@@ -38,11 +38,19 @@ enum Command {
         #[arg(long, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
         url: Option<String>,
     },
+    /// redeem one banked Codex reset credit for an account via the running server
+    Reset {
+        #[clap(flatten)]
+        args: cli::ResetArgs,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
-    if !matches!(cli.command, Some(Command::Top { .. })) {
+    if !matches!(
+        cli.command,
+        Some(Command::Top { .. }) | Some(Command::Reset { .. })
+    ) {
         logging::init(cli.log_format);
     }
     match cli.command {
@@ -57,6 +65,12 @@ fn main() {
         Some(Command::Serve { bind }) => serve(bind).expect("server failed"),
         Some(Command::Top { url }) => {
             if let Err(e) = top::run(url) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Reset { args }) => {
+            if let Err(e) = cli::reset(&args) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -233,6 +247,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/accounts/{id}/relogin",
             axum::routing::post(ui::relogin_account),
+        )
+        .route(
+            "/admin/api/accounts/{id}/reset",
+            axum::routing::post(ui::reset_account),
         )
         .route(
             "/admin/api/catalog/{backend}",

@@ -68,6 +68,17 @@ fn monitor_target(config: &Config, url_override: Option<String>) -> Result<Monit
             return Ok(MonitorTarget::Socket(system_socket));
         }
     }
+    let (url, token) = admin_http_target(config, url_override)?;
+    Ok(MonitorTarget::Http { url, token })
+}
+
+/// Resolve the admin HTTP origin and bearer token for a CLI command that must talk to a running
+/// server. Without `--url` the token comes from config or the local database; with `--url` it
+/// MUST come from `UNDERCLASS_UI_TOKEN` so a database token is never sent to a remote host.
+pub fn admin_http_target(
+    config: &Config,
+    url_override: Option<String>,
+) -> Result<(String, String), String> {
     let url = match url_override.as_deref() {
         Some(url) => url.trim_end_matches('/').to_string(),
         None => {
@@ -101,7 +112,7 @@ fn monitor_target(config: &Config, url_override: Option<String>) -> Result<Monit
             .or_else(|| local_token(config))
     }
     .ok_or("monitor socket unavailable and admin token unavailable; start underclass serve or set UNDERCLASS_UI_TOKEN")?;
-    Ok(MonitorTarget::Http { url, token })
+    Ok((url, token))
 }
 
 /// @cc [owner:ghuntley,label:cli] top-observes-only

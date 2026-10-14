@@ -1,6 +1,7 @@
 use clap::Parser;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub const PROVIDER_ID: &str = "underclass";
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -21,6 +22,156 @@ pub struct ConnectArgs {
     pub dry_run: bool,
     #[arg(long, help = "remove the underclass provider and credentials")]
     pub remove: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ResetArgs {
+    #[arg(help = "account label (email/username), account id, or unique id prefix")]
+    pub account: String,
+    #[arg(
+        long,
+        help = "redeem even when upstream reports the account is not rate limited"
+    )]
+    pub force: bool,
+    #[arg(long, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
+    pub url: Option<String>,
+}
+
+/// One row of the admin state's account list, as much as the CLI needs to pick a target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountRef {
+    pub id: String,
+    pub label: String,
+    pub backend: String,
+}
+
+/// @cc [owner:ghuntley,label:cli] reset-account-selector
+/// `match_account` MUST resolve an operator's selector to exactly one account: a case-insensitive
+/// exact label match wins, then an exact id match, then a unique id prefix of at least 8
+/// characters. It MUST fail with a message naming the absence or ambiguity rather than guessing,
+/// and MUST never match on an empty selector.
+pub fn match_account<'a>(
+    accounts: &'a [AccountRef],
+    selector: &str,
+) -> Result<&'a AccountRef, String> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err("account selector must not be empty".into());
+    }
+    let by_label: Vec<&AccountRef> = accounts
+        .iter()
+        .filter(|a| a.label.eq_ignore_ascii_case(selector))
+        .collect();
+    match by_label.as_slice() {
+        [one] => return Ok(one),
+        [] => {}
+        many => {
+            return Err(format!(
+                "label {selector:?} matches {} accounts; use an account id instead",
+                many.len()
+            ));
+        }
+    }
+    if let Some(exact) = accounts.iter().find(|a| a.id == selector) {
+        return Ok(exact);
+    }
+    if selector.len() >= 8 {
+        let by_prefix: Vec<&AccountRef> = accounts
+            .iter()
+            .filter(|a| a.id.starts_with(selector))
+            .collect();
+        match by_prefix.as_slice() {
+            [one] => return Ok(one),
+            [] => {}
+            many => {
+                return Err(format!(
+                    "id prefix {selector:?} matches {} accounts",
+                    many.len()
+                ));
+            }
+        }
+    }
+    Err(format!("no account matches {selector:?}"))
+}
+
+fn account_refs(state: &Value) -> Vec<AccountRef> {
+    state["accounts"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    Some(AccountRef {
+                        id: row["id"].as_str()?.to_string(),
+                        label: row["label"].as_str()?.to_string(),
+                        backend: row["backend"].as_str().unwrap_or_default().to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// @cc [owner:ghuntley,label:cli] reset-cli-via-admin-api
+/// `reset` MUST act only through the running server's authenticated admin API (resolve the
+/// account from `/admin/api/state`, then POST `/admin/api/accounts/{id}/reset`), MUST NOT read
+/// credentials from or write to the local database, and MUST surface the server's `message` on
+/// a non-2xx response instead of a bare status code.
+pub fn reset(args: &ResetArgs) -> Result<(), String> {
+    let config = crate::config::Config::load();
+    let (url, token) = crate::top::admin_http_target(&config, args.url.clone())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let state: Value = client
+        .get(format!("{url}/admin/api/state"))
+        .bearer_auth(&token)
+        .send()
+        .map_err(|e| format!("cannot reach {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("admin state request failed: {e}"))?
+        .json()
+        .map_err(|e| format!("admin state response: {e}"))?;
+    let accounts = account_refs(&state);
+    let account = match_account(&accounts, &args.account)?;
+    if account.backend != "codex" {
+        return Err(format!(
+            "{} is a {} account; only ChatGPT/Codex accounts have banked resets",
+            account.label, account.backend
+        ));
+    }
+    let response = client
+        .post(format!(
+            "{url}/admin/api/accounts/{}/reset?force={}",
+            account.id, args.force
+        ))
+        .bearer_auth(&token)
+        .send()
+        .map_err(|e| format!("reset request failed: {e}"))?;
+    let status = response.status();
+    let body: Value = response.json().unwrap_or(Value::Null);
+    if status.is_success() {
+        println!(
+            "{}: {} (credit {}); account is now {}, {} reset(s) remaining",
+            account.label,
+            body["outcome"].as_str().unwrap_or("unknown"),
+            body["credit_id"].as_str().unwrap_or("?"),
+            body["status"].as_str().unwrap_or("unknown"),
+            body["available_resets"].as_i64().unwrap_or(0),
+        );
+        Ok(())
+    } else {
+        let message = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("request failed");
+        Err(format!(
+            "{}: {message} (HTTP {})",
+            account.label,
+            status.as_u16()
+        ))
+    }
 }
 
 pub fn opencode_global_config_dir() -> PathBuf {
@@ -471,5 +622,106 @@ mod tests {
         let block = provider_block("http://127.0.0.1:8080/v1", "key", &[]);
         assert_eq!(block["options"]["setCacheKey"], true);
         assert_eq!(block["options"]["baseURL"], "http://127.0.0.1:8080/v1");
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    fn pool() -> Vec<AccountRef> {
+        vec![
+            AccountRef {
+                id: "aaaaaaaa-1111".into(),
+                label: "One@Example.test".into(),
+                backend: "codex".into(),
+            },
+            AccountRef {
+                id: "aaaaaaaa-2222".into(),
+                label: "two@example.test".into(),
+                backend: "codex".into(),
+            },
+            AccountRef {
+                id: "bbbbbbbb-3333".into(),
+                label: "gh-user".into(),
+                backend: "copilot".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn label_match_is_case_insensitive_and_wins_over_id() {
+        let accounts = pool();
+        assert_eq!(
+            match_account(&accounts, "one@example.TEST").unwrap().id,
+            "aaaaaaaa-1111"
+        );
+        assert_eq!(
+            match_account(&accounts, " two@example.test ").unwrap().id,
+            "aaaaaaaa-2222"
+        );
+    }
+
+    #[test]
+    fn exact_id_and_unique_prefix_resolve() {
+        let accounts = pool();
+        assert_eq!(
+            match_account(&accounts, "bbbbbbbb-3333").unwrap().label,
+            "gh-user"
+        );
+        assert_eq!(
+            match_account(&accounts, "bbbbbbbb").unwrap().label,
+            "gh-user"
+        );
+    }
+
+    #[test]
+    fn ambiguous_short_or_missing_selectors_fail() {
+        let accounts = pool();
+        assert!(
+            match_account(&accounts, "aaaaaaaa")
+                .unwrap_err()
+                .contains("matches 2")
+        );
+        assert!(
+            match_account(&accounts, "bbbb")
+                .unwrap_err()
+                .contains("no account")
+        );
+        assert!(match_account(&accounts, "nobody@example.test").is_err());
+        assert!(match_account(&accounts, "   ").is_err());
+        assert!(match_account(&[], "x").is_err());
+    }
+
+    #[test]
+    fn duplicate_labels_are_rejected() {
+        let mut accounts = pool();
+        accounts.push(AccountRef {
+            id: "cccccccc-4444".into(),
+            label: "two@example.test".into(),
+            backend: "codex".into(),
+        });
+        assert!(
+            match_account(&accounts, "two@example.test")
+                .unwrap_err()
+                .contains("matches 2")
+        );
+        assert_eq!(
+            match_account(&accounts, "cccccccc-4444").unwrap().label,
+            "two@example.test"
+        );
+    }
+
+    #[test]
+    fn account_refs_skip_malformed_rows() {
+        let state = serde_json::json!({"accounts": [
+            {"id": "a", "label": "l", "backend": "codex"},
+            {"id": 5, "label": "bad"},
+            {"id": "b", "label": "m"}
+        ]});
+        let refs = account_refs(&state);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[1].backend, "");
+        assert!(account_refs(&serde_json::json!({})).is_empty());
     }
 }

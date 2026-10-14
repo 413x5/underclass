@@ -257,6 +257,68 @@ pub async fn relogin_account(
     }
 }
 
+#[derive(Deserialize, Default)]
+pub struct ResetQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// @cc [owner:ghuntley,label:pool] manual-reset-endpoint-outcomes
+/// `reset_account` MUST return 404 for an unknown account id and otherwise delegate to
+/// `ResetManager::manual_reset` with the `force` query flag. Every non-2xx response MUST carry a
+/// JSON body with a stable `error` code and a human `message`; refusals that `force` can override
+/// (`not_rate_limited`, `already_redeemed`) and `no_credit` MUST be 409, `not_codex` 400, and
+/// upstream failures 502.
+pub async fn reset_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ResetQuery>,
+) -> Response {
+    use crate::resets::ManualResetError;
+    let Some(account) = state.store.get_account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown_account", "message": "unknown account" })),
+        )
+            .into_response();
+    };
+    match state
+        .resets
+        .manual_reset(
+            &account,
+            &state.tokens,
+            &state.pool,
+            &state.store,
+            query.force,
+        )
+        .await
+    {
+        Ok(outcome) => Json(json!({
+            "account_id": account.id,
+            "label": account.label,
+            "outcome": outcome.outcome,
+            "credit_id": outcome.credit_id,
+            "status": outcome.status,
+            "available_resets": outcome.available_resets,
+        }))
+        .into_response(),
+        Err(err) => {
+            let status = match err {
+                ManualResetError::NotCodex => StatusCode::BAD_REQUEST,
+                ManualResetError::NotRateLimited
+                | ManualResetError::AlreadyRedeemed
+                | ManualResetError::NoCredit => StatusCode::CONFLICT,
+                ManualResetError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(json!({ "error": err.code(), "message": err.message() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn set_status(state: &Arc<AppState>, id: &str, status: AccountStatus, reset_at: i64) -> Response {
     if state.store.get_account(id).is_none() {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();

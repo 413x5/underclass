@@ -201,6 +201,7 @@ async function loadState() {
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
           ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">Re-login</button>` : ''}
+          ${a.backend === 'codex' && a.usage && a.usage.available_resets > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
         </td>`;
       tbody.appendChild(tr);
@@ -410,6 +411,19 @@ async function relogin(id) {
     document.getElementById('flowPending').style.display = 'block';
     pollFlow(data.flow_id);
   }
+}
+async function useReset(id, force = false) {
+  if (!force && !confirm('Redeem one banked Codex reset for this account now?')) return;
+  const res = await api('/admin/api/accounts/' + id + '/reset' + (force ? '?force=true' : ''), { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    alert(`Reset outcome: ${data.outcome}. ${data.label} is now ${data.status}; ${data.available_resets} reset(s) remaining.`);
+  } else if ((data.error === 'not_rate_limited' || data.error === 'already_redeemed') && confirm(data.message + '\n\nRedeem anyway?')) {
+    return useReset(id, true);
+  } else {
+    alert('Reset failed: ' + (data.message || data.error || res.status));
+  }
+  loadState();
 }
 async function del(id) {
   if (!confirm('Remove this account from the pool?')) return;
