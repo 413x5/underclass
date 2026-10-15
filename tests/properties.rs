@@ -5,7 +5,9 @@ use underclass::pool::{PoolCore, SelectError};
 use underclass::store::{Store, UsageQuery, UsageRecord};
 use underclass::resets::{Candidate, RateLimit, Window, blocked_cooling_deadline, choose_candidate, natural_recovery_ms};
 use underclass::tokens::{ROTATION_INTERVAL_MS, rotation_due};
-use underclass::usage::{TokenCounts, UsageTap};
+use underclass::usage::{StreamEnd, TokenCounts, UsageTap};
+use underclass::stats::{self, Dim};
+use underclass::store::UpstreamEvent;
 use std::collections::HashMap;
 
 #[hegel::test]
@@ -21,7 +23,7 @@ fn test_monitor_minute_bins_partition_recent_attempts(tc: TestCase) {
             id: 0, request_id: format!("monitor-{i}"), ts, endpoint: "/v1/responses".into(),
             backend: "codex".into(), model: "model".into(), account_id: "account".into(),
             account_label: "label".into(), cache_key: None, status: 200,
-            input_tokens: None, output_tokens: None,
+            input_tokens: None, output_tokens: None, ..Default::default()
         }).unwrap();
         let minute = ts.div_euclid(60_000);
         if minute >= first_minute && ts <= now {
@@ -49,7 +51,7 @@ fn test_monitor_account_totals_partition_month_and_unknown_usage(tc: TestCase) {
             id: 0, request_id: format!("monitor-{i}"), ts: *ts, endpoint: "/v1/responses".into(),
             backend: "codex".into(), model: "model".into(), account_id: id.clone(),
             account_label: id.clone(), cache_key: None, status: 200,
-            input_tokens: input, output_tokens: output,
+            input_tokens: input, output_tokens: output, ..Default::default()
         }).unwrap();
         if (1_000..100_000).contains(ts) {
             let total = expected.entry(id).or_default();
@@ -103,7 +105,7 @@ fn test_usage_groups_partition_measured_and_unknown_attempts(tc: TestCase) {
         let input = if sample % 2 == 0 { Some(*sample as i64) } else { None };
         if let Some(value) = input { measured += 1; expected_input += value; } else { unknown += 1; }
         store.insert_usage(&UsageRecord {
-            id: 0, request_id: format!("request-{i}"), ts: i as i64, endpoint: "/v1/responses".into(), backend: "codex".into(), model: format!("model-{}", i % 2), account_id: format!("account-{}", i % 3), account_label: format!("label-{}", i % 3), cache_key: Some(format!("key-{}", i % 4)), status: 200, input_tokens: input, output_tokens: input,
+            id: 0, request_id: format!("request-{i}"), ts: i as i64, endpoint: "/v1/responses".into(), backend: "codex".into(), model: format!("model-{}", i % 2), account_id: format!("account-{}", i % 3), account_label: format!("label-{}", i % 3), cache_key: Some(format!("key-{}", i % 4)), status: 200, input_tokens: input, output_tokens: input, ..Default::default()
         }).unwrap();
     }
     let total = store.usage_summary(&UsageQuery::default()).unwrap();
@@ -474,4 +476,171 @@ fn test_bindings_respect_ttl_and_cap(tc: TestCase) {
     let later = now + underclass::pool::BINDING_TTL_MS + 1;
     built.core.sweep(later);
     assert!(built.core.bindings().is_empty(), "expired bindings not evicted");
+}
+
+const SSE_EVENTS: [&str; 6] = [
+    "event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+    "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\r\n\r\n",
+    "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
+    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+    "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n",
+    "data: {\"type\":\"error\",\"code\":\"cyber_policy\",\"message\":\"This request was blocked.\"}\n\n",
+];
+
+#[hegel::test]
+fn test_stream_outcome_independent_of_chunk_boundaries(tc: TestCase) {
+    let picks: Vec<usize> = tc.draw(gs::vecs(gs::integers::<usize>().min_value(0).max_value(SSE_EVENTS.len() - 1)).max_size(8));
+    let splits: Vec<usize> = tc.draw(gs::vecs(gs::integers::<usize>().min_value(1).max_value(50)).max_size(40));
+    let body: String = picks.iter().map(|i| SSE_EVENTS[*i]).collect();
+    let mut whole = UsageTap::new(true, false);
+    whole.feed(body.as_bytes());
+    let mut chunked = UsageTap::new(true, false);
+    let mut position = 0;
+    for size in splits {
+        if position >= body.len() { break; }
+        let end = (position + size).min(body.len());
+        chunked.feed(&body.as_bytes()[position..end]);
+        position = end;
+    }
+    chunked.feed(&body.as_bytes()[position..]);
+    for end in [StreamEnd::Eof, StreamEnd::UpstreamError, StreamEnd::Dropped] {
+        let report = chunked.report(end);
+        assert_eq!(report, whole.report(end));
+        // Upstream message text never reaches the recorded code.
+        if let Some(code) = &report.error_code {
+            assert!(code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')), "{code}");
+        }
+    }
+    let first_terminal = picks.iter().find(|i| matches!(**i, 2..=5));
+    let expected = match first_terminal {
+        Some(2) => "failed",
+        Some(3) => "completed",
+        Some(4) => "incomplete",
+        Some(5) => "failed",
+        _ => "truncated",
+    };
+    assert_eq!(whole.report(StreamEnd::Eof).outcome.as_str(), expected);
+}
+
+#[hegel::test]
+fn test_concurrency_matches_brute_force(tc: TestCase) {
+    let raw: Vec<(i64, i64)> = tc.draw(gs::vecs(gs::tuples!(
+        gs::integers::<i64>().min_value(-50).max_value(200),
+        gs::integers::<i64>().min_value(1).max_value(80)
+    )).max_size(25));
+    let bucket_ms: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(60));
+    let span: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(200));
+    let intervals: Vec<(i64, i64)> = raw.iter().map(|(s, d)| (*s, s + d)).collect();
+    let buckets = stats::concurrency(&intervals, 0, span, bucket_ms);
+    assert_eq!(buckets.len(), stats::bucket_count(0, span, bucket_ms));
+    let active_at = |t: i64| intervals.iter().filter(|(s, e)| *s <= t && t < *e).count() as i64;
+    for (i, (peak, mean_milli)) in buckets.iter().enumerate() {
+        let start = i as i64 * bucket_ms;
+        let end = (start + bucket_ms).min(span);
+        let brute_peak = (start..end).map(active_at).max().unwrap_or(0);
+        let area: i64 = (start..end).map(active_at).sum();
+        assert_eq!(*peak, brute_peak, "bucket {i}");
+        assert_eq!(*mean_milli, area * 1000 / (end - start), "bucket {i}");
+        assert!(*mean_milli <= peak * 1000);
+    }
+}
+
+#[hegel::test]
+fn test_stats_series_partitions_rows_and_events(tc: TestCase) {
+    let rows: Vec<(i64, i64, u8, u8, u16)> = tc.draw(gs::vecs(gs::tuples!(
+        gs::integers::<i64>().min_value(-100).max_value(3_000),
+        gs::integers::<i64>().min_value(0).max_value(400),
+        gs::integers::<u8>().min_value(0).max_value(5),
+        gs::integers::<u8>().min_value(0).max_value(3),
+        gs::integers::<u16>().min_value(0).max_value(300)
+    )).max_size(30));
+    let events: Vec<(i64, u8)> = tc.draw(gs::vecs(gs::tuples!(
+        gs::integers::<i64>().min_value(-100).max_value(3_000),
+        gs::integers::<u8>().min_value(0).max_value(6)
+    )).max_size(15));
+    let bucket_ms: i64 = tc.draw(gs::integers::<i64>().min_value(50).max_value(1_000));
+    let (from, to) = (0i64, 2_500i64);
+    let store = Store::in_memory().unwrap();
+    let mut expected_tokens = 0i64;
+    let mut expected_attempts = vec![0i64; stats::bucket_count(from, to, bucket_ms)];
+    let mut requests = std::collections::HashSet::new();
+    let mut sessions = std::collections::HashSet::new();
+    for (ts, duration, request, model, tokens) in &rows {
+        store.insert_usage(&UsageRecord {
+            request_id: format!("r{request}"), ts: *ts, endpoint: "/v1/responses".into(), backend: "codex".into(),
+            model: format!("m{model}"), account_id: "a".into(), account_label: "a".into(),
+            cache_key: Some(format!("k{}", request % 3)), status: 200,
+            input_tokens: Some(i64::from(*tokens)), output_tokens: Some(1), duration_ms: Some(*duration),
+            ..Default::default()
+        }).unwrap();
+        if (from..to).contains(ts) {
+            expected_tokens += i64::from(*tokens);
+            expected_attempts[((ts - from) / bucket_ms) as usize] += 1;
+            requests.insert(*request);
+            sessions.insert(request % 3);
+        }
+    }
+    let mut expected_events = vec![0i64; expected_attempts.len()];
+    for (i, (ts, kind)) in events.iter().enumerate() {
+        store.insert_upstream_events(&[UpstreamEvent {
+            ts: *ts, source: "proxy".into(), kind: underclass::store::EVENT_KINDS[*kind as usize].into(),
+            dedupe_key: Some(format!("e{i}")), ..Default::default()
+        }]).unwrap();
+        if (from..to).contains(ts) {
+            expected_events[((ts - from) / bucket_ms) as usize] += 1;
+        }
+    }
+    let series = store.stats_series(from, to, bucket_ms, Dim::Total).unwrap();
+    let buckets = series.first().map(|s| s.buckets.clone()).unwrap_or_default();
+    let attempts: Vec<i64> = buckets.iter().map(|b| b.totals.attempts).collect();
+    let event_counts: Vec<i64> = buckets.iter().map(|b| b.totals.events.values().sum()).collect();
+    if series.is_empty() {
+        assert!(expected_attempts.iter().all(|n| *n == 0) && expected_events.iter().all(|n| *n == 0));
+    } else {
+        assert_eq!(attempts, expected_attempts);
+        assert_eq!(event_counts, expected_events);
+        assert_eq!(buckets.iter().map(|b| b.totals.input_tokens).sum::<i64>(), expected_tokens);
+        for b in &buckets {
+            assert!(b.totals.sessions <= b.totals.requests && b.totals.requests <= b.totals.attempts);
+            assert_eq!(b.totals.outcomes.values().sum::<i64>(), b.totals.attempts);
+        }
+    }
+    let distinct = store.stats_distinct(from, to, Dim::Total).unwrap();
+    let (r, k) = distinct.first().map(|(_, r, k)| (*r, *k)).unwrap_or((0, 0));
+    assert_eq!((r, k), (requests.len() as i64, sessions.len() as i64));
+    // Per-model series partition the total.
+    let by_model = store.stats_series(from, to, bucket_ms, Dim::Model).unwrap();
+    let model_tokens: i64 = by_model.iter().flat_map(|s| s.buckets.iter()).map(|b| b.totals.input_tokens).sum();
+    assert_eq!(model_tokens, expected_tokens);
+}
+
+#[hegel::test]
+fn test_daily_rollup_matches_raw_day(tc: TestCase) {
+    let rows: Vec<(i64, i64, u8)> = tc.draw(gs::vecs(gs::tuples!(
+        gs::integers::<i64>().min_value(0).max_value(3 * stats::DAY_MS),
+        gs::integers::<i64>().min_value(0).max_value(5 * stats::HOUR_MS),
+        gs::integers::<u8>().min_value(0).max_value(3)
+    )).max_size(25));
+    let day: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(2));
+    let store = Store::in_memory().unwrap();
+    for (i, (ts, duration, account)) in rows.iter().enumerate() {
+        store.insert_usage(&UsageRecord {
+            request_id: format!("r{i}"), ts: *ts, endpoint: "/v1/responses".into(), backend: "codex".into(),
+            model: "m".into(), account_id: format!("a{account}"), account_label: format!("label{account}"),
+            status: 200, input_tokens: Some(i as i64), output_tokens: Some(1), duration_ms: Some(*duration),
+            stream_outcome: Some("completed".into()), ..Default::default()
+        }).unwrap();
+    }
+    store.rollup_stats_day(day, 10 * stats::DAY_MS).unwrap();
+    for dim in Dim::all() {
+        let raw = store.stats_series(day * stats::DAY_MS, (day + 1) * stats::DAY_MS, stats::DAY_MS, dim).unwrap();
+        let rolled = store.stats_daily(day, day + 1, dim).unwrap();
+        let raw: Vec<(String, stats::Totals)> = raw.into_iter().map(|s| (s.key, s.buckets[0].totals.clone())).collect();
+        let rolled: Vec<(String, stats::Totals)> = rolled.into_iter().map(|(_, k, _, t)| (k, t)).collect();
+        if dim == Dim::Total && raw.is_empty() {
+            assert_eq!(rolled, vec![(stats::TOTAL_KEY.to_string(), stats::Totals::default())]);
+        } else {
+            assert_eq!(rolled, raw);
+        }
+    }
 }

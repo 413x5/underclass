@@ -16,6 +16,8 @@ cargo run -- connect        # configure opencode to use the pool (global config)
 cargo run -- connect --dry-run
 cargo run -- connect --remove
 cargo run -- reset <email-or-id> [--force]   # redeem one banked Codex reset via the running server's admin API
+cargo run -- stats [--since 90d] [--by model|account] [--json]   # usage/capacity/refusal stats via the admin API
+cargo run -- stats import-codex [--dry-run]  # backfill capacity/policy errors from Codex session logs
 ```
 
 ## Testing policy (enforced)
@@ -50,7 +52,7 @@ Use the `code-contracts` skill for every code change and code review. Follow its
 
 - Every non-trivial architectural decision gets a MADR record in `docs/adr/NNNN-title.md` (Status / Context / Decision / Consequences).
 - Superseding a decision: mark the old ADR `Superseded by NNNN`, write the new one. Never delete ADRs.
-- Index: 0001 Rust/Axum - 0002 Hegel PBT, no mutation testing - 0003 prompt-cache-key stickiness - 0004 health state machine + fail-fast - 0005 SQLite store - 0006 tracing/correlation IDs - 0007 config-driven catalog - 0008 JSONC-safe merge - 0009 device-code onboarding - 0010 unprefixed routing, flat pool - 0011 GitHub Copilot backend - 0018 recoverable credential rejection - 0019 scheduled refresh token rotation - 0020 manual Codex reset redemption.
+- Index: 0001 Rust/Axum - 0002 Hegel PBT, no mutation testing - 0003 prompt-cache-key stickiness - 0004 health state machine + fail-fast - 0005 SQLite store - 0006 tracing/correlation IDs - 0007 config-driven catalog - 0008 JSONC-safe merge - 0009 device-code onboarding - 0010 unprefixed routing, flat pool - 0011 GitHub Copilot backend - 0018 recoverable credential rejection - 0019 scheduled refresh token rotation - 0020 manual Codex reset redemption - 0021 stream outcome accounting + long-range capacity statistics.
 
 ## Config files agents may edit
 

@@ -83,6 +83,15 @@ async fn mock_responses(
         }
     }
     if serde_json::from_str::<serde_json::Value>(&body).ok()
+        .and_then(|value| value.get("overload").and_then(|flag| flag.as_bool())) == Some(true) {
+        // A 200 stream that fails before any output, like upstream capacity errors in practice.
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
+        ).into_response();
+    }
+    if serde_json::from_str::<serde_json::Value>(&body).ok()
         .and_then(|value| value.get("slow_abort").and_then(|flag| flag.as_bool())) == Some(true) {
         let stream = futures::stream::unfold(0, |step| async move {
             match step {
@@ -225,6 +234,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
             reqwest::Client::new(), "http://127.0.0.1:1".to_string(), false,
         )),
         stream_usage_unsupported: Mutex::new(Default::default()),
+        stats_retention_days: 730,
     });
 
     let v1 = axum::Router::new()
@@ -244,6 +254,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         .route("/admin/api/monitor", axum::routing::get(underclass::monitor::snapshot))
         .route("/admin/api/usage", axum::routing::get(underclass::ui::usage_summary))
         .route("/admin/api/usage/requests", axum::routing::get(underclass::ui::usage_requests))
+        .route("/admin/api/stats", axum::routing::get(underclass::stats_api::stats_handler))
         .route(
             "/admin/api/accounts/{id}/enable",
             axum::routing::post(underclass::ui::enable_account),
@@ -258,6 +269,49 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), logs)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_mid_stream_overload_is_recorded() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("acc-ovl", "tok-overload"));
+    let (base, logs) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+    let response = http.post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": true, "overload": true}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200, "mid-stream failures keep the upstream status");
+    assert!(response.text().await.unwrap().contains("response.failed"), "failure passes through to the client");
+
+    let mut row = None;
+    for _ in 0..50 {
+        row = store.usage_records(&Default::default()).unwrap().into_iter().next();
+        if row.is_some() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = row.expect("usage row written when the stream ends");
+    assert_eq!(row.stream_outcome.as_deref(), Some("failed"));
+    assert_eq!(row.error_code.as_deref(), Some("server_is_overloaded"));
+    assert_eq!(row.saw_output, Some(false));
+    assert!(row.duration_ms.is_some());
+    let entry = logs.lock().unwrap().iter().find(|e| e.request_id == row.request_id).cloned().unwrap();
+    assert_eq!(entry.stream_outcome.as_deref(), Some("failed"));
+    assert_eq!(entry.error_code.as_deref(), Some("server_is_overloaded"));
+
+    // Windows are half-open at `now`; step past the millisecond the event was stamped with.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let stats: serde_json::Value = http.get(format!("{base}/admin/api/stats?since=1h&bucket=minute"))
+        .header("Authorization", "Bearer unused")
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(stats["totals"]["events"]["overloaded"], 1, "{stats}");
+    assert_eq!(stats["totals"]["outcomes"]["failed"], 1, "{stats}");
+    assert_eq!(stats["totals"]["requests"], 1);
+    assert!(!stats.to_string().contains("capacity. Please"), "upstream message text must not be stored");
+    let denied = http.get(format!("{base}/admin/api/stats")).send().await.unwrap();
+    assert_eq!(denied.status(), 401);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -65,6 +65,41 @@ pub fn log_account_state(account_id: &str, label: Option<&str>, event: &str, det
     );
 }
 
+/// One line per finished response body. Failed, incomplete, or truncated bodies log at warn so
+/// mid-stream upstream failures (e.g. `server_is_overloaded`) are visible despite the 200 status.
+pub fn log_stream_finished(
+    request_id: &str,
+    model: &str,
+    label: &str,
+    outcome: &str,
+    error_code: Option<&str>,
+    saw_output: bool,
+    duration_ms: i64,
+) {
+    if matches!(outcome, "failed" | "incomplete" | "truncated" | "upstream_error") {
+        tracing::warn!(
+            request_id = %request_id,
+            model = %model,
+            account = %label,
+            outcome = %outcome,
+            error_code = error_code.unwrap_or("none"),
+            saw_output = saw_output,
+            duration_ms = duration_ms,
+            "stream.finished"
+        );
+    } else {
+        tracing::info!(
+            request_id = %request_id,
+            model = %model,
+            account = %label,
+            outcome = %outcome,
+            saw_output = saw_output,
+            duration_ms = duration_ms,
+            "stream.finished"
+        );
+    }
+}
+
 pub fn log_saturated(request_id: &str, retry_after_ms: i64) {
     tracing::warn!(
         request_id = %request_id,

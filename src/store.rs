@@ -4,8 +4,17 @@ use std::path::Path;
 use std::sync::Mutex;
 use serde::Serialize;
 use rusqlite::types::Value;
+use crate::stats::{self, CountRow, Dim, Interval, Series, TallyRow, Totals};
 
-#[derive(Clone, Debug, Serialize)]
+fn usage_dim_sql(dim: Dim) -> (&'static str, &'static str) {
+    match dim {
+        Dim::Total => ("'*'", "'*'"),
+        Dim::Model => ("model", "model"),
+        Dim::Account => ("account_id", "account_label"),
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct UsageRecord {
     pub id: i64,
     pub request_id: String,
@@ -19,7 +28,47 @@ pub struct UsageRecord {
     pub status: u16,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// Attempt start to finish (for streams: until the body ended), when known.
+    pub duration_ms: Option<i64>,
+    /// How a 2xx body ended (`usage::StreamOutcome::as_str`); `None` for non-2xx attempts.
+    pub stream_outcome: Option<String>,
+    /// Sanitized upstream error code, from the error body or the failing stream event.
+    pub error_code: Option<String>,
+    /// Whether model output reached the client before the stream ended.
+    pub saw_output: Option<bool>,
 }
+
+/// A notable upstream or pool event for long-range capacity and refusal statistics.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct UpstreamEvent {
+    pub ts: i64,
+    /// `proxy` for events observed by this server, `codex_import` for backfilled client logs.
+    pub source: String,
+    /// `overloaded`, `policy_blocked`, `quota_exhausted`, `retries_exhausted`, `upstream_failed`,
+    /// `quota_cooling`, or `pool_saturated`.
+    pub kind: String,
+    /// Where the event surfaced: `stream`, `http`, `pool`, or `codex_log`.
+    pub detail: Option<String>,
+    pub error_code: Option<String>,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub account_id: Option<String>,
+    pub account_label: Option<String>,
+    pub request_id: Option<String>,
+    pub until_ms: Option<i64>,
+    /// Unique per imported event so a re-import inserts nothing.
+    pub dedupe_key: Option<String>,
+}
+
+pub const EVENT_KINDS: [&str; 7] = [
+    "overloaded",
+    "policy_blocked",
+    "quota_exhausted",
+    "retries_exhausted",
+    "upstream_failed",
+    "quota_cooling",
+    "pool_saturated",
+];
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct UsageQuery {
@@ -128,10 +177,39 @@ fn schema() -> &'static str {
         cache_key TEXT,
         status INTEGER NOT NULL,
         input_tokens INTEGER,
-        output_tokens INTEGER
+        output_tokens INTEGER,
+        duration_ms INTEGER,
+        stream_outcome TEXT,
+        error_code TEXT,
+        saw_output INTEGER
     );
     CREATE INDEX IF NOT EXISTS usage_records_ts ON usage_records(ts, id);
     CREATE INDEX IF NOT EXISTS usage_records_dims ON usage_records(model, account_id, cache_key, ts);
+    CREATE TABLE IF NOT EXISTS upstream_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        detail TEXT,
+        error_code TEXT,
+        backend TEXT,
+        model TEXT,
+        account_id TEXT,
+        account_label TEXT,
+        request_id TEXT,
+        until_ms INTEGER,
+        dedupe_key TEXT UNIQUE
+    );
+    CREATE INDEX IF NOT EXISTS upstream_events_ts ON upstream_events(ts);
+    CREATE TABLE IF NOT EXISTS stats_daily (
+        day INTEGER NOT NULL,
+        dim TEXT NOT NULL,
+        key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        totals TEXT NOT NULL,
+        computed_at INTEGER NOT NULL,
+        PRIMARY KEY (day, dim, key)
+    );
     "#
 }
 
@@ -150,6 +228,20 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE accounts ADD COLUMN token_refreshed_at INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    let mut stmt = conn.prepare("PRAGMA table_info(usage_records)")?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, ty) in [
+        ("duration_ms", "INTEGER"),
+        ("stream_outcome", "TEXT"),
+        ("error_code", "TEXT"),
+        ("saw_output", "INTEGER"),
+    ] {
+        if !columns.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE usage_records ADD COLUMN {name} {ty}"), [])?;
+        }
     }
     Ok(())
 }
@@ -209,8 +301,8 @@ impl Store {
     /// unknown token counts as NULL even when the account is later removed.
     pub fn insert_usage(&self, record: &UsageRecord) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO usage_records (request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![record.request_id, record.ts, record.endpoint, record.backend, record.model, record.account_id, record.account_label, record.cache_key, record.status, record.input_tokens, record.output_tokens],
+            "INSERT INTO usage_records (request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens,duration_ms,stream_outcome,error_code,saw_output) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![record.request_id, record.ts, record.endpoint, record.backend, record.model, record.account_id, record.account_label, record.cache_key, record.status, record.input_tokens, record.output_tokens, record.duration_ms, record.stream_outcome, record.error_code, record.saw_output],
         )?;
         Ok(())
     }
@@ -242,14 +334,226 @@ impl Store {
         let offset = query.offset.unwrap_or(0).min(i64::MAX as usize) as i64;
         values.push(Value::Integer(limit));
         values.push(Value::Integer(offset));
-        let sql = format!("SELECT id,request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens FROM usage_records WHERE {filter} ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?");
+        let sql = format!("SELECT id,request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens,duration_ms,stream_outcome,error_code,saw_output FROM usage_records WHERE {filter} ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?");
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| Ok(UsageRecord {
             id: r.get(0)?, request_id: r.get(1)?, ts: r.get(2)?, endpoint: r.get(3)?, backend: r.get(4)?, model: r.get(5)?, account_id: r.get(6)?, account_label: r.get(7)?, cache_key: r.get(8)?, status: r.get(9)?, input_tokens: r.get(10)?, output_tokens: r.get(11)?,
+            duration_ms: r.get(12)?, stream_outcome: r.get(13)?, error_code: r.get(14)?, saw_output: r.get(15)?,
         }))?;
         rows.collect()
     }
+    /// @cc [owner:ghuntley,label:persistence] upstream-event-write-through
+    /// `insert_upstream_events` MUST persist each event immediately, MUST insert an event whose
+    /// `dedupe_key` already exists zero times, and MUST discard the finished-day rollups for every day
+    /// that gained an event so maintenance recomputes them.
+    pub fn insert_upstream_events(&self, events: &[UpstreamEvent]) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut inserted = 0;
+        let mut days = std::collections::BTreeSet::new();
+        for event in events {
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO upstream_events (ts,source,kind,detail,error_code,backend,model,account_id,account_label,request_id,until_ms,dedupe_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![event.ts, event.source, event.kind, event.detail, event.error_code, event.backend, event.model, event.account_id, event.account_label, event.request_id, event.until_ms, event.dedupe_key],
+            )?;
+            if changed > 0 {
+                inserted += changed;
+                days.insert(event.ts.div_euclid(stats::DAY_MS));
+            }
+        }
+        for day in days {
+            tx.execute("DELETE FROM stats_daily WHERE day = ?1", params![day])?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn insert_upstream_event(&self, event: &UpstreamEvent) {
+        if let Err(error) = self.insert_upstream_events(std::slice::from_ref(event)) {
+            tracing::error!(error = %error, kind = %event.kind, "upstream_event.persist_failed");
+        }
+    }
+
+    /// Per-bucket counts from `usage_records` with `ts` in `[from, to)`.
+    pub fn stats_counts(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<CountRow>> {
+        let (key, label) = usage_dim_sql(dim);
+        let sql = format!(
+            "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), COUNT(DISTINCT request_id), COUNT(*), COUNT(DISTINCT cache_key), \
+             COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
+             SUM(CASE WHEN status BETWEEN 200 AND 299 AND (input_tokens IS NULL OR output_tokens IS NULL) THEN 1 ELSE 0 END) \
+             FROM usage_records WHERE ts >= ?1 AND ts < ?2 GROUP BY b, k"
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from, to, bucket_ms], |r| Ok(CountRow {
+            bucket: r.get(0)?, key: r.get(1)?, label: r.get(2)?, requests: r.get(3)?, attempts: r.get(4)?,
+            sessions: r.get(5)?, input_tokens: r.get(6)?, output_tokens: r.get(7)?, unmeasured: r.get(8)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Per-bucket attempt outcomes: the recorded stream outcome, `http_<status>` for non-2xx,
+    /// `network_error` for no response, or `unknown` for 2xx rows recorded before outcomes existed.
+    pub fn stats_outcomes(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<TallyRow>> {
+        let (key, label) = usage_dim_sql(dim);
+        let sql = format!(
+            "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), \
+             COALESCE(stream_outcome, CASE WHEN status = 0 THEN 'network_error' WHEN status BETWEEN 200 AND 299 THEN 'unknown' ELSE 'http_' || status END) AS o, \
+             COUNT(*) FROM usage_records WHERE ts >= ?1 AND ts < ?2 GROUP BY b, k, o"
+        );
+        self.tally(&sql, from, to, bucket_ms)
+    }
+
+    /// Per-bucket upstream event counts by kind.
+    pub fn stats_events(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<TallyRow>> {
+        let (key, label) = match dim {
+            Dim::Total => ("'*'", "'*'"),
+            Dim::Model => ("COALESCE(model,'(unknown)')", "COALESCE(model,'(unknown)')"),
+            Dim::Account => ("COALESCE(account_id,'(unknown)')", "COALESCE(account_label,account_id,'(unknown)')"),
+        };
+        let sql = format!(
+            "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), kind, COUNT(*) \
+             FROM upstream_events WHERE ts >= ?1 AND ts < ?2 GROUP BY b, k, kind"
+        );
+        self.tally(&sql, from, to, bucket_ms)
+    }
+
+    fn tally(&self, sql: &str, from: i64, to: i64, bucket_ms: i64) -> rusqlite::Result<Vec<TallyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![from, to, bucket_ms], |r| Ok(TallyRow {
+            bucket: r.get(0)?, key: r.get(1)?, label: r.get(2)?, name: r.get(3)?, count: r.get(4)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Lifetimes of attempts overlapping `[from, to)`; attempts started more than
+    /// `stats::MAX_ATTEMPT_MS` before `from` are not considered.
+    pub fn stats_intervals(&self, from: i64, to: i64, dim: Dim) -> rusqlite::Result<Vec<Interval>> {
+        let (key, _) = usage_dim_sql(dim);
+        let sql = format!(
+            "SELECT {key}, ts, ts + MAX(duration_ms, 1) FROM usage_records \
+             WHERE ts >= ?1 AND ts < ?2 AND duration_ms IS NOT NULL AND ts + MAX(duration_ms, 1) > ?3"
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from - stats::MAX_ATTEMPT_MS, to, from], |r| Ok(Interval {
+            key: r.get(0)?, start: r.get(1)?, end: r.get(2)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// @cc [owner:ghuntley,label:accounting] stats-series-raw
+    /// `stats_series` MUST aggregate exactly the usage rows and upstream events with `ts` in
+    /// `[from, to)` into `bucket_ms` buckets per `dim` key, with concurrency from attempt lifetimes.
+    pub fn stats_series(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<Series>> {
+        let counts = self.stats_counts(from, to, bucket_ms, dim)?;
+        let outcomes = self.stats_outcomes(from, to, bucket_ms, dim)?;
+        let events = self.stats_events(from, to, bucket_ms, dim)?;
+        let intervals = self.stats_intervals(from, to, dim)?;
+        Ok(stats::assemble(from, to, bucket_ms, &counts, &outcomes, &events, &intervals))
+    }
+
+    /// Exact distinct request and session counts per `dim` key over `[from, to)`.
+    pub fn stats_distinct(&self, from: i64, to: i64, dim: Dim) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        let (key, _) = usage_dim_sql(dim);
+        let sql = format!(
+            "SELECT {key} AS k, COUNT(DISTINCT request_id), COUNT(DISTINCT cache_key) FROM usage_records \
+             WHERE ts >= ?1 AND ts < ?2 GROUP BY k"
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// Stored finished-day rollups for days in `[from_day, to_day)`: `(day, key, label, totals)`.
+    pub fn stats_daily(&self, from_day: i64, to_day: i64, dim: Dim) -> rusqlite::Result<Vec<(i64, String, String, Totals)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT day, key, label, totals FROM stats_daily WHERE day >= ?1 AND day < ?2 AND dim = ?3 ORDER BY day, key",
+        )?;
+        let rows = stmt.query_map(params![from_day, to_day, dim.as_str()], |r| {
+            let totals: String = r.get(3)?;
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, serde_json::from_str(&totals).unwrap_or_default()))
+        })?;
+        rows.collect()
+    }
+
+    /// Days in `[from_day, to_day)` that already have a stored rollup.
+    pub fn stats_rolled_days(&self, from_day: i64, to_day: i64) -> rusqlite::Result<std::collections::BTreeSet<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT day FROM stats_daily WHERE day >= ?1 AND day < ?2 AND dim = 'total'",
+        )?;
+        let rows = stmt.query_map(params![from_day, to_day], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// @cc [owner:ghuntley,label:accounting] stats-daily-rollup
+    /// `rollup_stats_day` MUST store, for every dim, exactly what `stats_series` reports for that UTC
+    /// day as one bucket, and MUST always store a `total` row (zeros when idle) so the day is marked
+    /// rolled up.
+    pub fn rollup_stats_day(&self, day: i64, now_ms: i64) -> rusqlite::Result<()> {
+        let from = day * stats::DAY_MS;
+        let to = from + stats::DAY_MS;
+        let mut rows: Vec<(Dim, String, String, Totals)> = Vec::new();
+        for dim in Dim::all() {
+            for series in self.stats_series(from, to, stats::DAY_MS, dim)? {
+                let totals = series.buckets.into_iter().next().map(|b| b.totals).unwrap_or_default();
+                rows.push((dim, series.key, series.label, totals));
+            }
+        }
+        if !rows.iter().any(|(dim, ..)| *dim == Dim::Total) {
+            rows.push((Dim::Total, stats::TOTAL_KEY.into(), stats::TOTAL_KEY.into(), Totals::default()));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM stats_daily WHERE day = ?1", params![day])?;
+        for (dim, key, label, totals) in rows {
+            tx.execute(
+                "INSERT INTO stats_daily (day, dim, key, label, totals, computed_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![day, dim.as_str(), key, label, serde_json::to_string(&totals).unwrap_or_default(), now_ms],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Earliest `ts` across usage rows and upstream events.
+    pub fn stats_earliest_ts(&self) -> rusqlite::Result<Option<i64>> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT MIN(t) FROM (SELECT MIN(ts) AS t FROM usage_records UNION ALL SELECT MIN(ts) FROM upstream_events)",
+            [],
+            |r| r.get(0),
+        )
+    }
+
+    /// @cc [owner:ghuntley,label:persistence] stats-retention
+    /// `prune_stats` MUST delete every usage row and upstream event with `ts < cutoff_ms` and every
+    /// daily rollup for a day ending at or before `cutoff_ms`, in bounded batches so request writes
+    /// are not blocked for the whole prune, and MUST NOT delete anything newer.
+    pub fn prune_stats(&self, cutoff_ms: i64) -> rusqlite::Result<usize> {
+        let mut deleted = 0;
+        for table in ["usage_records", "upstream_events"] {
+            loop {
+                let n = self.conn.lock().unwrap().execute(
+                    &format!("DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE ts < ?1 LIMIT 5000)"),
+                    params![cutoff_ms],
+                )?;
+                deleted += n;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        deleted += self.conn.lock().unwrap().execute(
+            "DELETE FROM stats_daily WHERE (day + 1) * ?1 <= ?2",
+            params![stats::DAY_MS, cutoff_ms],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -633,7 +937,7 @@ mod tests {
                 id: 0, request_id: format!("request-{ts}"), ts, endpoint: "/v1/responses".into(),
                 backend: "codex".into(), model: "model".into(), account_id: account.into(),
                 account_label: account.into(), cache_key: Some("secret-session".into()),
-                status: 200, input_tokens: input, output_tokens: output,
+                status: 200, input_tokens: input, output_tokens: output, ..Default::default()
             }).unwrap();
         }
         let bins = store.monitor_minute_bins(120_000).unwrap();
@@ -651,7 +955,7 @@ mod tests {
             let store = Store::open(&path).unwrap();
             for (key, input) in [(Some("session-a"), Some(12)), (Some("session-a"), None), (Some("session-b"), Some(5))] {
                 store.insert_usage(&UsageRecord {
-                    id: 0, request_id: uuid::Uuid::new_v4().to_string(), ts: 100, endpoint: "/v1/responses".into(), backend: "codex".into(), model: "model-a".into(), account_id: "account-a".into(), account_label: "alice".into(), cache_key: key.map(str::to_string), status: 200, input_tokens: input, output_tokens: input.map(|n| n / 2),
+                    id: 0, request_id: uuid::Uuid::new_v4().to_string(), ts: 100, endpoint: "/v1/responses".into(), backend: "codex".into(), model: "model-a".into(), account_id: "account-a".into(), account_label: "alice".into(), cache_key: key.map(str::to_string), status: 200, input_tokens: input, output_tokens: input.map(|n| n / 2), ..Default::default()
                 }).unwrap();
             }
         }
