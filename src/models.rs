@@ -111,6 +111,10 @@ pub struct RequestLogEntry {
     pub sticky: String,
     pub status: u16,
     pub duration_ms: u64,
+    /// How the response body ended; filled in when a streamed body finishes.
+    pub stream_outcome: Option<String>,
+    /// Sanitized upstream error code for a failed attempt or stream.
+    pub error_code: Option<String>,
 }
 
 pub fn now_ms() -> i64 {

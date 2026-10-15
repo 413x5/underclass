@@ -1,5 +1,5 @@
 use underclass::provider::BackendMap;
-use underclass::{cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, store, tokens, top, ui};
+use underclass::{cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api, store, tokens, top, ui};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -11,6 +11,8 @@ use std::path::Path;
 /// window itself is `tokens::ROTATION_INTERVAL_MS`; this only bounds how late a due token can be,
 /// so a coarse tick keeps the 24h cadence cheap without pinning a timer to the exact deadline.
 const ROTATION_TICK: std::time::Duration = std::time::Duration::from_secs(900);
+/// How often stats retention pruning and finished-day rollups run.
+const STATS_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 
 #[derive(Parser)]
 #[command(name = "underclass", about = "pooled multi-subscription codex/copilot proxy for opencode")]
@@ -43,13 +45,18 @@ enum Command {
         #[clap(flatten)]
         args: cli::ResetArgs,
     },
+    /// show token, session, concurrency, capacity, and refusal statistics from the running server
+    Stats {
+        #[clap(flatten)]
+        args: underclass::stats_cli::StatsArgs,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
     if !matches!(
         cli.command,
-        Some(Command::Top { .. }) | Some(Command::Reset { .. })
+        Some(Command::Top { .. }) | Some(Command::Reset { .. }) | Some(Command::Stats { .. })
     ) {
         logging::init(cli.log_format);
     }
@@ -71,6 +78,12 @@ fn main() {
         }
         Some(Command::Reset { args }) => {
             if let Err(e) = cli::reset(&args) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Stats { args }) => {
+            if let Err(e) = underclass::stats_cli::run(&args) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -167,6 +180,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             cfg.auto_codex_resets,
         )),
         stream_usage_unsupported: Mutex::new(Default::default()),
+        stats_retention_days: cfg.stats_retention_days,
     });
 
     {
@@ -181,6 +195,30 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
                     pool::DEFAULT_BINDING_CAP,
                 );
                 state.pool.lock().unwrap().sync_from_store(&store);
+            }
+        });
+    }
+
+    {
+        let store = store.clone();
+        let retention_days = cfg.stats_retention_days;
+        tokio::spawn(async move {
+            loop {
+                let store = store.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    stats_api::maintain(&store, models::now_ms(), retention_days)
+                })
+                .await;
+                match result {
+                    Ok(Ok((pruned, rolled))) => {
+                        if pruned > 0 || rolled > 0 {
+                            tracing::info!(pruned, rolled, retention_days, "stats.maintained");
+                        }
+                    }
+                    Ok(Err(error)) => tracing::error!(error = %error, "stats.maintenance_failed"),
+                    Err(error) => tracing::error!(error = %error, "stats.maintenance_failed"),
+                }
+                tokio::time::sleep(STATS_TICK).await;
             }
         });
     }
@@ -230,6 +268,8 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route("/admin/api/usage", axum::routing::get(ui::usage_summary))
         .route("/admin/api/usage/requests", axum::routing::get(ui::usage_requests))
         .route("/admin/api/monitor", axum::routing::get(monitor::snapshot))
+        .route("/admin/api/stats", axum::routing::get(stats_api::stats_handler))
+        .route("/admin/api/events/import", axum::routing::post(stats_api::import_handler))
         .route("/admin/api/flows", axum::routing::post(ui::start_flow))
         .route("/admin/api/flows/{id}", axum::routing::get(ui::flow_status))
         .route(

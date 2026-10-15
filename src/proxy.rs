@@ -3,8 +3,8 @@ use crate::models::{now_ms, BackendId, Outcome, RequestLogEntry};
 use crate::pool::{Decision, PoolCore, SelectError, Selection};
 use crate::provider::BackendMap;
 use crate::store::Store;
-use crate::store::UsageRecord;
-use crate::usage::{UsageTap, usage_from_json};
+use crate::store::{UpstreamEvent, UsageRecord};
+use crate::usage::{StreamEnd, StreamOutcome, UsageTap, usage_from_json};
 use crate::tokens::TokenManager;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -33,12 +33,22 @@ pub struct AppState {
     pub ui_token: String,
     pub resets: Arc<crate::resets::ResetManager>,
     pub stream_usage_unsupported: Mutex<std::collections::HashSet<BackendId>>,
+    /// How long usage rows, upstream events, and daily rollups are kept.
+    pub stats_retention_days: i64,
 }
 
+/// @cc [owner:ghuntley,label:accounting] stream-finish-recorded
+/// When a 2xx response body ends for any reason (EOF, upstream error, or client drop),
+/// `UsageFinish` MUST persist exactly one usage row carrying the stream outcome, sanitized error
+/// code, `saw_output`, and duration; MUST log `stream.finished`; MUST annotate the attempt's
+/// ring-buffer entry; and MUST record an upstream event for every `failed` outcome and for an
+/// `incomplete` outcome whose reason is a capacity, policy, or quota code.
 struct UsageFinish {
     store: Arc<Store>,
+    logs: Arc<Mutex<VecDeque<RequestLogEntry>>>,
     record: UsageRecord,
     tap: UsageTap,
+    ended: Option<StreamEnd>,
 }
 
 impl Drop for UsageFinish {
@@ -47,11 +57,83 @@ impl Drop for UsageFinish {
             self.record.input_tokens = Some(counts.input_tokens);
             self.record.output_tokens = Some(counts.output_tokens);
         }
+        let report = self.tap.report(self.ended.unwrap_or(StreamEnd::Dropped));
+        let duration_ms = (now_ms() - self.record.ts).max(0);
+        self.record.duration_ms = Some(duration_ms);
+        self.record.stream_outcome = Some(report.outcome.as_str().to_string());
+        self.record.error_code = report.error_code.clone();
+        self.record.saw_output = Some(report.saw_output);
+        logging::log_stream_finished(
+            &self.record.request_id,
+            &self.record.model,
+            &self.record.account_label,
+            report.outcome.as_str(),
+            report.error_code.as_deref(),
+            report.saw_output,
+            duration_ms,
+        );
+        if let Some(entry) = self
+            .logs
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.request_id == self.record.request_id && entry.account.as_deref() == Some(self.record.account_id.as_str()))
+        {
+            entry.stream_outcome = self.record.stream_outcome.clone();
+            entry.error_code = self.record.error_code.clone();
+        }
+        let kind = crate::usage::event_kind(report.error_code.as_deref());
+        let notable = match report.outcome {
+            StreamOutcome::Failed => true,
+            StreamOutcome::Incomplete => kind != "upstream_failed",
+            _ => false,
+        };
+        if notable {
+            self.store.insert_upstream_event(&event_for(&self.record, kind, "stream", report.error_code.clone()));
+        }
+        // Written last: once the usage row is visible, the event and annotation already exist.
         persist_usage(&self.store, &self.record);
     }
 }
 
+fn event_for(record: &UsageRecord, kind: &str, detail: &str, error_code: Option<String>) -> UpstreamEvent {
+    UpstreamEvent {
+        ts: now_ms(),
+        source: "proxy".into(),
+        kind: kind.into(),
+        detail: Some(detail.into()),
+        error_code,
+        backend: Some(record.backend.clone()),
+        model: Some(record.model.clone()),
+        account_id: Some(record.account_id.clone()),
+        account_label: Some(record.account_label.clone()),
+        request_id: Some(record.request_id.clone()),
+        until_ms: None,
+        dedupe_key: None,
+    }
+}
+
+fn record_saturated(state: &AppState, request_id: &str, model: &str, until_ms: i64) {
+    logging::log_saturated(request_id, until_ms);
+    state.store.insert_upstream_event(&UpstreamEvent {
+        ts: now_ms(),
+        source: "proxy".into(),
+        kind: "pool_saturated".into(),
+        detail: Some("pool".into()),
+        model: Some(model.to_string()),
+        request_id: Some(request_id.to_string()),
+        until_ms: Some(until_ms),
+        ..Default::default()
+    });
+}
+
 fn persist_usage(store: &Store, record: &UsageRecord) {
+    let mut record = record.clone();
+    if record.duration_ms.is_none() {
+        record.duration_ms = Some((now_ms() - record.ts).max(0));
+    }
+    let record = &record;
     if let Err(error) = store.insert_usage(record) {
         tracing::error!(request_id = %record.request_id, error = %error, "usage.persist_failed");
     } else {
@@ -59,9 +141,12 @@ fn persist_usage(store: &Store, record: &UsageRecord) {
     }
 }
 
-fn usage_record(request_id: &str, path: &str, model: &str, sticky: Option<&str>, selection: &Selection, account: &crate::models::Account, status: u16) -> UsageRecord {
+/// `started_ms` is when the attempt began, so `ts .. ts + duration_ms` is the attempt's lifetime.
+#[allow(clippy::too_many_arguments)]
+fn usage_record(request_id: &str, path: &str, model: &str, sticky: Option<&str>, selection: &Selection, account: &crate::models::Account, status: u16, started_ms: i64) -> UsageRecord {
     UsageRecord {
-        id: 0, request_id: request_id.to_string(), ts: now_ms(), endpoint: path.to_string(), backend: selection.backend.as_str().to_string(), model: model.to_string(), account_id: selection.account_id.clone(), account_label: account.label.clone(), cache_key: sticky.map(str::to_string), status, input_tokens: None, output_tokens: None,
+        id: 0, request_id: request_id.to_string(), ts: started_ms, endpoint: path.to_string(), backend: selection.backend.as_str().to_string(), model: model.to_string(), account_id: selection.account_id.clone(), account_label: account.label.clone(), cache_key: sticky.map(str::to_string), status, input_tokens: None, output_tokens: None,
+        ..Default::default()
     }
 }
 
@@ -255,7 +340,7 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         let selection = match selection {
             Ok(sel) => sel,
             Err(SelectError::Saturated { until_ms }) => {
-                logging::log_saturated(&request_id, until_ms);
+                record_saturated(&state, &request_id, &model, until_ms);
                 return attach_request_id(saturated_response(until_ms), &request_id);
             }
             Err(SelectError::NoAccounts) => {
@@ -322,8 +407,9 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         }
     }
 
-    if let Err(SelectError::Saturated { until_ms }) = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model) {
-        logging::log_saturated(&request_id, until_ms);
+    let saturated = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
+    if let Err(SelectError::Saturated { until_ms }) = saturated {
+        record_saturated(&state, &request_id, &model, until_ms);
         return attach_request_id(saturated_response(until_ms), &request_id);
     }
 
@@ -358,6 +444,7 @@ async fn attempt_account(
     refreshed: &mut std::collections::HashSet<String>,
 ) -> Attempt {
     let started = Instant::now();
+    let started_ms = now_ms();
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
         return Attempt::Failover(None);
     };
@@ -416,7 +503,7 @@ async fn attempt_account(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, backend = %selection.backend.as_str(), "upstream.network_error");
-            let record = usage_record(request_id, path, model, sticky, selection, &account, 0);
+            let record = usage_record(request_id, path, model, sticky, selection, &account, 0, started_ms);
             persist_usage(&state.store, &record);
             report_outcome(state, &selection.account_id, Outcome::Transient);
             drop(guard);
@@ -428,7 +515,7 @@ async fn attempt_account(
         let status = response.status();
         let rejection = response.text().await.unwrap_or_default();
         if rejection.contains("stream_options") || rejection.contains("include_usage") {
-            let rejected = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+            let rejected = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
             persist_usage(&state.store, &rejected);
             state.stream_usage_unsupported.lock().unwrap().insert(selection.backend);
             tracing::warn!(request_id = %request_id, backend = %selection.backend.as_str(), "usage.stream_option_unsupported");
@@ -437,14 +524,14 @@ async fn attempt_account(
                 Ok(resp) => resp,
                 Err(error) => {
                     tracing::warn!(request_id = %request_id, error = %error, "upstream.network_error");
-                    let record = usage_record(request_id, path, model, sticky, selection, &account, 0);
+                    let record = usage_record(request_id, path, model, sticky, selection, &account, 0, started_ms);
                     persist_usage(&state.store, &record);
                     drop(guard);
                     return Attempt::Failover(None);
                 }
             };
         } else {
-            let record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+            let record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
             persist_usage(&state.store, &record);
             push_log(state, request_id, model, Some(selection.backend.as_str().to_string()), Some(selection.account_id.clone()), Some(account.label.clone()), sticky.unwrap_or("none"), status.as_u16(), started.elapsed().as_millis() as u64);
             drop(guard);
@@ -458,7 +545,7 @@ async fn attempt_account(
         && refreshed.insert(selection.account_id.clone())
     {
         let body_text = response.text().await.unwrap_or_default();
-        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
         if let Ok(value) = serde_json::from_str::<Value>(&body_text)
             && let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
             record.input_tokens = Some(counts.input_tokens);
@@ -484,13 +571,22 @@ async fn attempt_account(
     if !status.is_success() {
         let resp_headers = response.headers().clone();
         let body_text = response.text().await.unwrap_or_default();
-        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
-        if let Ok(value) = serde_json::from_str::<Value>(&body_text)
-            && let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
-            record.input_tokens = Some(counts.input_tokens);
-            record.output_tokens = Some(counts.output_tokens);
+        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+        if let Ok(value) = serde_json::from_str::<Value>(&body_text) {
+            if let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+                record.input_tokens = Some(counts.input_tokens);
+                record.output_tokens = Some(counts.output_tokens);
+            }
+            record.error_code = value
+                .get("error")
+                .and_then(crate::usage::error_code)
+                .or_else(|| crate::usage::error_code(&value));
         }
         persist_usage(&state.store, &record);
+        let kind = crate::usage::event_kind(record.error_code.as_deref());
+        if record.error_code.is_some() && matches!(kind, "overloaded" | "policy_blocked") {
+            state.store.insert_upstream_event(&event_for(&record, kind, "http", record.error_code.clone()));
+        }
         let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
         if let Some(new_status) = {
             let mut pool = state.pool.lock().unwrap();
@@ -506,6 +602,9 @@ async fn attempt_account(
             match &outcome {
                 Outcome::QuotaExhausted { until_ms } => {
                     logging::log_account_state(&selection.account_id, label, "cooling", &format!("until {until_ms}"));
+                    let mut event = event_for(&record, "quota_cooling", "http", record.error_code.clone());
+                    event.until_ms = Some(*until_ms);
+                    state.store.insert_upstream_event(&event);
                 }
                 Outcome::AuthFailed => {
                     logging::log_account_state(&selection.account_id, label, "auth_error", "upstream rejected credentials");
@@ -545,11 +644,13 @@ async fn attempt_account(
         let stream = response.bytes_stream();
         let finish = UsageFinish {
             store: state.store.clone(),
-            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16()),
+            logs: state.logs.clone(),
+            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
             tap: UsageTap::new(
                 usage_is_stream(&outbound_body, content_type.as_bytes()),
                 backend.usage_is_chat(path),
             ),
+            ended: None,
         };
         let body_stream = Body::from_stream(futures::stream::unfold(
             (stream, Some(guard), finish),
@@ -559,14 +660,20 @@ async fn attempt_account(
                         finish.tap.feed(&chunk);
                         Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish)))
                     },
-                    Some(Err(_)) => Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "upstream stream error",
-                        )),
-                        (stream, guard, finish),
-                    )),
-                    None => None,
+                    Some(Err(_)) => {
+                        finish.ended.get_or_insert(StreamEnd::UpstreamError);
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "upstream stream error",
+                            )),
+                            (stream, guard, finish),
+                        ))
+                    }
+                    None => {
+                        finish.ended.get_or_insert(StreamEnd::Eof);
+                        None
+                    }
                 }
             },
         ));
@@ -636,6 +743,8 @@ fn push_log(
         sticky: sticky.to_string(),
         status,
         duration_ms,
+        stream_outcome: None,
+        error_code: None,
     });
     while logs.len() > LOG_BUFFER {
         logs.pop_front();

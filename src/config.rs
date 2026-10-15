@@ -11,6 +11,7 @@ pub struct FileConfig {
     pub copilot_cooldown_ms: Option<u64>,
     pub codex_cooldown_ms: Option<u64>,
     pub auto_codex_resets: Option<bool>,
+    pub stats_retention_days: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +22,7 @@ pub struct Config {
     pub codex_cooldown_ms: i64,
     pub auto_codex_resets: bool,
     pub copilot_cooldown_ms: i64,
+    pub stats_retention_days: i64,
     pub data_dir: PathBuf,
     #[allow(dead_code)]
     pub config_dir: PathBuf,
@@ -88,6 +90,13 @@ impl Config {
             .or(file_cfg.auto_codex_resets)
             .unwrap_or(true);
 
+        let stats_retention_days = std::env::var("UNDERCLASS_STATS_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .or(file_cfg.stats_retention_days)
+            .unwrap_or(crate::stats::DEFAULT_RETENTION_DAYS)
+            .max(1);
+
         Self {
             bind,
             proxy_key,
@@ -95,6 +104,7 @@ impl Config {
             codex_cooldown_ms,
             auto_codex_resets,
             copilot_cooldown_ms,
+            stats_retention_days,
             data_dir,
             config_dir,
         }

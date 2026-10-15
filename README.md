@@ -63,6 +63,7 @@ opencode --provider underclass --model underclass/gpt-5.5
 - **Health pool.** A quota response moves an account to *cooling* until the upstream deadline or a per-backend default. Codex uses the later valid deadline from its usage-limit error and `retry-after`, and its account usage poll can extend cooldown to a later exhausted-window reset or readmit an account when upstream reports it allowed. 401s trigger one token refresh + retry, then the account needs re-login. Cooling accounts stay configured and return to rotation automatically.
 - **Codex usage and banked resets.** The admin page shows per-account usage windows and available reset credits. When a live request finds every enabled ChatGPT/Codex account unavailable, underclass can redeem one banked reset, choosing the account that would otherwise wait longest for natural quota recovery. This is enabled by default; set `auto_codex_resets = false` in `~/.config/underclass/config.toml` or `UNDERCLASS_AUTO_CODEX_RESETS=false` to disable automatic redemption. To spend a credit by hand, click **Use reset** on the account row in the admin page or run `underclass reset <email-or-id>` against the running server (it uses the same admin token resolution as `underclass top`; pass `--url` plus `UNDERCLASS_UI_TOKEN` for a remote server). The manual path redeems exactly one credit for that account, refuses when upstream reports the account is not rate limited or a reset already redeemed for this outage has not restored usage, and `--force` overrides both refusals.
 - **Token accounting.** Each upstream attempt is recorded in SQLite with its model, account, prompt cache key, and reported input/output tokens. Missing counts remain marked unknown. The admin page shows current-month totals and filters; historical rows remain queryable after account removal.
+- **Stream outcomes and statistics.** A 2xx stream can still fail upstream (e.g. `response.failed` with `server_is_overloaded`, which Codex shows as "Selected model is at capacity"). underclass records how every body ended (`completed`, `failed`, `incomplete`, `truncated`, `upstream_error`, `client_closed`), the sanitized error code, and the attempt duration. It logs `stream.finished` at warn for failures, and records capacity, policy (`cyber_policy`), quota, and saturation events. `underclass stats` and the admin page's Statistics panel report requests, sessions, tokens, peak and mean concurrency, outcomes, and events over up to two years. See [ADR 0021](docs/adr/0021-stream-outcome-and-capacity-statistics.md).
 - **Fail fast.** If every account eligible for the requested model is cooling, the proxy answers `429` + `Retry-After` = earliest reset. No queuing.
 - **Flat pool.** Codex and Copilot accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to Codex so new models work without proxy changes.
 - **Pre-first-byte failover only.** Once a stream starts, upstream errors pass through — no silent re-send of half-finished turns.
@@ -80,8 +81,9 @@ Optional `~/.config/underclass/config.toml`:
 | `ui_token` | minted on first run | admin token for the web UI + `/admin/api/*` |
 | `codex_cooldown_secs` | `1800` | cooling window when upstream omits `retry-after` |
 | `copilot_cooldown_secs` | `1800` | same, for Copilot |
+| `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path). For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM` (default to the real endpoints).
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM` (default to the real endpoints).
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -90,9 +92,13 @@ State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.lo
 ```
 underclass serve [--bind ADDR]
 underclass top [--url HTTP_OR_HTTPS_ORIGIN]
+underclass stats [--since 24h|7d|90d|2y] [--bucket minute|hour|day] [--by total|model|account] [--json] [--url ORIGIN]
+underclass stats import-codex [--dir DIR]... [--dry-run] [--url ORIGIN]
 underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
                    [--project] [--no-default-model] [--dry-run] [--remove]
 ```
+
+`stats` prints a UTC table with these columns: requests, sessions, tokens in/out, peak/mean concurrency, failed streams, and overloaded / policy / quota / cooling / saturated events. It uses the same admin token resolution as `top`. `stats import-codex` backfills capacity, quota, retry-exhaustion, and policy errors (such as `cyber_policy`) from `$CODEX_HOME/sessions` rollout logs. It sends only timestamps, kinds, codes, models, and dedupe keys, and is safe to re-run.
 
 `connect` targets the global opencode config by default; `--project` writes `./.opencode/opencode.json` instead. `--dry-run` prints the merged documents without writing.
 
@@ -110,6 +116,8 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `GET /admin/api/usage` | admin token | token totals grouped by `group_by=model,account_id,cache_key` (any subset) |
 | `GET /admin/api/usage/requests` | admin token | paginated per-attempt accounting rows |
 | `GET /admin/api/monitor` | admin token | compact read-only live monitor snapshot |
+| `GET /admin/api/stats` | admin token | bucketed requests, sessions, tokens, concurrency, outcomes, events (`since`, `bucket`, `by`) |
+| `POST /admin/api/events/import` | admin token | idempotent upstream-event backfill (used by `stats import-codex`) |
 | `POST /admin/api/flows` | admin token | start a device-flow onboarding |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |
@@ -256,6 +264,10 @@ src/
   copilot.rs   GitHub Copilot backend (device flow, catalog, headers)
   tokens.rs    single-flight token refresh
   proxy.rs     /v1/* handlers, failover, streaming
+  usage.rs     token + stream-outcome tap over upstream bodies
+  stats.rs     pure stats core: concurrency sweep, bucketing, rollup merge
+  stats_api.rs stats query, event import, retention/rollup maintenance
+  stats_cli.rs `stats` verb and Codex rollout import
   logging.rs   structured logs, correlation IDs, redaction
   ui.rs        admin API
   ui.html      embedded single-page web UI

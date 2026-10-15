@@ -34,6 +34,15 @@
   .spin { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   section.card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 16px; margin-top: 16px; }
+  .bad { color: #f85149; }
+  .strip { display: flex; align-items: flex-end; gap: 1px; height: 80px; margin: 10px 0 4px; border-bottom: 1px solid #30363d; }
+  .strip > div { flex: 1 1 0; display: flex; flex-direction: column-reverse; min-width: 1px; height: 100%; }
+  .strip span { display: block; width: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 0.75rem; color: #8b949e; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .k-overloaded { background: #f85149; } .k-policy_blocked { background: #a371f7; } .k-quota_exhausted { background: #d29922; }
+  .k-retries_exhausted { background: #db6d28; } .k-upstream_failed { background: #8b949e; } .k-quota_cooling { background: #e3b341; }
+  .k-pool_saturated { background: #58a6ff; }
 </style>
 </head>
 <body>
@@ -53,6 +62,31 @@
       <tbody></tbody>
     </table>
     <p class="muted">Healthy accounts serve requests. Quota exhaustion moves an account to <b>cooling</b> until its window resets — it stays configured. <b>auth error</b> accounts need re-login.</p>
+  </section>
+
+  <section class="card">
+    <h2 style="margin-top:0">Statistics</h2>
+    <p class="muted">Requests, sessions (prompt-cache keys), tokens, concurrency, stream outcomes, and upstream events — capacity (<i>overloaded</i>), policy refusals, quota — over time. Times in UTC.</p>
+    <div class="row" style="flex-wrap:wrap">
+      <select id="statsRange" aria-label="Range" style="width:auto">
+        <option value="24h|hour">24 hours (hourly)</option>
+        <option value="7d|hour">7 days (hourly)</option>
+        <option value="30d|day">30 days (daily)</option>
+        <option value="90d|day" selected>90 days (daily)</option>
+        <option value="1y|day">1 year (daily)</option>
+        <option value="2y|day">2 years (daily)</option>
+      </select>
+      <select id="statsBy" aria-label="Group by" style="width:auto">
+        <option value="total">over time</option>
+        <option value="model">by model</option>
+        <option value="account">by account</option>
+      </select>
+      <button onclick="loadStats()">Query</button>
+    </div>
+    <p id="statsTotals" class="muted"></p>
+    <div id="statsStrip" class="strip" aria-label="Upstream events per bucket"></div>
+    <div id="statsLegend" class="legend"></div>
+    <table id="statsTable" style="margin-top:12px"><thead><tr><th></th><th>requests</th><th>sessions</th><th>tokens in</th><th>tokens out</th><th>peak</th><th>mean</th><th>failed</th><th>overloaded</th><th>policy</th><th>quota</th><th>cooling</th><th>saturated</th></tr></thead><tbody></tbody></table>
   </section>
 
   <section class="card">
@@ -216,11 +250,11 @@ async function loadState() {
       const t = new Date(r.ts).toLocaleTimeString();
       tr.innerHTML = `<td>${t}</td><td class="muted">${esc(r.request_id.slice(0,8))}</td><td>${esc(r.model)}</td>
         <td>${r.backend ?? '—'}</td><td>${r.label ? esc(r.label) : (r.account ? esc(r.account.slice(0,8)) : '—')}</td>
-        <td>${esc(r.sticky)}</td><td>${r.status}</td><td>${r.duration_ms}</td>`;
+        <td>${esc(r.sticky)}</td><td>${fmtStatus(r.status, r.stream_outcome, r.error_code)}</td><td>${r.duration_ms}</td>`;
       rbody.appendChild(tr);
     }
     document.getElementById('snippet').textContent = JSON.stringify(snippet(data.catalog), null, 2);
-    if (!usageLoaded) await loadUsage();
+    if (!usageLoaded) { await loadUsage(); await loadStats(); }
   } catch (e) { /* token dialog already handling 401 */ }
 }
 
@@ -284,11 +318,77 @@ async function loadMoreUsage() {
   if (usageOffset === 0) body.innerHTML = '';
   for (const row of data.requests) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${new Date(row.ts).toLocaleString()}</td><td>${esc(row.request_id.slice(0,8))}</td><td>${esc(row.model)}</td><td>${esc(row.account_label)}</td><td>${esc(row.cache_key ?? '—')}</td><td>${row.status}</td><td>${row.input_tokens ?? '?'}</td><td>${row.output_tokens ?? '?'}</td>`;
+    tr.innerHTML = `<td>${new Date(row.ts).toLocaleString()}</td><td>${esc(row.request_id.slice(0,8))}</td><td>${esc(row.model)}</td><td>${esc(row.account_label)}</td><td>${esc(row.cache_key ?? '—')}</td><td>${fmtStatus(row.status, row.stream_outcome, row.error_code)}</td><td>${row.input_tokens ?? '?'}</td><td>${row.output_tokens ?? '?'}</td>`;
     body.appendChild(tr);
   }
   usageOffset += data.requests.length;
   document.getElementById('usageMore').hidden = data.requests.length < 50;
+}
+
+function fmtStatus(status, outcome, code) {
+  let text = String(status);
+  if (outcome && outcome !== 'completed') text += ' · ' + outcome;
+  if (code) text += ': ' + code;
+  const bad = status >= 400 || (outcome && !['completed', 'client_closed'].includes(outcome));
+  return `<span class="${bad ? 'bad' : ''}">${esc(text)}</span>`;
+}
+
+const EVENT_KINDS = ['overloaded', 'policy_blocked', 'quota_exhausted', 'retries_exhausted', 'upstream_failed', 'quota_cooling', 'pool_saturated'];
+function human(n) {
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (a >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (a >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function statsCells(name, t) {
+  const o = t.outcomes || {}, e = t.events || {};
+  const failed = (o.failed || 0) + (o.incomplete || 0) + (o.truncated || 0);
+  return `<td>${esc(name)}</td><td>${t.requests}</td><td>${t.sessions}</td><td>${human(t.input_tokens)}</td><td>${human(t.output_tokens)}</td>`
+    + `<td>${t.peak_concurrency}</td><td>${(t.mean_concurrency_milli / 1000).toFixed(1)}</td><td>${failed}</td>`
+    + `<td>${e.overloaded || 0}</td><td>${e.policy_blocked || 0}</td><td>${e.quota_exhausted || 0}</td><td>${e.quota_cooling || 0}</td><td>${e.pool_saturated || 0}</td>`;
+}
+function bucketLabel(ms, bucket) {
+  const iso = new Date(ms).toISOString();
+  return bucket === 'day' ? iso.slice(0, 10) : iso.slice(0, 16).replace('T', ' ');
+}
+
+async function loadStats() {
+  const [since, bucket] = document.getElementById('statsRange').value.split('|');
+  const by = document.getElementById('statsBy').value;
+  const res = await api('/admin/api/stats?' + new URLSearchParams({ since, bucket, by }));
+  const totalsEl = document.getElementById('statsTotals');
+  if (!res.ok) { totalsEl.textContent = 'Stats query failed: ' + await res.text(); return; }
+  const data = await res.json();
+  const t = data.totals;
+  const events = Object.entries(t.events || {}).map(([k, v]) => `${k} ${v}`).join(' · ') || 'no upstream events';
+  totalsEl.textContent = `${t.requests} requests · ${t.sessions} sessions · ${human(t.input_tokens)} in / ${human(t.output_tokens)} out tokens · peak ${t.peak_concurrency} concurrent (mean ${(t.mean_concurrency_milli / 1000).toFixed(1)}) · ${data.live_inflight} in flight now · ${events}`;
+  const strip = document.getElementById('statsStrip');
+  strip.innerHTML = '';
+  const max = Math.max(1, ...data.buckets.map(b => EVENT_KINDS.reduce((n, k) => n + ((b.events || {})[k] || 0), 0)));
+  for (const b of data.buckets) {
+    const col = document.createElement('div');
+    const parts = EVENT_KINDS.filter(k => (b.events || {})[k]);
+    col.title = bucketLabel(b.start_ms, data.bucket) + (parts.length ? ': ' + parts.map(k => `${k} ${b.events[k]}`).join(', ') : ': none');
+    for (const k of parts) {
+      const seg = document.createElement('span');
+      seg.className = 'k-' + k;
+      seg.style.height = (100 * b.events[k] / max) + '%';
+      col.appendChild(seg);
+    }
+    strip.appendChild(col);
+  }
+  document.getElementById('statsLegend').innerHTML = EVENT_KINDS.map(k => `<span><i class="k-${k}"></i>${k}</span>`).join('') + `<span>max ${max} per ${data.bucket}</span>`;
+  const body = document.querySelector('#statsTable tbody');
+  body.innerHTML = '';
+  const rows = data.series.length
+    ? data.series.map(s => [s.label, s.totals])
+    : data.buckets.slice().reverse().map(b => [bucketLabel(b.start_ms, data.bucket), b]);
+  for (const [name, totals] of rows.concat([['total', t]])) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = statsCells(name, totals);
+    body.appendChild(tr);
+  }
 }
 
 function formatUsage(usage) {

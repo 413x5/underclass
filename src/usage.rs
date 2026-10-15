@@ -27,6 +27,101 @@ pub fn usage_from_json(value: &Value, chat: bool) -> Option<TokenCounts> {
     }
 }
 
+/// How an upstream response body ended, as observed by the proxy while passing it through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamOutcome {
+    /// `response.completed`, chat `[DONE]`, or a successful non-stream body.
+    Completed,
+    /// `response.failed`, a stream `error` event, or an error object in the body.
+    Failed,
+    /// `response.incomplete`.
+    Incomplete,
+    /// Upstream closed the stream without a terminal event.
+    Truncated,
+    /// The upstream body errored mid-transfer.
+    UpstreamError,
+    /// The client went away before the stream ended.
+    ClientClosed,
+}
+
+impl StreamOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Incomplete => "incomplete",
+            Self::Truncated => "truncated",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientClosed => "client_closed",
+        }
+    }
+}
+
+/// Why the proxy stopped reading an upstream body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    Eof,
+    UpstreamError,
+    Dropped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamReport {
+    pub outcome: StreamOutcome,
+    pub error_code: Option<String>,
+    /// Whether any model output reached the client before the stream ended.
+    pub saw_output: bool,
+}
+
+const MAX_CODE_LEN: usize = 64;
+
+/// @cc [owner:ghuntley,label:security] error-code-sanitized
+/// `sanitize_code` MUST return only ASCII alphanumerics, `_`, `-`, and `.`, at most 64 bytes, and
+/// `None` when nothing remains; upstream error codes pass through it before they are logged or
+/// stored, so free-form upstream `message` text can never reach logs or the database.
+pub fn sanitize_code(raw: &str) -> Option<String> {
+    let code: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(MAX_CODE_LEN)
+        .collect();
+    (!code.is_empty()).then_some(code)
+}
+
+/// Extracts `code`, falling back to `type`, from an upstream error object.
+pub fn error_code(error: &Value) -> Option<String> {
+    error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .and_then(sanitize_code)
+}
+
+/// Whether an upstream error code means the model is out of serving capacity.
+pub fn is_overload_code(code: &str) -> bool {
+    let code = code.to_ascii_lowercase();
+    code == "slow_down" || code.contains("overload") || code.contains("capacity")
+}
+
+/// @cc [owner:ghuntley,label:accounting] upstream-event-kind
+/// `event_kind` MUST map an upstream error code to exactly one stats kind: `overloaded` for
+/// capacity codes, `policy_blocked` for policy/safety refusals (e.g. `cyber_policy`),
+/// `quota_exhausted` for usage-limit codes, and `upstream_failed` otherwise.
+pub fn event_kind(code: Option<&str>) -> &'static str {
+    let Some(code) = code else { return "upstream_failed" };
+    let lower = code.to_ascii_lowercase();
+    if is_overload_code(&lower) {
+        "overloaded"
+    } else if lower.contains("policy") || lower.contains("content_filter") || lower.contains("safety") {
+        "policy_blocked"
+    } else if lower.contains("usage_limit") || lower.contains("quota") || lower.contains("usage_not_included") {
+        "quota_exhausted"
+    } else {
+        "upstream_failed"
+    }
+}
+
 /// @cc [owner:ghuntley,label:accounting] usage-tap-bounded
 /// The tap MUST retain at most one megabyte of upstream data while scanning and MUST count only
 /// non-negative upstream-reported token pairs; absent, malformed, or incomplete usage is unknown.
@@ -35,8 +130,11 @@ pub struct UsageTap {
     chat: bool,
     buffer: Vec<u8>,
     event_data: Vec<u8>,
+    event_name: Option<String>,
     overflow: bool,
     counts: Option<TokenCounts>,
+    terminal: Option<(StreamOutcome, Option<String>)>,
+    saw_output: bool,
 }
 
 impl UsageTap {
@@ -46,8 +144,11 @@ impl UsageTap {
             chat,
             buffer: Vec::new(),
             event_data: Vec::new(),
+            event_name: None,
             overflow: false,
             counts: None,
+            terminal: None,
+            saw_output: false,
         }
     }
 
@@ -70,6 +171,12 @@ impl UsageTap {
                 let line = line.strip_suffix(b"\r").unwrap_or(&line);
                 if line.is_empty() {
                     self.finish_event();
+                } else if !self.overflow && line.starts_with(b"event:") {
+                    let name = line[6..].strip_prefix(b" ").unwrap_or(&line[6..]);
+                    self.event_name = std::str::from_utf8(name)
+                        .ok()
+                        .filter(|name| name.len() <= MAX_CODE_LEN)
+                        .map(str::to_string);
                 } else if !self.overflow && line.starts_with(b"data:") {
                     let data = line[5..].strip_prefix(b" ").unwrap_or(&line[5..]);
                     let separator = usize::from(!self.event_data.is_empty());
@@ -104,24 +211,112 @@ impl UsageTap {
     }
 
     fn finish_event(&mut self) {
-        if !self.overflow {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.event_data) {
-                let counts = if self.chat {
-                    usage_from_json(&value, true)
-                } else if value.get("type").and_then(Value::as_str) == Some("response.completed") {
-                    value
-                        .get("response")
-                        .and_then(|response| usage_from_json(response, false))
-                } else {
-                    None
-                };
-                if counts.is_some() {
-                    self.counts = counts;
+        let parsed = if self.overflow {
+            None
+        } else {
+            serde_json::from_slice::<Value>(&self.event_data).ok()
+        };
+        if let Some(value) = &parsed {
+            let counts = if self.chat {
+                usage_from_json(value, true)
+            } else if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+                value
+                    .get("response")
+                    .and_then(|response| usage_from_json(response, false))
+            } else {
+                None
+            };
+            if counts.is_some() {
+                self.counts = counts;
+            }
+        }
+        if self.chat {
+            if !self.overflow && self.event_data.trim_ascii() == b"[DONE]" {
+                self.set_terminal(StreamOutcome::Completed, None);
+            } else if let Some(value) = &parsed {
+                if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
+                    self.set_terminal(StreamOutcome::Failed, error_code(error));
+                } else if value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| !choices.is_empty())
+                {
+                    self.saw_output = true;
                 }
+            }
+        } else {
+            // The SSE `event:` name survives even when an oversized data payload was dropped.
+            let kind = parsed
+                .as_ref()
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| self.event_name.clone());
+            let response = parsed.as_ref().and_then(|v| v.get("response"));
+            match kind.as_deref() {
+                Some("response.completed") => self.set_terminal(StreamOutcome::Completed, None),
+                Some("response.failed") => {
+                    let code = response.and_then(|r| r.get("error")).and_then(error_code);
+                    self.set_terminal(StreamOutcome::Failed, code);
+                }
+                Some("response.incomplete") => {
+                    let reason = response
+                        .and_then(|r| r.get("incomplete_details"))
+                        .and_then(|d| d.get("reason"))
+                        .and_then(Value::as_str)
+                        .and_then(sanitize_code);
+                    self.set_terminal(StreamOutcome::Incomplete, reason);
+                }
+                Some("error") => {
+                    let code = parsed.as_ref().and_then(|v| {
+                        error_code(v).or_else(|| v.get("error").and_then(error_code))
+                    });
+                    self.set_terminal(StreamOutcome::Failed, code);
+                }
+                Some(kind) if kind == "response.output_item.added" || kind.ends_with(".delta") => {
+                    self.saw_output = true;
+                }
+                _ => {}
             }
         }
         self.event_data.clear();
+        self.event_name = None;
         self.overflow = false;
+    }
+
+    fn set_terminal(&mut self, outcome: StreamOutcome, code: Option<String>) {
+        if self.terminal.is_none() {
+            self.terminal = Some((outcome, code));
+        }
+    }
+
+    /// @cc [owner:ghuntley,label:accounting] stream-outcome-classified
+    /// `report` MUST prefer the first terminal event seen in the body (`response.completed`,
+    /// `response.failed`, `response.incomplete`, stream `error`, chat `[DONE]`) over how the
+    /// transfer ended; without one, a streamed body MUST be `truncated` on EOF, `upstream_error` on a
+    /// transport error, and `client_closed` when dropped. The result MUST NOT depend on how the body
+    /// was split into chunks.
+    pub fn report(&self, end: StreamEnd) -> StreamReport {
+        let (outcome, error_code) = if let Some((outcome, code)) = &self.terminal {
+            (*outcome, code.clone())
+        } else {
+            match end {
+                StreamEnd::Eof if !self.stream => {
+                    let error = (!self.overflow)
+                        .then(|| serde_json::from_slice::<Value>(&self.buffer).ok())
+                        .flatten()
+                        .and_then(|v| v.get("error").filter(|e| !e.is_null()).cloned());
+                    match error {
+                        Some(error) => (StreamOutcome::Failed, error_code(&error)),
+                        None => (StreamOutcome::Completed, None),
+                    }
+                }
+                StreamEnd::Eof => (StreamOutcome::Truncated, None),
+                StreamEnd::UpstreamError => (StreamOutcome::UpstreamError, None),
+                StreamEnd::Dropped => (StreamOutcome::ClientClosed, None),
+            }
+        };
+        StreamReport { outcome, error_code, saw_output: self.saw_output }
     }
 
     pub fn counts(&self) -> Option<TokenCounts> {
@@ -175,6 +370,96 @@ mod tests {
         let mut tap = UsageTap::new(true, false);
         tap.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n");
         assert_eq!(tap.counts(), None);
+    }
+
+    #[test]
+    fn overloaded_failure_before_output() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n");
+        tap.feed(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity.\"}}}\n\n");
+        assert_eq!(
+            tap.report(StreamEnd::Eof),
+            StreamReport {
+                outcome: StreamOutcome::Failed,
+                error_code: Some("server_is_overloaded".into()),
+                saw_output: false
+            }
+        );
+    }
+
+    #[test]
+    fn failure_after_output_records_saw_output() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+        tap.feed(b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\"}}}\n\n");
+        let report = tap.report(StreamEnd::Dropped);
+        assert_eq!(report.outcome, StreamOutcome::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("server_error"));
+        assert!(report.saw_output);
+    }
+
+    #[test]
+    fn incomplete_reports_reason() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n");
+        let report = tap.report(StreamEnd::Eof);
+        assert_eq!(report.outcome, StreamOutcome::Incomplete);
+        assert_eq!(report.error_code.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[test]
+    fn missing_terminal_event_depends_on_how_stream_ended() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n");
+        assert_eq!(tap.report(StreamEnd::Eof).outcome, StreamOutcome::Truncated);
+        assert_eq!(tap.report(StreamEnd::UpstreamError).outcome, StreamOutcome::UpstreamError);
+        assert_eq!(tap.report(StreamEnd::Dropped).outcome, StreamOutcome::ClientClosed);
+    }
+
+    #[test]
+    fn chat_done_and_chat_error() {
+        let mut tap = UsageTap::new(true, true);
+        tap.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n");
+        let report = tap.report(StreamEnd::Eof);
+        assert_eq!((report.outcome, report.saw_output), (StreamOutcome::Completed, true));
+        let mut tap = UsageTap::new(true, true);
+        tap.feed(b"data: {\"error\":{\"code\":\"model_overloaded\",\"message\":\"busy\"}}\n\n");
+        assert_eq!(tap.report(StreamEnd::Eof).error_code.as_deref(), Some("model_overloaded"));
+    }
+
+    #[test]
+    fn oversized_terminal_event_still_classified_by_event_name() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"event: response.completed\ndata: ");
+        tap.feed(&vec![b'x'; MAX_CAPTURE_BYTES + 10]);
+        tap.feed(b"\n\n");
+        assert_eq!(tap.report(StreamEnd::Eof).outcome, StreamOutcome::Completed);
+    }
+
+    #[test]
+    fn non_stream_bodies() {
+        let mut tap = UsageTap::new(false, false);
+        tap.feed(b"{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}");
+        assert_eq!(tap.report(StreamEnd::Eof).outcome, StreamOutcome::Completed);
+        let mut tap = UsageTap::new(false, false);
+        tap.feed(b"{\"error\":{\"code\":\"server_is_overloaded\"}}");
+        assert_eq!(tap.report(StreamEnd::Eof).error_code.as_deref(), Some("server_is_overloaded"));
+    }
+
+    #[test]
+    fn codes_are_sanitized() {
+        assert_eq!(sanitize_code("Selected model is at capacity."), Some("Selectedmodelisatcapacity.".into()));
+        assert_eq!(sanitize_code("  "), None);
+        assert_eq!(sanitize_code(&"a".repeat(100)).unwrap().len(), 64);
+        assert!(is_overload_code("server_is_overloaded"));
+        assert!(is_overload_code("server_overloaded"));
+        assert!(is_overload_code("slow_down"));
+        assert!(!is_overload_code("rate_limit_exceeded"));
+        assert_eq!(event_kind(Some("server_is_overloaded")), "overloaded");
+        assert_eq!(event_kind(Some("cyber_policy")), "policy_blocked");
+        assert_eq!(event_kind(Some("usage_limit_reached")), "quota_exhausted");
+        assert_eq!(event_kind(Some("server_error")), "upstream_failed");
+        assert_eq!(event_kind(None), "upstream_failed");
     }
 
     #[test]
