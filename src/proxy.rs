@@ -115,9 +115,10 @@ fn event_for(record: &UsageRecord, kind: &str, detail: &str, error_code: Option<
 }
 
 fn record_saturated(state: &AppState, request_id: &str, model: &str, until_ms: i64) {
-    logging::log_saturated(request_id, until_ms);
+    let now = now_ms();
+    logging::log_saturated(request_id, until_ms, now);
     state.store.insert_upstream_event(&UpstreamEvent {
-        ts: now_ms(),
+        ts: now,
         source: "proxy".into(),
         kind: "pool_saturated".into(),
         detail: Some("pool".into()),
@@ -332,9 +333,10 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 
         if matches!(selection, Err(SelectError::Saturated { .. })) && !reset_after_quota {
             reset_after_quota = true;
-            if state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await {
-                selection = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
-            }
+            // Always select again: the reset attempt can wait on the shared reset lock and on
+            // usage fetches, during which cooling deadlines may pass even if nothing was redeemed.
+            state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
+            selection = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
         }
 
         let selection = match selection {

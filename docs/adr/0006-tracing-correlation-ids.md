@@ -14,7 +14,7 @@ Use the `tracing` ecosystem:
 
 - `tracing-subscriber` with JSON output by default (pretty when attached to a TTY; `--log-format json|pretty` to override). Filter via `RUST_LOG`, default `info`.
 - Validated request-ID middleware assigns or propagates `x-request-id`; the ID is echoed on every handled response. [ADR 0012](0012-cross-proxy-request-correlation.md) specifies the shared UUIDv4 protocol with preflight.
-- Each request logs structured events with fields: `request.selected` (request_id, model, decision, backend, account), `request.completed` (request_id, status, duration_ms), `request.saturated` (request_id, retry_after_ms), and account lifecycle events (`account.cooling`, `account.auth_error`).
+- Each request logs structured events with fields: `request.selected` (request_id, model, decision, backend, account), `request.completed` (request_id, status, duration_ms), `request.saturated` (request_id, retry_after_ms relative wait, until_ms absolute reset), and account lifecycle events (`account.cooling`, `account.auth_error`).
 - Redaction rules live in `logging.rs`: access/refresh tokens, authorization headers, and prompt bodies are never logged; account IDs are truncated to 8 characters.
 
 ## Consequences

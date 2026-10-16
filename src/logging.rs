@@ -100,10 +100,12 @@ pub fn log_stream_finished(
     }
 }
 
-pub fn log_saturated(request_id: &str, retry_after_ms: i64) {
+/// `until_ms` is the absolute epoch-millisecond pool reset; `retry_after_ms` is the relative wait.
+pub fn log_saturated(request_id: &str, until_ms: i64, now_ms: i64) {
     tracing::warn!(
         request_id = %request_id,
-        retry_after_ms = retry_after_ms,
+        retry_after_ms = until_ms.saturating_sub(now_ms).max(0),
+        until_ms = until_ms,
         "request.saturated"
     );
 }

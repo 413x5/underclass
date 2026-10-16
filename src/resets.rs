@@ -172,6 +172,19 @@ pub fn blocked_cooling_deadline(status: AccountStatus, current: i64, recovery: i
     }
 }
 
+/// Cheap pre-check so requests do not queue on the reset lock while a Codex account can serve.
+fn codex_pool_blocked(pool: &Arc<Mutex<PoolCore>>, now: i64) -> bool {
+    let mut core = pool.lock().unwrap();
+    core.sweep(now);
+    let mut codex = core
+        .accounts
+        .values()
+        .map(|s| &s.account)
+        .filter(|a| a.backend == BackendId::Codex && a.status != AccountStatus::Disabled)
+        .peekable();
+    codex.peek().is_some() && !codex.any(|a| a.healthy())
+}
+
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub account_id: String,
@@ -434,7 +447,7 @@ impl ResetManager {
         tokens: &TokenManager,
         request_id: &str,
     ) -> bool {
-        if !self.enabled {
+        if !self.enabled || !codex_pool_blocked(pool, now_ms()) {
             return false;
         }
         let _guard = self.lock.lock().await;
