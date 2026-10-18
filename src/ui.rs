@@ -55,6 +55,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
     json!({
         "id": account.id,
         "backend": account.backend.as_str(),
+        "plan": account.chatgpt_plan(),
         "label": account.label,
         "status": account.status,
         "reset_at": account.reset_at,
