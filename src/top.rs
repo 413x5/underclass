@@ -419,6 +419,7 @@ fn draw_accounts(
             let cells = if compact {
                 vec![
                     Cell::from(display_text(&account.label)),
+                    Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
                     Cell::from(status).style(Style::default().fg(status_color(account.status))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
@@ -429,6 +430,7 @@ fn draw_accounts(
             } else {
                 vec![
                     Cell::from(display_text(&account.label)),
+                    Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
                     Cell::from(account.backend.as_str()),
                     Cell::from(status).style(Style::default().fg(status_color(account.status))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
@@ -467,9 +469,10 @@ fn draw_accounts(
         .collect();
     let (headers, widths): (Vec<&str>, Vec<Constraint>) = if compact {
         (
-            vec!["ACCOUNT", "STATE", "LIVE", "SESS", "QUOTA LEFT"],
+            vec!["ACCOUNT", "PLAN", "STATE", "LIVE", "SESS", "QUOTA LEFT"],
             vec![
-                Constraint::Percentage(30),
+                Constraint::Percentage(25),
+                Constraint::Length(12),
                 Constraint::Percentage(22),
                 Constraint::Length(5),
                 Constraint::Length(5),
@@ -480,6 +483,7 @@ fn draw_accounts(
         (
             vec![
                 "ACCOUNT",
+                "PLAN",
                 "BACKEND",
                 "STATE",
                 "LIVE",
@@ -490,6 +494,7 @@ fn draw_accounts(
             ],
             vec![
                 Constraint::Percentage(20),
+                Constraint::Length(12),
                 Constraint::Length(9),
                 Constraint::Percentage(16),
                 Constraint::Length(5),
@@ -761,6 +766,7 @@ mod tests {
             id: "a".into(),
             label: "alice".into(),
             backend: BackendId::Codex,
+            plan: Some("plus".into()),
             status: AccountStatus::Healthy,
             reset_at: 0,
             inflight: 0,
@@ -812,7 +818,12 @@ mod tests {
                 snapshot: Some(MonitorSnapshot {
                     now_ms: 120_000,
                     month_start_ms: 0,
-                    accounts: vec![],
+                    accounts: vec![MonitorAccount {
+                        id: "account".into(), label: "test account".into(),
+                        backend: BackendId::Codex, plan: Some("plus".into()),
+                        status: AccountStatus::Healthy, reset_at: 0, inflight: 0,
+                        sticky_sessions: 0, month: Counters::default(), quota: None,
+                    }],
                     month: Counters::default(),
                     last_minute: Counters::default(),
                     minute_bins: vec![0; 60],
@@ -821,6 +832,12 @@ mod tests {
                 ..Default::default()
             };
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            if width >= 80 {
+                let screen = terminal.backend().buffer().content().iter()
+                    .map(|cell| cell.symbol()).collect::<String>();
+                assert!(screen.contains("PLAN"));
+                assert!(screen.contains("plus"));
+            }
         }
     }
 

@@ -69,6 +69,29 @@ pub struct Account {
 }
 
 impl Account {
+    /// @cc [owner:ghuntley,label:monitor] account-plan-metadata-only
+    /// `chatgpt_plan` MUST return only a nonempty string from the stored Codex access
+    /// token's `chatgpt_plan_type` claim (namespaced auth claim preferred), or None.
+    /// Other backends and malformed tokens MUST return None; no I/O is permitted.
+    pub fn chatgpt_plan(&self) -> Option<String> {
+        if self.backend != BackendId::Codex {
+            return None;
+        }
+        let claims = crate::jwt::parse_jwt_claims(self.access_token.as_deref()?)?;
+        claims
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_plan_type"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                claims
+                    .get("chatgpt_plan_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .map(str::to_owned)
+    }
+
     pub fn healthy(&self) -> bool {
         self.status == AccountStatus::Healthy
     }
@@ -126,4 +149,52 @@ pub fn now_ms() -> i64 {
 
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+
+    fn token(claims: serde_json::Value) -> String {
+        format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()))
+    }
+
+    #[test]
+    fn plan_is_per_account_and_tracks_current_token() {
+        let mut plus = crate::flows::new_account(BackendId::Codex, "plus account".into());
+        plus.access_token = Some(token(
+            json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}}),
+        ));
+        let mut pro = plus.clone();
+        pro.access_token = Some(token(json!({"chatgpt_plan_type": "pro"})));
+        assert_eq!(plus.chatgpt_plan().as_deref(), Some("plus"));
+        assert_eq!(pro.chatgpt_plan().as_deref(), Some("pro"));
+        plus.access_token = pro.access_token.clone();
+        assert_eq!(plus.chatgpt_plan().as_deref(), Some("pro"));
+        pro.backend = BackendId::Copilot;
+        assert_eq!(pro.chatgpt_plan(), None);
+    }
+
+    #[test]
+    fn plan_prefers_namespace_and_handles_missing_or_invalid_metadata() {
+        let mut account = crate::flows::new_account(BackendId::Codex, "account".into());
+        for claims in [
+            json!({}),
+            json!({"chatgpt_plan_type": 42}),
+            json!({"chatgpt_plan_type": " "}),
+        ] {
+            account.access_token = Some(token(claims));
+            assert_eq!(account.chatgpt_plan(), None);
+        }
+        account.access_token = Some("invalid".into());
+        assert_eq!(account.chatgpt_plan(), None);
+        account.access_token = None;
+        assert_eq!(account.chatgpt_plan(), None);
+        account.access_token = Some(token(
+            json!({"chatgpt_plan_type": "free", "https://api.openai.com/auth": {"chatgpt_plan_type": "business"}}),
+        ));
+        assert_eq!(account.chatgpt_plan().as_deref(), Some("business"));
+    }
 }

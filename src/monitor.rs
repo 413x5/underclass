@@ -17,6 +17,8 @@ pub struct MonitorAccount {
     pub id: String,
     pub label: String,
     pub backend: BackendId,
+    #[serde(default)]
+    pub plan: Option<String>,
     pub status: AccountStatus,
     pub reset_at: i64,
     pub inflight: u32,
@@ -124,6 +126,7 @@ fn collect(state: &AppState) -> rusqlite::Result<MonitorSnapshot> {
                     id: account.id.clone(),
                     label: account.label.clone(),
                     backend: account.backend,
+                    plan: account.chatgpt_plan(),
                     status: account.status,
                     reset_at: account.reset_at,
                     inflight: item.inflight,
