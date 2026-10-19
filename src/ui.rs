@@ -142,6 +142,86 @@ pub struct StartFlowBody {
     pub backend: String,
     #[serde(default)]
     pub enterprise_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+/// @cc [owner:ghuntley,label:auth] cline-flow-verifies-key
+/// A Cline onboarding request MUST create a flow record, validate the pasted API key, and report
+/// either `authorized` with the persisted account id or `failed` with a message; it MUST NOT
+/// persist an account when the key is empty or rejected upstream. When `replace_account` names an
+/// existing account, a successful flow MUST keep that account's id rather than creating a second
+/// account against the same upstream quota.
+async fn start_cline_flow(
+    state: &Arc<AppState>,
+    api_key: Option<String>,
+    label: Option<String>,
+    replace_account: Option<String>,
+) -> (crate::flows::FlowRegistry, String) {
+    let flow_id = state.flows.create(
+        BackendId::Cline,
+        crate::flows::FlowState::Pending {
+            user_code: String::new(),
+            verify_url: "https://app.cline.bot/dashboard/api-keys".into(),
+        },
+        replace_account.clone(),
+    );
+    let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) else {
+        state.flows.set_state(
+            &flow_id,
+            crate::flows::FlowState::Failed {
+                message: "an API key from app.cline.bot is required".into(),
+            },
+        );
+        return (state.flows.clone(), flow_id);
+    };
+    // `add_account` stores the trimmed key, so the catalog refresh must authenticate with that same
+    // value; a pasted trailing newline would otherwise fail only the refresh.
+    let api_key = api_key.trim().to_string();
+    match crate::cline::add_account(
+        &state.client,
+        &state.store,
+        &api_key,
+        label,
+        replace_account,
+    )
+    .await
+    {
+        Ok(account) => {
+            state.pool.lock().unwrap().sync_account(account.clone());
+            if let Err(error) =
+                crate::cline::refresh_catalog(&state.client, &state.store, &state.pool, &api_key).await
+            {
+                crate::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
+            }
+            state.flows.set_state(
+                &flow_id,
+                crate::flows::FlowState::Authorized {
+                    account_id: account.id,
+                },
+            );
+        }
+        Err(error) => {
+            // Only a `Failed` error means the key itself was rejected; anything else is a transient
+            // upstream problem and must not tell the operator to replace a working key.
+            let message = match error {
+                crate::cline::AuthError::Failed => "Cline rejected the API key".to_string(),
+                crate::cline::AuthError::BadReplaceTarget => {
+                    "that account no longer exists or is not a Cline account; close this dialog and re-key it from the account list".to_string()
+                }
+                other => format!("could not verify the Cline API key, try again ({other})"),
+            };
+            state.flows.set_state(
+                &flow_id,
+                crate::flows::FlowState::Failed { message },
+            );
+        }
+    }
+    (state.flows.clone(), flow_id)
 }
 
 pub async fn start_flow(
@@ -154,6 +234,28 @@ pub async fn start_flow(
     let Some(backend) = BackendId::parse(&body.backend) else {
         return (StatusCode::BAD_REQUEST, "unknown backend").into_response();
     };
+    if backend == BackendId::Cline {
+        let replace_account = body
+            .account_id
+            .clone()
+            .filter(|id| !id.trim().is_empty());
+        if let Some(account_id) = replace_account.as_deref() {
+            let Some(account) = state.store.get_account(account_id) else {
+                return (StatusCode::NOT_FOUND, "unknown account").into_response();
+            };
+            if account.backend != BackendId::Cline {
+                return (StatusCode::BAD_REQUEST, "account is not a Cline account").into_response();
+            }
+        }
+        let (flows, flow_id) = start_cline_flow(
+            &state,
+            body.api_key.clone(),
+            body.label.clone(),
+            replace_account,
+        )
+        .await;
+        return Json(json!({ "flow_id": flow_id, "flow": flows.get(&flow_id) })).into_response();
+    }
     let result = match backend {
         BackendId::Codex => crate::codex::start_flow(
             state.client.clone(),
@@ -172,6 +274,7 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::Cline => unreachable!("handled above"),
     };
     match result {
         Ok(flow_id) => {
@@ -247,6 +350,12 @@ pub async fn relogin_account(
         )
         .await
         .map_err(|e| e.to_string()),
+        // A Cline key cannot be refreshed, so re-keying is a paste-a-new-key flow that keeps this
+        // account's id and clears its cooldown. No polling flow is created: the browser collects the
+        // new key and posts it to `/admin/api/flows` with this account id.
+        BackendId::Cline => {
+            return Json(json!({ "rekey": id })).into_response();
+        }
     };
     match result {
         Ok(flow_id) => {
@@ -355,6 +464,32 @@ pub async fn put_catalog(
     let ids: Vec<String> = body.models.iter().map(|m| m.id.clone()).collect();
     state.pool.lock().unwrap().set_catalog(backend, ids);
     Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) })).into_response()
+}
+
+/// @cc [owner:ghuntley,label:pool] cline-catalog-refresh-endpoint
+/// `refresh_cline_catalog` MUST attempt a catalog refresh for every Cline account that holds a key,
+/// MUST count only non-empty successful refreshes, and MUST report one `label: error` string per
+/// failed account without failing the whole request.
+pub async fn refresh_cline_catalog(State(state): State<Arc<AppState>>) -> Response {
+    let accounts: Vec<_> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|account| account.backend == BackendId::Cline)
+        .collect();
+    let mut refreshed = 0usize;
+    let mut errors = Vec::new();
+    for account in accounts {
+        let Some(key) = account.refresh_token.clone() else {
+            continue;
+        };
+        match crate::cline::refresh_catalog(&state.client, &state.store, &state.pool, &key).await {
+            Ok(models) if !models.is_empty() => refreshed += 1,
+            Ok(_) => {}
+            Err(error) => errors.push(format!("{}: {error}", account.label)),
+        }
+    }
+    Json(json!({ "refreshed_accounts": refreshed, "errors": errors })).into_response()
 }
 
 pub async fn client_key(State(state): State<Arc<AppState>>) -> Response {

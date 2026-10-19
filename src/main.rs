@@ -15,7 +15,7 @@ const ROTATION_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 const STATS_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 
 #[derive(Parser)]
-#[command(name = "underclass", about = "pooled multi-subscription codex/copilot proxy for opencode")]
+#[command(name = "underclass", about = "pooled multi-subscription codex/copilot/cline proxy for opencode")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -138,6 +138,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
 
     seed_catalog(&store, models::BackendId::Codex, codex::default_catalog());
     seed_catalog(&store, models::BackendId::Copilot, copilot::fallback_catalog());
+    seed_catalog(&store, models::BackendId::Cline, underclass::cline::default_catalog());
 
     let core = pool::PoolCore::new(&store);
     let pool = Arc::new(Mutex::new(core));
@@ -159,6 +160,12 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::Copilot,
         Arc::new(copilot::CopilotBackend {
             cooldown_ms: cfg.copilot_cooldown_ms,
+        }),
+    );
+    backends.insert(
+        models::BackendId::Cline,
+        Arc::new(underclass::cline::ClineBackend {
+            cooldown_ms: cfg.cline_cooldown_ms,
         }),
     );
     let backends = Arc::new(backends);
@@ -224,6 +231,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     }
 
     refresh_copilot_catalogs_on_boot(&state).await;
+    refresh_cline_catalogs_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -299,6 +307,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/refresh-copilot",
             axum::routing::post(ui::refresh_copilot_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh-cline",
+            axum::routing::post(ui::refresh_cline_catalog),
         )
         .route("/admin/api/client-key", axum::routing::get(ui::client_key))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -399,8 +411,39 @@ async fn refresh_copilot_catalogs_on_boot(state: &Arc<proxy::AppState>) {
     }
 }
 
+/// @cc [owner:ghuntley,label:pool] cline-catalog-refreshed-on-boot
+/// On boot, every Cline account with a stored key MUST refresh the Cline catalog, and a successful
+/// non-empty response MUST replace the stored and routable catalog so newly published models
+/// become available without a restart.
+async fn refresh_cline_catalogs_on_boot(state: &Arc<proxy::AppState>) {
+    let accounts: Vec<models::Account> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|account| account.backend == models::BackendId::Cline)
+        .collect();
+    for account in accounts {
+        let Some(key) = account.refresh_token.clone() else {
+            continue;
+        };
+        match underclass::cline::refresh_catalog(&state.client, &state.store, &state.pool, &key).await {
+            Ok(models) if !models.is_empty() => {
+                underclass::logging::log_catalog_refresh(&account, Some(models.len()), None);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                underclass::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
+            }
+        }
+    }
+}
+
+/// @cc [owner:ghuntley,label:auth] generic-label-is-replaceable
+/// `is_generic_label` MUST report true for every backend's seeded fallback label, so the boot
+/// identity refresh can replace a placeholder with the profile's email or name. A fallback label
+/// reported as non-generic would stay ambiguous in logs and the UI forever.
 fn is_generic_label(label: &str) -> bool {
-    matches!(label, "chatgpt" | "github") || label.trim().is_empty()
+    matches!(label, "chatgpt" | "github" | "cline") || label.trim().is_empty()
 }
 
 /// @cc [owner:ghuntley,label:auth] scheduled-rotation-never-bricks-account
@@ -449,6 +492,12 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
                 };
                 copilot::fetch_github_identity(&state.client, &token).await
             }
+            models::BackendId::Cline => {
+                let Some(token) = account.refresh_token.clone() else {
+                    continue;
+                };
+                underclass::cline::fetch_identity(&state.client, &token).await
+            }
         };
         let Some(identity) = identity else {
             continue;
@@ -459,5 +508,20 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
         state.store.upsert_account(&updated);
         state.pool.lock().unwrap().sync_account(updated);
         tracing::info!(account = %account.id, "account.identity_refreshed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_generic_label;
+
+    #[test]
+    fn every_backend_fallback_label_is_generic() {
+        for label in ["chatgpt", "github", "cline", "", "   "] {
+            assert!(is_generic_label(label), "{label:?} must be replaceable");
+        }
+        for label in ["dev@example.com", "octocat", "ghuntley"] {
+            assert!(!is_generic_label(label), "{label:?} is a real identity");
+        }
     }
 }

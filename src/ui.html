@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>underclass — codex/copilot pool</title>
+<title>underclass — codex/copilot/cline pool</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -47,7 +47,7 @@
 </head>
 <body>
 <main>
-  <h1>underclass <small>pooled codex + copilot subscriptions</small></h1>
+  <h1>underclass <small>pooled codex + copilot + cline subscriptions</small></h1>
 
   <section class="card">
     <div class="row" style="justify-content: space-between">
@@ -55,6 +55,7 @@
       <div class="row">
         <button onclick="startFlow()">Add account</button>
         <button onclick="refreshCopilotCatalog()">Refresh Copilot catalog</button>
+        <button onclick="refreshClineCatalog()">Refresh Cline catalog</button>
       </div>
     </div>
     <table id="accounts">
@@ -136,6 +137,7 @@
     <select id="catalogBackend" onchange="loadCatalog()">
       <option value="codex">codex</option>
       <option value="copilot">copilot</option>
+      <option value="cline">cline</option>
     </select>
     <label>models (JSON array of {id, name, context, input, output})</label>
     <textarea id="catalogEditor" rows="10"></textarea>
@@ -153,10 +155,18 @@
     <select id="flowBackend">
       <option value="codex">ChatGPT / Codex</option>
       <option value="copilot">GitHub Copilot</option>
+      <option value="cline">Cline (API key)</option>
     </select>
     <div id="enterpriseWrap" style="display:none">
       <label>GitHub Enterprise URL or domain (blank for github.com)</label>
       <input id="flowEnterprise" placeholder="company.ghe.com">
+    </div>
+    <div id="clineWrap" style="display:none">
+      <label>API key from <a href="https://app.cline.bot" target="_blank" rel="noopener">app.cline.bot</a> → Settings → API Keys</label>
+      <input id="flowApiKey" type="password" autocomplete="off" placeholder="sk-…">
+      <label>label (optional — defaults to the account email)</label>
+      <input id="flowLabel" placeholder="me@example.com">
+      <p class="muted">ClinePass models appear as <code>underclass/cline/cline-pass/*</code>; the credit-based models as <code>underclass/cline/&lt;provider&gt;/*</code>.</p>
     </div>
     <div class="row" style="margin-top:16px">
       <button class="primary" onclick="beginFlow()">Continue</button>
@@ -234,7 +244,7 @@ async function loadState() {
         <td>${formatCredits(a.usage)}</td>
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
-          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">Re-login</button>` : ''}
+          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">${a.backend === 'cline' ? 'Re-key' : 'Re-login'}</button>` : ''}
           ${a.backend === 'codex' && a.usage && a.usage.available_resets > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
         </td>`;
@@ -418,7 +428,7 @@ function snippet(catalog) {
   return {
     provider: { underclass: {
       npm: '@ai-sdk/openai-compatible',
-      name: 'Underclass (pooled Codex + Copilot)',
+      name: 'Underclass (pooled Codex + Copilot + Cline)',
       options: { baseURL: location.origin + '/v1', apiKey: '<proxy-key>', setCacheKey: true },
       models
     }},
@@ -444,12 +454,19 @@ async function saveCatalog() {
   if (res.ok) { document.getElementById('catalogMsg').textContent = 'saved'; loadState(); }
 }
 
+let pendingReplace = null;
+
 document.getElementById('flowBackend').addEventListener('change', () => {
-  document.getElementById('enterpriseWrap').style.display =
-    document.getElementById('flowBackend').value === 'copilot' ? 'block' : 'none';
+  const backend = document.getElementById('flowBackend').value;
+  document.getElementById('enterpriseWrap').style.display = backend === 'copilot' ? 'block' : 'none';
+  document.getElementById('clineWrap').style.display = backend === 'cline' ? 'block' : 'none';
 });
 
 async function startFlow() {
+  pendingReplace = null;
+  document.getElementById('flowTitle').textContent = 'Add account';
+  document.getElementById('flowApiKey').value = '';
+  document.getElementById('flowLabel').value = '';
   document.getElementById('flowIdle').style.display = 'block';
   document.getElementById('flowPending').style.display = 'none';
   document.getElementById('flowDone').style.display = 'none';
@@ -463,6 +480,12 @@ async function beginFlow() {
   if (backend === 'copilot') {
     const ent = document.getElementById('flowEnterprise').value.trim();
     if (ent) body.enterprise_url = ent;
+  }
+  if (backend === 'cline') {
+    body.api_key = document.getElementById('flowApiKey').value.trim();
+    const label = document.getElementById('flowLabel').value.trim();
+    if (label) body.label = label;
+    if (pendingReplace) body.account_id = pendingReplace;
   }
   const res = await api('/admin/api/flows', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) { alert(await res.text()); return; }
@@ -504,13 +527,28 @@ async function acct(id, action) {
 }
 async function relogin(id) {
   const res = await api('/admin/api/accounts/' + id + '/relogin', { method: 'POST' });
-  if (res.ok) {
-    const data = await res.json();
+  if (!res.ok) { alert(await res.text()); return; }
+  const data = await res.json();
+  if (data.rekey) {
+    // Cline: the server only tells us to collect a new key; the paste dialog does the work.
+    pendingReplace = data.rekey;
+    document.getElementById('flowTitle').textContent = 'Re-key account';
+    document.getElementById('flowBackend').value = 'cline';
+    document.getElementById('flowApiKey').value = '';
+    document.getElementById('flowLabel').value = '';
+    document.getElementById('enterpriseWrap').style.display = 'none';
+    document.getElementById('clineWrap').style.display = 'block';
+    document.getElementById('flowIdle').style.display = 'block';
+    document.getElementById('flowPending').style.display = 'none';
+    document.getElementById('flowDone').style.display = 'none';
+    document.getElementById('flowFailed').style.display = 'none';
     document.getElementById('flowDialog').showModal();
-    document.getElementById('flowIdle').style.display = 'none';
-    document.getElementById('flowPending').style.display = 'block';
-    pollFlow(data.flow_id);
+    return;
   }
+  document.getElementById('flowDialog').showModal();
+  document.getElementById('flowIdle').style.display = 'none';
+  document.getElementById('flowPending').style.display = 'block';
+  pollFlow(data.flow_id);
 }
 async function useReset(id, force = false) {
   if (!force && !confirm('Redeem one banked Codex reset for this account now?')) return;
@@ -533,6 +571,14 @@ async function del(id) {
 async function refreshCopilotCatalog() {
   await api('/admin/api/catalog/refresh-copilot', { method: 'POST' });
   loadState();
+  loadCatalog();
+}
+async function refreshClineCatalog() {
+  const res = await api('/admin/api/catalog/refresh-cline', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (data.errors && data.errors.length) alert('Cline catalog errors: ' + data.errors.join('; '));
+  loadState();
+  loadCatalog();
 }
 function copySnippet() {
   navigator.clipboard.writeText(document.getElementById('snippet').textContent);

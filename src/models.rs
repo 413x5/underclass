@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum BackendId {
     Codex,
     Copilot,
+    Cline,
 }
 
 impl BackendId {
@@ -12,6 +13,7 @@ impl BackendId {
         match self {
             BackendId::Codex => "codex",
             BackendId::Copilot => "copilot",
+            BackendId::Cline => "cline",
         }
     }
 
@@ -19,12 +21,13 @@ impl BackendId {
         match s {
             "codex" => Some(BackendId::Codex),
             "copilot" => Some(BackendId::Copilot),
+            "cline" => Some(BackendId::Cline),
             _ => None,
         }
     }
 
-    pub fn all() -> [BackendId; 2] {
-        [BackendId::Codex, BackendId::Copilot]
+    pub fn all() -> [BackendId; 3] {
+        [BackendId::Codex, BackendId::Copilot, BackendId::Cline]
     }
 }
 

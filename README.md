@@ -1,6 +1,6 @@
 # underclass
 
-**A local proxy that pools multiple ChatGPT/Codex and GitHub Copilot subscriptions behind one OpenAI-compatible endpoint.**
+**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, and Cline subscriptions behind one OpenAI-compatible endpoint.**
 
 ```
                        ┌────────────────────────────────────┐
@@ -13,7 +13,10 @@
  web UI ◄─────────────►│  sticky sessions · health pool     │
  (accounts, catalog,   │  fail-fast saturation · tracing    │────► api.githubcopilot.com
   live request feed)   │                                    │      (M Copilot subs,
-                       └────────────────────────────────────┘       GitHub device flow)
+                       │                                    │       GitHub device flow)
+                       │                                    │────► api.cline.bot
+                       └────────────────────────────────────┘      (K API keys,
+                                                                     Cline + ClinePass)
 ```
 
 One subscription runs out of quota? It leaves rotation until its window resets — and comes back on its own. Sessions stay pinned to one subscription so upstream prompt caches stay warm. When *everything* is exhausted, the proxy fails fast with the earliest reset time instead of hanging.
@@ -46,7 +49,7 @@ never writes them to diagnostics. Open the web UI and paste the value supplied a
 `UNDERCLASS_UI_TOKEN`.
 
 1. Open the web UI and paste the configured admin token.
-2. Click **Add account** → pick *ChatGPT / Codex* or *GitHub Copilot* → enter the device code at the shown URL. The account is labeled automatically with the account's email or username.
+2. Click **Add account** → pick *ChatGPT / Codex* or *GitHub Copilot* → enter the device code at the shown URL, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys. Accounts are labeled automatically with the account's email or username.
 3. Repeat for every subscription you want in the pool.
 4. Point opencode at the pool:
 
@@ -65,7 +68,8 @@ opencode --provider underclass --model underclass/gpt-5.5
 - **Token accounting.** Each upstream attempt is recorded in SQLite with its model, account, prompt cache key, and reported input/output tokens. Missing counts remain marked unknown. The admin page shows current-month totals and filters; historical rows remain queryable after account removal.
 - **Stream outcomes and statistics.** A 2xx stream can still fail upstream (e.g. `response.failed` with `server_is_overloaded`, which Codex shows as "Selected model is at capacity"). underclass records how every body ended (`completed`, `failed`, `incomplete`, `truncated`, `upstream_error`, `client_closed`), the sanitized error code, and the attempt duration. It logs `stream.finished` at warn for failures, and records capacity, policy (`cyber_policy`), quota, and saturation events. `underclass stats` and the admin page's Statistics panel report requests, sessions, tokens, peak and mean concurrency, outcomes, and events over up to two years. See [ADR 0021](docs/adr/0021-stream-outcome-and-capacity-statistics.md).
 - **Fail fast.** If every account eligible for the requested model is cooling, the proxy answers `429` + `Retry-After` = earliest reset. No queuing.
-- **Flat pool.** Codex and Copilot accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to Codex so new models work without proxy changes.
+- **Flat pool.** Codex, Copilot, and Cline accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to Codex so new models work without proxy changes.
+- **Cline and ClinePass.** Cline models are namespaced `cline/…`: credit-based models keep their upstream ID after the prefix (`cline/anthropic/claude-sonnet-4-6`, `cline/openai/gpt-5.4`), and ClinePass subscription models appear as `cline/cline-pass/…` (`cline/cline-pass/kimi-k3`, `cline/cline-pass/deepseek-v4.1-flash`). Cline only speaks Chat Completions, so `/v1/responses` requests routed to it are translated to `/api/v1/chat/completions` and the reply is translated back to the Responses format. `402 Payment Required` cools the account; `403` (model outside the plan) leaves it in rotation. See [the Cline backend ADR](docs/adr/fork/cline-backend-responses-translation.md).
 - **Pre-first-byte failover only.** Once a stream starts, upstream errors pass through — no silent re-send of half-finished turns.
 
 Design decisions and their trade-offs live in [`docs/adr/`](docs/adr) — start with [ADR 0010](docs/adr/0010-unprefixed-routing-flat-pool.md) for the routing model.
@@ -81,9 +85,10 @@ Optional `~/.config/underclass/config.toml`:
 | `ui_token` | minted on first run | admin token for the web UI + `/admin/api/*` |
 | `codex_cooldown_secs` | `1800` | cooling window when upstream omits `retry-after` |
 | `copilot_cooldown_secs` | `1800` | same, for Copilot |
+| `cline_cooldown_secs` | `1800` | same, for Cline (applied on `402`) |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM` (default to the real endpoints).
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`).
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -110,7 +115,7 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 
 | route | auth | purpose |
 |---|---|---|
-| `POST /v1/responses` | proxy key | Responses API, streamed through to the pool |
+| `POST /v1/responses` | proxy key | Responses API, streamed through to the pool (translated for Cline) |
 | `POST /v1/chat/completions` | proxy key | Chat Completions, same |
 | `GET /v1/models` | proxy key | union catalog with merged limits |
 | `GET /` | none | web UI |
@@ -120,16 +125,18 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `GET /admin/api/monitor` | admin token | compact read-only live monitor snapshot |
 | `GET /admin/api/stats` | admin token | bucketed requests, sessions, tokens, concurrency, outcomes, events (`since`, `bucket`, `by`) |
 | `POST /admin/api/events/import` | admin token | idempotent upstream-event backfill (used by `stats import-codex`) |
-| `POST /admin/api/flows` | admin token | start a device-flow onboarding |
+| `POST /admin/api/flows` | admin token | start onboarding (device flow, or Cline API key via `api_key`) |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |
 | `DELETE /admin/api/accounts/{id}` | admin token | remove from pool |
-| `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog |
+| `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog (`codex`, `copilot`, `cline`) |
 | `GET /admin/api/client-key` | admin token | retrieve the proxy key for `connect` |
 
 Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log-format json|pretty`) and each request logs the account (label) that served it.
 
 Accounting queries accept `from_ms` (inclusive), `to_ms` (exclusive), and exact `model`, `account_id`, or `cache_key` filters. Use `missing_key=true` to select requests without a key. Grouped summaries and request details accept `limit` (1–1000, default 100) and `offset`; summary responses also include unpaginated `totals`. With no time bounds, queries default to the current UTC month; provide `from_ms=0` to query all history. Each summary includes measured and unknown request counts. Token totals sum reported values only; they are lower bounds when unknown requests exist. See [ADR 0014](docs/adr/0014-per-attempt-token-accounting.md).
+
+A blank `cache key` means the client sent no `prompt_cache_key`, not that prompt caching is off — the proxy does not invent a key. Cline's prompt cache is content-addressed and shared across its API keys, so a session that moves between Cline subscriptions still hits cache; stickiness keeps a session on one billing surface rather than protecting cache warmth. See [Prompt Cache Scope Across Subscriptions](docs/adr/fork/prompt-cache-scope-across-subscriptions.md).
 
 ### Correlation with preflight
 
@@ -139,7 +146,7 @@ Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase.
 
 ## Models
 
-The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`) and Copilot's live `/models` list. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
+The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, and Cline's `cline/` + `cline/cline-pass/` IDs. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
 
 ## Nix flake
 

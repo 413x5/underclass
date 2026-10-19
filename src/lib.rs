@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod cline;
 pub mod codex;
 pub mod config;
 pub mod copilot;
@@ -13,6 +14,7 @@ pub mod pool;
 pub mod provider;
 pub mod proxy;
 pub mod resets;
+pub mod responses;
 pub mod stats;
 pub mod stats_api;
 pub mod stats_cli;

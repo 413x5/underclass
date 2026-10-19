@@ -20,6 +20,23 @@ pub trait Backend: Send + Sync {
 
     fn prepare_body(&self, _body: &mut Value) {}
 
+    /// @cc [owner:ghuntley,label:proxy] responses-translation-before-upstream
+    /// When this returns true, the proxy MUST translate an inbound `/v1/responses` body to Chat
+    /// Completions before header injection and `prepare_body`, and MUST translate the upstream body
+    /// back to the Responses format (streamed or not) before it reaches the client. Backends that
+    /// return false MUST pass request and response bodies through unchanged.
+    fn responses_via_chat(&self) -> bool {
+        false
+    }
+
+    /// @cc [owner:ghuntley,label:proxy] response-envelope-unwrapped
+    /// When this returns a key, a non-streaming 2xx upstream body MUST be a JSON object carrying
+    /// that key, and the proxy MUST unwrap `body[key]` before usage accounting or delivery to the
+    /// client. An unwrappable body MUST pass through unchanged rather than be dropped.
+    fn response_envelope(&self) -> Option<&'static str> {
+        None
+    }
+
     fn auto_stream_usage(&self, _path: &str, _body: &mut Value) -> bool {
         false
     }

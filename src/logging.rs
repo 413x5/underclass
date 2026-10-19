@@ -65,6 +65,26 @@ pub fn log_account_state(account_id: &str, label: Option<&str>, event: &str, det
     );
 }
 
+/// Catalog refresh outcome for one account. Identity is logged as a label plus a truncated id so
+/// raw UUIDs never reach the log.
+pub fn log_catalog_refresh(account: &crate::models::Account, models: Option<usize>, error: Option<&str>) {
+    match (models, error) {
+        (Some(models), _) => tracing::info!(
+            account = %account.label,
+            account_id = %truncate(&account.id),
+            models = models,
+            "catalog.refreshed"
+        ),
+        (None, Some(error)) => tracing::warn!(
+            account = %account.label,
+            account_id = %truncate(&account.id),
+            error = %error,
+            "catalog.refresh_failed"
+        ),
+        (None, None) => {}
+    }
+}
+
 /// One line per finished response body. Failed, incomplete, or truncated bodies log at warn so
 /// mid-stream upstream failures (e.g. `server_is_overloaded`) are visible despite the 200 status.
 pub fn log_stream_finished(

@@ -288,7 +288,7 @@ pub fn provider_block(base_url: &str, api_key: &str, models: &[crate::models::Mo
         .collect();
     serde_json::json!({
         "npm": "@ai-sdk/openai-compatible",
-        "name": "Underclass (pooled Codex + Copilot)",
+        "name": "Underclass (pooled Codex + Copilot + Cline)",
         "options": {
             "baseURL": base_url,
             "apiKey": api_key,
@@ -387,13 +387,14 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
     }
 
     let api_key = resolve_api_key(args, underclass_store)?;
-    let models = underclass_store.catalog(crate::models::BackendId::Codex);
-    let copilot_models = underclass_store.catalog(crate::models::BackendId::Copilot);
-    let mut all_models = models;
-    let seen: std::collections::HashSet<String> = all_models.iter().map(|m| m.id.clone()).collect();
-    for m in copilot_models {
-        if !seen.contains(&m.id) {
-            all_models.push(m);
+    let mut all_models = underclass_store.catalog(crate::models::BackendId::Codex);
+    let mut seen: std::collections::HashSet<String> =
+        all_models.iter().map(|m| m.id.clone()).collect();
+    for backend in [crate::models::BackendId::Copilot, crate::models::BackendId::Cline] {
+        for m in underclass_store.catalog(backend) {
+            if seen.insert(m.id.clone()) {
+                all_models.push(m);
+            }
         }
     }
     if all_models.is_empty() {
