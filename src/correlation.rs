@@ -1,4 +1,4 @@
-//! Validated request identity shared across the preflight/underclass boundary.
+//! Validated request identity shared across the preflight (secret-inspection proxy) / underclass boundary.
 use axum::{
     extract::Request,
     http::{HeaderMap, HeaderValue},

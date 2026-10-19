@@ -1,0 +1,57 @@
+#!/bin/sh
+# post-commit — advisory only: warn when the commit just made was NOT covered by the hook.
+#
+# A post-commit hook runs after the commit exists, so it cannot block; it only reports. Its single job
+# is to speak when enforcement silently did NOT apply. Since it cannot block, its failure mode is
+# silence, so this errs toward saying too much rather than too little.
+#
+# Enforced scopes, matching `preflight-hook`: `commit` (the default) and `worktree` both record a
+# reviewed tree, so both are covered. `head` records none - it reviews already-committed content and
+# cannot vouch for a commit that did not exist when it ran - so it warns.
+#
+# PREFLIGHT_SKIP=1 silences this. An ABSENT sidecar is silent too: no review has run, and pre-commit
+# would have refused first (the one exception is a repo's first commit, allowed unenforced by design).
+# A sidecar that is PRESENT but unreadable must warn - it is indistinguishable from a verified one.
+#
+# Install alongside pre-commit, once per clone:  git config core.hooksPath .githooks
+set -u
+
+[ "${PREFLIGHT_SKIP:-0}" = "1" ] && exit 0
+
+dir="${PREFLIGHT_DIR:-.preflight}"
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root" || exit 0
+
+meta="$dir/review.meta.json"
+[ -f "$meta" ] || exit 0
+
+warn_unreadable() {
+  printf 'preflight-code: advisory: cannot read %s (%s), so this commit was NOT verified by the hook.\n' "$meta" "$1" >&2
+  printf "preflight-code: run 'preflight-code review' with the default scope to make the hook enforce commits.\n" >&2
+  exit 0
+}
+
+command -v python3 >/dev/null 2>&1 || warn_unreadable 'python3 not found'
+
+scope=$(python3 - "$meta" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+    print(d.get('scope') or '')
+except Exception:
+    print('')
+PY
+)
+
+# An empty scope means this is not the sidecar it claims to be (malformed JSON, or no `scope` key).
+# Unreadable for this hook's purposes, so it is reported rather than passed over.
+[ -n "$scope" ] || warn_unreadable 'malformed sidecar or missing scope'
+
+case "$scope" in
+  commit|worktree) exit 0 ;;
+esac
+
+printf 'preflight-code: advisory: the last review used scope=%s, so this commit was NOT verified by the hook.\n' "$scope" >&2
+printf "preflight-code: run 'preflight-code review' with the default scope to make the hook enforce commits.\n" >&2
+exit 0
