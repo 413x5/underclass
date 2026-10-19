@@ -133,7 +133,7 @@ Accounting queries accept `from_ms` (inclusive), `to_ms` (exclusive), and exact 
 
 ### Correlation with preflight
 
-When [preflight](https://github.com/ghuntley/preflight) fronts underclass, it generates a UUIDv4 and forwards it as `x-request-id`. Underclass preserves that ID in its response, routing/retry logs, and request history. Search the same `request_id` in both services to trace inspection through pool routing.
+When [preflight](https://github.com/ghuntley/preflight), the secret-inspection proxy, fronts underclass, it generates a UUIDv4 and forwards it as `x-request-id`. (The `preflight-code` review bundle is a separate tool and plays no part in this path.) Underclass preserves that ID in its response, routing/retry logs, and request history. Search the same `request_id` in both services to trace inspection through pool routing.
 
 Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase. Missing, duplicate, invalid, nil, and other-version IDs are replaced before authentication or logging. Every handled response receives the resulting ID, including 401s, 429s, model discovery, and unmatched routes. Provider responses cannot replace it. Correlation IDs convey no authorization or proof that preflight inspected a request. See [ADR 0012](docs/adr/0012-cross-proxy-request-correlation.md).
 
@@ -240,12 +240,12 @@ Notes:
 
 ```sh
 cargo build
-cargo test        # 43 unit tests + 8 Hegel property tests + e2e suite
+cargo test        # unit tests, Hegel property tests, and the e2e suite
 ```
 
 Testing is two-tier: plain unit tests for exact behavior (headers, merges, redaction), and [Hegel](https://hegel.dev) property tests over the pure pool core — stickiness stability, health-state invariants, saturation minimums, TTL/cap bounds. The core (`src/pool.rs`, `src/health.rs`) is synchronous with an injected clock; async lives only at the edges. New backends implement the `provider::Backend` trait and register — nothing else changes.
 
-Agent conventions and the ADR policy are in [`AGENTS.md`](AGENTS.md). Architecture decision records: [`docs/adr/`](docs/adr).
+Setup, the checks a change must pass, and the review loop are in [`CONTRIBUTING.md`](CONTRIBUTING.md). Agent conventions and the ADR policy are in [`AGENTS.md`](AGENTS.md). Architecture decision records: [`docs/adr/`](docs/adr).
 
 ## License
 
@@ -255,26 +255,34 @@ Agent conventions and the ADR policy are in [`AGENTS.md`](AGENTS.md). Architectu
 
 ```
 src/
-  main.rs      bootstrap, router, background tasks
-  config.rs    TOML + env config
-  models.rs    domain types (Account, status, catalog, log entries)
-  store.rs     SQLite persistence (accounts, bindings, catalog, config)
-  pool.rs      pure pool core: stickiness, eligibility, selection
-  health.rs    quota classification, retry-after parsing
-  provider.rs  Backend trait
-  codex.rs     ChatGPT/Codex backend (device flow, refresh, headers)
-  copilot.rs   GitHub Copilot backend (device flow, catalog, headers)
-  tokens.rs    single-flight token refresh
-  proxy.rs     /v1/* handlers, failover, streaming
-  usage.rs     token + stream-outcome tap over upstream bodies
-  stats.rs     pure stats core: concurrency sweep, bucketing, rollup merge
-  stats_api.rs stats query, event import, retention/rollup maintenance
-  stats_cli.rs `stats` verb and Codex rollout import
-  logging.rs   structured logs, correlation IDs, redaction
-  ui.rs        admin API
-  ui.html      embedded single-page web UI
-  cli.rs       `connect` verb, JSONC-safe opencode config merge
+  main.rs        bootstrap, router, background tasks
+  lib.rs         library root: module list for the binary and the tests
+  config.rs      TOML + env config
+  models.rs      domain types (Account, status, catalog, log entries)
+  store.rs       SQLite persistence (accounts, bindings, catalog, config)
+  pool.rs        pure pool core: stickiness, eligibility, selection
+  health.rs      quota classification, retry-after parsing
+  provider.rs    Backend trait
+  codex.rs       ChatGPT/Codex backend (device flow, refresh, headers)
+  copilot.rs     GitHub Copilot backend (device flow, catalog, headers)
+  flows.rs       device-code flow registry for onboarding
+  tokens.rs      single-flight token refresh
+  jwt.rs         token claim parsing (account id extraction)
+  resets.rs      Codex usage snapshots and banked reset redemption
+  proxy.rs       /v1/* handlers, failover, streaming
+  usage.rs       token + stream-outcome tap over upstream bodies
+  stats.rs       pure stats core: concurrency sweep, bucketing, rollup merge
+  stats_api.rs   stats query, event import, retention/rollup maintenance
+  stats_cli.rs   `stats` verb and Codex rollout import
+  monitor.rs     read-only snapshot for the terminal monitor
+  top.rs         `top` terminal monitor client
+  correlation.rs validated `x-request-id` propagation
+  logging.rs     structured logs, correlation IDs, redaction
+  ui.rs          admin API
+  ui.html        embedded single-page web UI
+  cli.rs         `connect` verb, JSONC-safe opencode config merge
 tests/
   properties.rs  Hegel property tests over the pure core
   e2e.rs         full-pool story against a mock upstream
+  correlation.rs request-ID middleware tests
 ```

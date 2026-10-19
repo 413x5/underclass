@@ -1,0 +1,29 @@
+#!/bin/sh
+# pre-commit — block a commit whose content was not reviewed by preflight.
+#
+# Copy into the repo's .githooks/ and enable once per clone with a RELATIVE path:
+#
+#   git config core.hooksPath .githooks
+#
+# Relative, because an absolute path breaks git worktrees: every worktree would run the hooks of
+# whichever checkout the path names instead of its own.
+#
+# Deliberate one-off bypasses: `git commit --no-verify`, or `PREFLIGHT_SKIP=1 git commit`.
+#
+# The helper is read-only: it verifies the content being committed against what `preflight-code review`
+# reviewed, and never runs a review, stages anything, or touches the index. See docs/architecture.md.
+set -u
+
+# ${HOME:-} rather than $HOME: with `set -u` an unset HOME (a hermetic build script, `env -u HOME git
+# commit`, some CI runners) would abort with "unbound variable" instead of the message below. A missing
+# helper FAILS the commit rather than passing an unverified one - that is what installing the hook is
+# for.
+helper="${PREFLIGHT_HOOK:-${HOME:-}/.config/preflight/preflight-hook}"
+if [ ! -x "$helper" ]; then
+  printf 'preflight-code: commit blocked: the preflight helper is missing (%s).\n' "$helper" >&2
+  printf "preflight-code: install the preflight bundle (its install.sh), then commit again.\n" >&2
+  printf "preflight-code: to bypass this one commit deliberately: git commit --no-verify\n" >&2
+  exit 1
+fi
+
+exec "$helper"
