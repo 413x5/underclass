@@ -62,10 +62,11 @@ impl TokenManager {
     /// @cc [owner:ghuntley,label:auth] proactive-refresh-margin
     /// `access_token` MUST return the cached Codex access token while it remains valid beyond
     /// `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh otherwise. For Copilot
-    /// it MUST return the stored GitHub token directly (it never expires or refreshes).
+    /// and Cline it MUST return the stored token directly: a GitHub token and a Cline API key are
+    /// both long-lived credentials that never expire or refresh, so neither may trigger a refresh.
     pub async fn access_token(&self, account: &Account) -> Result<String, TokenError> {
         match account.backend {
-            crate::models::BackendId::Copilot => account
+            crate::models::BackendId::Copilot | crate::models::BackendId::Cline => account
                 .refresh_token
                 .clone()
                 .ok_or(TokenError::MissingToken),
@@ -98,7 +99,9 @@ impl TokenManager {
         let refresh_token = account.refresh_token.clone().ok_or(TokenError::MissingToken)?;
 
         match account.backend {
-            crate::models::BackendId::Copilot => Ok(refresh_token),
+            crate::models::BackendId::Copilot | crate::models::BackendId::Cline => {
+                Ok(refresh_token)
+            }
             crate::models::BackendId::Codex => {
                 let tokens = crate::codex::refresh(&self.client, &refresh_token)
                     .await

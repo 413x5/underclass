@@ -634,7 +634,7 @@ fn draw_recent(
 }
 
 fn quota(account: &MonitorAccount, now_ms: i64) -> String {
-    if account.backend == BackendId::Copilot {
+    if account.backend != BackendId::Codex {
         return "unknown".into();
     }
     let Some(snapshot) = &account.quota else {

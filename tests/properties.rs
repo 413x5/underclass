@@ -220,10 +220,13 @@ fn build(backend_spread: usize, account_count: usize) -> Built {
     core.set_catalog(BackendId::Codex, models.clone());
     if backend_spread > 1 {
         core.set_catalog(BackendId::Copilot, models.clone());
+        core.set_catalog(BackendId::Cline, models.clone());
     }
     let mut accounts = Vec::new();
     for i in 0..account_count.max(1) {
-        let backend = if backend_spread > 1 && i % backend_spread != 0 {
+        let backend = if backend_spread > 2 && i % 3 == 2 {
+            BackendId::Cline
+        } else if backend_spread > 1 && i % backend_spread != 0 {
             BackendId::Copilot
         } else {
             BackendId::Codex
@@ -643,4 +646,251 @@ fn test_daily_rollup_matches_raw_day(tc: TestCase) {
             assert_eq!(rolled, raw);
         }
     }
+}
+
+#[hegel::test]
+fn test_cline_model_namespace_round_trips(tc: TestCase) {
+    let raw: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(20));
+    for model in raw {
+        if model.is_empty() {
+            continue;
+        }
+        let upstream = underclass::cline::upstream_model_id(&model);
+        let namespaced = underclass::cline::pool_model_id(upstream);
+        assert_eq!(
+            underclass::cline::upstream_model_id(&namespaced),
+            upstream,
+            "namespace must strip exactly one cline/ prefix"
+        );
+        assert_eq!(
+            underclass::cline::pool_model_id(underclass::cline::upstream_model_id(&namespaced)),
+            namespaced
+        );
+    }
+}
+
+#[hegel::test]
+fn test_cline_catalog_always_contains_subscription_models(tc: TestCase) {
+    let ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(20));
+    let fetched: Vec<underclass::models::ModelInfo> = ids
+        .into_iter()
+        .filter(|id| !id.is_empty() && !id.ends_with(":batch"))
+        .map(|id| underclass::models::ModelInfo {
+            id: underclass::cline::pool_model_id(&id),
+            name: id,
+            context: 0,
+            input: 0,
+            output: 0,
+        })
+        .collect();
+    let merged = underclass::cline::merge_catalog(fetched);
+    for subscription in underclass::cline::default_catalog() {
+        assert!(
+            merged.iter().any(|model| model.id == subscription.id),
+            "ClinePass model {} dropped from the merged catalog",
+            subscription.id
+        );
+    }
+    let mut sorted = merged.iter().map(|model| model.id.clone()).collect::<Vec<_>>();
+    sorted.sort();
+    let actual = merged.iter().map(|model| model.id.clone()).collect::<Vec<_>>();
+    assert_eq!(actual, sorted, "merged catalog must stay sorted");
+}
+
+/// Builds a chat-completions SSE payload from ordered text deltas plus a finish reason, ending with
+/// the `[DONE]` sentinel only when `sentinel` is set.
+fn chat_sse(deltas: &[String], reasoning: &[String], finish: Option<&str>, sentinel: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in deltas.iter().zip(reasoning.iter()) {
+        let (text, think) = chunk;
+        let mut delta = serde_json::Map::new();
+        if !text.is_empty() {
+            delta.insert("content".into(), serde_json::Value::String(text.clone()));
+        }
+        if !think.is_empty() {
+            delta.insert("reasoning".into(), serde_json::Value::String(think.clone()));
+        }
+        let payload = serde_json::json!({"choices": [{"delta": delta}]});
+        out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+    }
+    if let Some(finish) = finish {
+        let payload = serde_json::json!({"choices": [{"delta": {}, "finish_reason": finish}]});
+        out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+    }
+    if sentinel {
+        out.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    out
+}
+
+fn stream_frames(frames: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(frames)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+fn terminal_events(frames: &[u8]) -> Vec<String> {
+    stream_frames(frames)
+        .into_iter()
+        .filter_map(|frame| frame.get("type")?.as_str().map(str::to_string))
+        .filter(|kind| {
+            matches!(
+                kind.as_str(),
+                "response.completed" | "response.incomplete" | "response.failed"
+            )
+        })
+        .collect()
+}
+
+#[hegel::test]
+fn test_chat_stream_translation_is_chunk_boundary_independent(tc: TestCase) {
+    let deltas: Vec<String> = tc.draw(
+        gs::vecs(gs::text().max_size(6)).max_size(6),
+    );
+    let reasoning: Vec<String> = deltas.iter().map(|_| String::new()).collect();
+    let sse = chat_sse(&deltas, &reasoning, Some("stop"), true);
+    let splits: Vec<usize> = tc.draw(
+        gs::vecs(gs::integers::<usize>().min_value(0).max_value(sse.len().max(1)))
+            .max_size(6),
+    );
+
+    let mut whole = underclass::responses::ChatStreamTranslator::new("m", "resp_1", 0);
+    let mut expected = whole.feed(&sse);
+    expected.extend(whole.finish_on_eof());
+
+    let mut piecewise = underclass::responses::ChatStreamTranslator::new("m", "resp_1", 0);
+    let mut actual = Vec::new();
+    let mut boundaries = splits;
+    boundaries.push(0);
+    boundaries.push(sse.len());
+    boundaries.sort_unstable();
+    let mut previous = 0usize;
+    for boundary in boundaries {
+        let boundary = boundary.min(sse.len());
+        actual.extend(piecewise.feed(&sse[previous..boundary]));
+        previous = boundary;
+    }
+    actual.extend(piecewise.feed(&sse[previous..]));
+    actual.extend(piecewise.finish_on_eof());
+
+    assert_eq!(
+        stream_frames(&actual),
+        stream_frames(&expected),
+        "chunk boundaries must not change the emitted frames"
+    );
+}
+
+#[hegel::test]
+fn test_chat_stream_translation_emits_exactly_one_terminal_event(tc: TestCase) {
+    let deltas: Vec<String> = tc.draw(
+        gs::vecs(gs::text().max_size(6)).max_size(6),
+    );
+    let reasoning: Vec<String> = deltas.iter().map(|_| String::new()).collect();
+    let finish = tc.draw(gs::sampled_from(vec![
+        None,
+        Some("stop"),
+        Some("length"),
+        Some("content_filter"),
+        Some("tool_calls"),
+        Some("error"),
+    ]));
+    let sentinel: bool = tc.draw(gs::booleans());
+    let sse = chat_sse(&deltas, &reasoning, finish, sentinel);
+
+    let mut translator = underclass::responses::ChatStreamTranslator::new("m", "resp_1", 0);
+    let mut frames = translator.feed(&sse);
+    frames.extend(translator.finish_on_eof());
+    // Finishing twice must not duplicate the terminal event.
+    frames.extend(translator.finish_on_eof());
+
+    assert_eq!(
+        terminal_events(&frames).len(),
+        1,
+        "the translator must emit exactly one terminal event"
+    );
+}
+
+#[hegel::test]
+fn test_chat_stream_text_deltas_concatenate(tc: TestCase) {
+    let deltas: Vec<String> = tc.draw(
+        gs::vecs(gs::text().max_size(6)).max_size(6),
+    );
+    let reasoning: Vec<String> = deltas.iter().map(|_| String::new()).collect();
+    let sse = chat_sse(&deltas, &reasoning, Some("stop"), true);
+
+    let mut translator = underclass::responses::ChatStreamTranslator::new("m", "resp_1", 0);
+    let mut frames = translator.feed(&sse);
+    frames.extend(translator.finish_on_eof());
+
+    let mut streamed = String::new();
+    for frame in stream_frames(&frames) {
+        if frame.get("type").and_then(|v| v.as_str()) == Some("response.output_text.delta") {
+            streamed.push_str(frame.get("delta").and_then(|v| v.as_str()).unwrap_or_default());
+        }
+    }
+    assert_eq!(streamed, deltas.concat(), "streamed text must equal the concatenated deltas");
+}
+
+#[hegel::test]
+fn test_chat_stream_error_finish_still_yields_one_terminal(tc: TestCase) {
+    let deltas: Vec<String> = tc.draw(gs::vecs(gs::text().max_size(6)).max_size(6));
+    let reasoning: Vec<String> = deltas.iter().map(|_| String::new()).collect();
+    let finish = tc.draw(gs::sampled_from(vec![Some("error"), Some("stop"), None]));
+    let sentinel: bool = tc.draw(gs::booleans());
+    let sse = chat_sse(&deltas, &reasoning, finish, sentinel);
+
+    let mut translator = underclass::responses::ChatStreamTranslator::new("m", "resp_1", 0);
+    let mut frames = translator.feed(&sse);
+    // Both a clean EOF and an abrupt upstream error close through `finish_on_eof`.
+    frames.extend(translator.finish_on_eof());
+    frames.extend(translator.finish_on_eof());
+
+    let terminals = terminal_events(&frames);
+    assert_eq!(terminals.len(), 1, "exactly one terminal event per stream");
+    if finish == Some("error") {
+        assert_eq!(terminals[0], "response.failed", "an error finish must fail the response");
+    }
+}
+
+#[hegel::test]
+fn test_completion_to_response_status_matches_finish_reason(tc: TestCase) {
+    let finish = tc.draw(gs::sampled_from(vec![
+        "stop", "length", "content_filter", "error", "tool_calls",
+    ]));
+    let chat = serde_json::json!({
+        "choices": [{"finish_reason": finish, "message": {"content": "text"}}],
+    });
+    let response = underclass::responses::completion_to_response(&chat, "m", "resp_1", 0);
+    let status = response["status"].as_str().unwrap();
+    let expected = match finish {
+        "length" | "content_filter" => "incomplete",
+        "error" => "failed",
+        _ => "completed",
+    };
+    assert_eq!(status, expected, "finish_reason {finish} mapped to {status}");
+    if finish == "error" {
+        assert_eq!(response["output"], serde_json::json!([]));
+        assert!(response.get("error").is_some(), "a failed response must carry an error");
+    }
+}
+
+#[hegel::test]
+fn test_chat_stream_finish_is_idempotent(tc: TestCase) {
+    let deltas: Vec<String> = tc.draw(gs::vecs(gs::text().max_size(6)).max_size(6));
+    let reasoning: Vec<String> = deltas.iter().map(|_| String::new()).collect();
+    let finishes: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).max_size(4));
+    let sse = chat_sse(&deltas, &reasoning, Some("stop"), true);
+
+    let mut translator = underclass::responses::ChatStreamTranslator::new("m", "resp_1", 0);
+    let mut frames = translator.feed(&sse);
+    // Every flush after the first must be a no-op: an upstream read error after `[DONE]` flushes a
+    // second time and must not append a duplicate terminal event.
+    for _ in finishes.iter().chain(std::iter::once(&true)) {
+        let tail = translator.finish_on_eof();
+        assert!(tail.is_empty(), "a repeated flush must emit nothing");
+        frames.extend(tail);
+    }
+    assert_eq!(terminal_events(&frames).len(), 1);
 }

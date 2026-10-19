@@ -160,6 +160,15 @@ pub fn extract_sticky_key(body: &Value, session_header: Option<&str>) -> Option<
         .filter(|s| !s.is_empty())
 }
 
+/// @cc [owner:ghuntley,label:proxy] enveloped-and-translated-bodies-require-sse
+/// `upstream_is_sse` MUST report false for any non-event-stream content type so a buffered-body
+/// request whose upstream answers with a single JSON document takes the buffered path. Consuming a
+/// JSON body as SSE yields no frames, which would drop a translated response entirely and forward an
+/// enveloped one as an unusable wrapper.
+fn upstream_is_sse(response_content_type: &[u8]) -> bool {
+    response_content_type.starts_with(b"text/event-stream")
+}
+
 fn usage_is_stream(body: &Value, content_type: &[u8]) -> bool {
     body.get("stream").and_then(Value::as_bool) == Some(true)
         || content_type.starts_with(b"text/event-stream")
@@ -487,6 +496,11 @@ async fn attempt_account(
         http::HeaderValue::from_static("text/event-stream, application/json"),
     );
     let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+    let responses_path = path.ends_with("/responses");
+    let translate_responses = responses_path && backend.responses_via_chat();
+    if translate_responses {
+        outbound_body = crate::responses::request_to_chat(&outbound_body);
+    }
     backend.inject_headers(&account, &token, sticky, &outbound_body, &mut headers);
     backend.prepare_body(&mut outbound_body);
     let fallback_body = outbound_body.clone();
@@ -590,6 +604,11 @@ async fn attempt_account(
             state.store.insert_upstream_event(&event_for(&record, kind, "http", record.error_code.clone()));
         }
         let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
+        let body_text = if translate_responses {
+            crate::responses::error_body(&body_text)
+        } else {
+            body_text
+        };
         if let Some(new_status) = {
             let mut pool = state.pool.lock().unwrap();
             pool.report(&selection.account_id, outcome.clone())
@@ -637,48 +656,195 @@ async fn attempt_account(
             body_text,
         )))
     } else {
-        let content_type = response
+        let mut content_type = response
             .headers()
             .get(http::header::CONTENT_TYPE)
             .cloned()
             .unwrap_or(http::HeaderValue::from_static("application/json"));
         let status_code = status;
+        let streaming = usage_is_stream(&outbound_body, content_type.as_bytes());
+        let envelope = backend.response_envelope();
+        // The client's `stream: true` is a request, not a guarantee: an upstream may answer a
+        // streaming request with a single JSON document. Streaming an enveloped or translated body
+        // would forward an unusable wrapper (or drop it entirely), so both only stream when the
+        // response really is an event stream and the buffered path handles the JSON answer.
+        let needs_buffering = translate_responses || envelope.is_some();
+        let streaming = if needs_buffering {
+            upstream_is_sse(content_type.as_bytes())
+        } else {
+            streaming
+        };
+        let translate_stream = translate_responses && streaming;
+        if !streaming && needs_buffering {
+            let raw = match response.bytes().await {
+                Ok(raw) => raw,
+                Err(e) => {
+                    return Attempt::Respond(attach_request_id(
+                        error_response(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("upstream body error: {e}"),
+                            "upstream_error",
+                        ),
+                        request_id,
+                    ));
+                }
+            };
+            let body = unwrap_envelope(&raw, envelope);
+            // Parse before the finish record exists: a 2xx body that is not the JSON we can convert
+            // is a failure of this attempt, and dropping a record already marked `Eof` would record
+            // it as a clean completion.
+            let converted = if translate_responses {
+                match serde_json::from_slice::<Value>(&body) {
+                    Ok(chat) => Some(chat),
+                    Err(e) => {
+                        let mut finish = UsageFinish {
+                            store: state.store.clone(),
+                            logs: state.logs.clone(),
+                            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
+                            tap: UsageTap::new(false, backend.usage_is_chat(path)),
+                            // The body arrived and ended; it just was not convertible.
+                            ended: Some(StreamEnd::UpstreamError),
+                        };
+                        finish.tap.feed(&body);
+                        push_log(
+                            state,
+                            request_id,
+                            model,
+                            Some(selection.backend.as_str().to_string()),
+                            Some(selection.account_id.clone()),
+                            Some(account.label.clone()),
+                            sticky.unwrap_or("none"),
+                            status_code.as_u16(),
+                            started.elapsed().as_millis() as u64,
+                        );
+                        drop(finish);
+                        return Attempt::Respond(attach_request_id(
+                            error_response(
+                                StatusCode::BAD_GATEWAY,
+                                &format!("upstream returned invalid json: {e}"),
+                                "upstream_error",
+                            ),
+                            request_id,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            push_log(
+                state,
+                request_id,
+                model,
+                Some(selection.backend.as_str().to_string()),
+                Some(selection.account_id.clone()),
+                Some(account.label.clone()),
+                sticky.unwrap_or("none"),
+                status_code.as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
+            let bytes = match converted {
+                Some(chat) => {
+                    let response_id = format!("resp_{}", request_id.replace('-', ""));
+                    let converted = crate::responses::completion_to_response(
+                        &chat,
+                        model,
+                        &response_id,
+                        started_ms / 1000,
+                    );
+                    content_type = http::HeaderValue::from_static("application/json");
+                    serde_json::to_vec(&converted).unwrap_or_default()
+                }
+                None => body.clone(),
+            };
+            let mut finish = UsageFinish {
+                store: state.store.clone(),
+                logs: state.logs.clone(),
+                record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
+                tap: UsageTap::new(false, backend.usage_is_chat(path)),
+                ended: None,
+            };
+            finish.tap.feed(&body);
+            finish.ended = Some(StreamEnd::Eof);
+            // Dropping the finish record annotates the log entry pushed above.
+            drop(finish);
+            let mut resp = Response::builder()
+                .status(status_code)
+                .body(Body::from(bytes))
+                .expect("valid response");
+            resp.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
+            return Attempt::Respond(resp);
+        }
+
         let stream = response.bytes_stream();
         let finish = UsageFinish {
             store: state.store.clone(),
             logs: state.logs.clone(),
             record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
-            tap: UsageTap::new(
-                usage_is_stream(&outbound_body, content_type.as_bytes()),
-                backend.usage_is_chat(path),
-            ),
+            tap: UsageTap::new(streaming, backend.usage_is_chat(path)),
             ended: None,
         };
+        let translator = translate_stream.then(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::responses::ChatStreamTranslator::new(
+                    model,
+                    &format!("resp_{}", request_id.replace('-', "")),
+                    started_ms / 1000,
+                ),
+            ))
+        });
         let body_stream = Body::from_stream(futures::stream::unfold(
-            (stream, Some(guard), finish),
-            |(mut stream, guard, mut finish)| async move {
+            (stream, Some(guard), finish, translator),
+            |state| async move {
+                let (mut stream, guard, mut finish, translator) = state;
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         finish.tap.feed(&chunk);
-                        Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish)))
+                        let out = match &translator {
+                            Some(translator) => translator.lock().unwrap().feed(&chunk),
+                            None => chunk.to_vec(),
+                        };
+                        Some((Ok::<_, std::io::Error>(out), (stream, guard, finish, translator)))
                     },
                     Some(Err(_)) => {
                         finish.ended.get_or_insert(StreamEnd::UpstreamError);
-                        Some((
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "upstream stream error",
+                        // A translated stream must close with exactly one terminal event. If the
+                        // translator already emitted it (e.g. after `[DONE]`), end the body cleanly
+                        // rather than aborting a completed response.
+                        match translator.as_ref().map(|t| t.lock().unwrap().finish_on_eof()) {
+                            None => Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "upstream stream error",
+                                )),
+                                (stream, guard, finish, translator),
                             )),
-                            (stream, guard, finish),
-                        ))
+                            Some(tail) if tail.is_empty() => None,
+                            Some(tail) => {
+                                Some((Ok::<_, std::io::Error>(tail), (stream, guard, finish, translator)))
+                            }
+                        }
                     }
                     None => {
                         finish.ended.get_or_insert(StreamEnd::Eof);
-                        None
+                        let tail = translator
+                            .as_ref()
+                            .map(|translator| translator.lock().unwrap().finish_on_eof())
+                            .unwrap_or_default();
+                        if tail.is_empty() {
+                            None
+                        } else {
+                            Some((
+                                Ok::<_, std::io::Error>(tail),
+                                (stream, guard, finish, translator),
+                            ))
+                        }
                     }
                 }
             },
         ));
+        if translate_stream {
+            content_type = http::HeaderValue::from_static("text/event-stream");
+        }
         push_log(
             state,
             request_id,
@@ -696,6 +862,24 @@ async fn attempt_account(
             .expect("valid stream response");
         resp.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
         Attempt::Respond(resp)
+    }
+}
+
+/// @cc [owner:ghuntley,label:proxy] response-envelope-helper-unwraps
+/// When `envelope` names a key and the body is a JSON object carrying a non-null value under it,
+/// the value is re-serialized as the body. Anything else passes through byte-for-byte, so this
+/// helper MUST NOT drop a body it cannot unwrap. This implements the `response-envelope-unwrapped`
+/// requirement declared on `Backend::response_envelope`.
+fn unwrap_envelope(body: &[u8], envelope: Option<&str>) -> Vec<u8> {
+    let Some(key) = envelope else {
+        return body.to_vec();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    match value.get(key).filter(|inner| !inner.is_null()) {
+        Some(inner) => serde_json::to_vec(inner).unwrap_or_else(|_| body.to_vec()),
+        None => body.to_vec(),
     }
 }
 
@@ -809,6 +993,61 @@ mod tests {
         assert!(extract_sticky_key(&body, None).is_none());
         let empty = json!({"prompt_cache_key": ""});
         assert!(extract_sticky_key(&empty, None).is_none());
+    }
+
+    #[test]
+    fn envelope_unwraps_data_key() {
+        let body = br#"{"data":{"choices":[{"message":{"content":"hi"}}]},"success":true}"#;
+        let unwrapped = unwrap_envelope(body, Some("data"));
+        let value: Value = serde_json::from_slice(&unwrapped).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn envelope_passes_through_plain_and_unwrappable_bodies() {
+        let plain = br#"{"choices":[]}"#;
+        assert_eq!(unwrap_envelope(plain, Some("data")), plain);
+        assert_eq!(unwrap_envelope(plain, None), plain);
+        assert_eq!(unwrap_envelope(b"not json", Some("data")), b"not json");
+        let null = br#"{"data":null}"#;
+        assert_eq!(unwrap_envelope(null, Some("data")), null);
+    }
+
+    #[test]
+    fn cline_declares_the_data_envelope() {
+        let backend = crate::cline::ClineBackend { cooldown_ms: 1000 };
+        use crate::provider::Backend;
+        assert_eq!(backend.response_envelope(), Some("data"));
+    }
+
+        #[test]
+    fn json_body_answered_to_a_streaming_request_is_not_parsed_as_sse() {
+        // Cline can answer a `stream: true` request with a single JSON document. Consuming that as
+        // SSE yields no frames, so a translated client gets a synthetic `stream_truncated` failure
+        // and an enveloped one gets the wrapper forwarded verbatim.
+        assert!(!upstream_is_sse(b"application/json"));
+        assert!(!upstream_is_sse(b"application/json; charset=utf-8"));
+        assert!(upstream_is_sse(b"text/event-stream"));
+        assert!(upstream_is_sse(b"text/event-stream; charset=utf-8"));
+    }
+
+    #[test]
+    fn envelope_and_translation_both_route_json_bodies_to_the_buffered_path() {
+        // `needs_buffering` must cover the enveloped chat-completions case, not just responses
+        // translation, or a chat client receives `{"data":…,"success":true}` unmodified.
+        let buffered = |translate: bool, envelope: Option<&str>, ct: &[u8]| {
+            let needs_buffering = translate || envelope.is_some();
+            if needs_buffering { !upstream_is_sse(ct) } else { usage_is_stream(&json!({"stream": true}), ct) }
+        };
+        // A plain chat-completions backend keeps its upstream framing untouched.
+        assert!(buffered(false, None, b"application/json"));
+        // Enveloped or translated, a JSON answer is buffered even though the client asked to stream.
+        assert!(buffered(false, Some("data"), b"application/json"));
+        assert!(buffered(true, None, b"application/json"));
+        assert!(buffered(true, Some("data"), b"application/json"));
+        // A real event stream still streams in every case.
+        assert!(!buffered(false, Some("data"), b"text/event-stream"));
+        assert!(!buffered(true, None, b"text/event-stream"));
     }
 
     #[test]

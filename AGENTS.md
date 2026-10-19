@@ -4,7 +4,7 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 ## What this is
 
-`underclass` is a local LLM proxy that pools multiple ChatGPT/Codex and GitHub Copilot subscriptions behind one OpenAI-compatible endpoint (`/v1/responses`, `/v1/chat/completions`, `/v1/models`). It keeps sessions sticky per subscription via the prompt cache key, takes quota-exhausted subscriptions out of rotation until their window resets, and fails fast with `429` + earliest reset time when the whole pool is exhausted. Architecture decisions live in `docs/adr/` - read `docs/adr/0010-unprefixed-routing-flat-pool.md` first for the core model.
+`underclass` is a local LLM proxy that pools multiple ChatGPT/Codex, GitHub Copilot, and Cline subscriptions behind one OpenAI-compatible endpoint (`/v1/responses`, `/v1/chat/completions`, `/v1/models`). It keeps sessions sticky per subscription via the prompt cache key, takes quota-exhausted subscriptions out of rotation until their window resets, and fails fast with `429` + earliest reset time when the whole pool is exhausted. Architecture decisions live in `docs/adr/` - read `docs/adr/0010-unprefixed-routing-flat-pool.md` first for the core model.
 
 ## Commands
 
@@ -52,6 +52,7 @@ Use the `code-contracts` skill for every code change and code review. Follow its
 
 - Every non-trivial architectural decision gets a MADR record in `docs/adr/NNNN-title.md` (Status / Context / Decision / Consequences).
 - Superseding a decision: mark the old ADR `Superseded by NNNN`, write the new one. Never delete ADRs.
+- Fork-local decisions live in [`docs/adr/fork/`](docs/adr/fork/README.md) with title-only filenames and their own index; never allocate an `NNNN` number on the fork. See that README for why.
 - Index: 0001 Rust/Axum - 0002 Hegel PBT, no mutation testing - 0003 prompt-cache-key stickiness - 0004 health state machine + fail-fast - 0005 SQLite store - 0006 tracing/correlation IDs - 0007 config-driven catalog - 0008 JSONC-safe merge - 0009 device-code onboarding - 0010 unprefixed routing, flat pool - 0011 GitHub Copilot backend - 0012 cross-proxy request correlation - 0013 automatic Codex banked resets - 0014 per-attempt token accounting - 0015 terminal pool monitor - 0016 local monitor socket - 0017 Codex quota deadline reconciliation - 0018 recoverable credential rejection - 0019 scheduled refresh token rotation - 0020 manual Codex reset redemption - 0021 stream outcome accounting + long-range capacity statistics.
 
 ## Review before the pull request (preflight-code)
@@ -170,7 +171,6 @@ current: a stale entry actively misleads.
   rejected in ADR 0002, so its absence is deliberate.
 - `docs/adr/` records are append-only: a reversal is a new record that supersedes the old one, never an
   edit to it.
-
 ## Config files agents may edit
 
 `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `docs/adr/*`, `Cargo.toml`, `flake.nix`, `.github/*`,
