@@ -25,6 +25,10 @@ pub struct MonitorAccount {
     pub sticky_sessions: usize,
     pub month: Counters,
     pub quota: Option<UsageSnapshot>,
+    /// What the backend last reported about the account, for backends without a Codex-shaped
+    /// quota snapshot (Claude Code windows, for example).
+    #[serde(default)]
+    pub observation: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -126,7 +130,7 @@ fn collect(state: &AppState) -> rusqlite::Result<MonitorSnapshot> {
                     id: account.id.clone(),
                     label: account.label.clone(),
                     backend: account.backend,
-                    plan: account.chatgpt_plan(),
+                    plan: account.plan_label(),
                     status: account.status,
                     reset_at: account.reset_at,
                     inflight: item.inflight,
@@ -137,6 +141,7 @@ fn collect(state: &AppState) -> rusqlite::Result<MonitorSnapshot> {
                     } else {
                         None
                     },
+                    observation: state.observations.lock().unwrap().get(&account.id).cloned(),
                 }
             })
             .collect::<Vec<_>>()

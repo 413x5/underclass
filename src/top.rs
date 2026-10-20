@@ -656,6 +656,9 @@ fn quota(account: &MonitorAccount, now_ms: i64) -> String {
     if account.backend == BackendId::Copilot {
         return "unknown".into();
     }
+    if account.backend == BackendId::Claude {
+        return claude_quota(account);
+    }
     let Some(snapshot) = &account.quota else {
         return "waiting…".into();
     };
@@ -688,17 +691,77 @@ fn quota(account: &MonitorAccount, now_ms: i64) -> String {
     }
 }
 
+/// The Claude Code subscription windows, as the account's own usage API last reported them.
+fn claude_quota(account: &MonitorAccount) -> String {
+    let Some(observation) = &account.observation else {
+        return "waiting…".into();
+    };
+    let window = |name: &str| {
+        observation
+            .get(name)
+            .and_then(|w| w.get("utilization"))
+            .and_then(|u| u.as_f64())
+            .map(|utilization| (100.0 - utilization * 100.0).clamp(0.0, 100.0))
+    };
+    let mut windows = Vec::new();
+    if let Some(left) = window("five_hour") {
+        windows.push(format!("5h {left:.0}%"));
+    }
+    if let Some(left) = window("seven_day") {
+        windows.push(format!("7d {left:.0}%"));
+    }
+    if windows.is_empty() {
+        return "unavailable".into();
+    }
+    windows.join(" · ")
+}
+
 fn credits(account: &MonitorAccount) -> String {
+    if account.backend == BackendId::Claude {
+        return account
+            .observation
+            .as_ref()
+            .and_then(|o| o.get("reset_credits"))
+            .and_then(|c| c.as_i64())
+            .map_or("—".into(), |count| count.to_string());
+    }
     account
         .quota
         .as_ref()
         .map_or("—".into(), |q| q.available_resets.to_string())
 }
 
+/// The Claude Code windows use the same severity bands as the Codex quota.
+fn claude_quota_color(account: &MonitorAccount) -> Color {
+    let Some(observation) = &account.observation else {
+        return MUTED;
+    };
+    let remaining = ["five_hour", "seven_day"]
+        .into_iter()
+        .filter_map(|name| {
+            observation
+                .get(name)
+                .and_then(|w| w.get("utilization"))
+                .and_then(|u| u.as_f64())
+                .map(|utilization| (100.0 - utilization * 100.0).clamp(0.0, 100.0))
+        })
+        .fold(100.0f64, f64::min);
+    if remaining <= 10.0 {
+        RED
+    } else if remaining <= 30.0 {
+        YELLOW
+    } else {
+        GREEN
+    }
+}
+
 /// @cc [owner:ghuntley,label:cli] quota-color-severity
 /// Fresh Codex quota MUST use the least remaining window: green above 30%, amber above 10% through
 /// 30%, red at 10% or less or when exhausted. Missing or stale quota MUST use a muted color.
 fn quota_color(account: &MonitorAccount, now_ms: i64) -> Color {
+    if account.backend == BackendId::Claude {
+        return claude_quota_color(account);
+    }
     if account.backend != BackendId::Codex {
         return MUTED;
     }
@@ -775,6 +838,40 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn claude_quota_column_reports_the_subscription_windows() {
+        let account = MonitorAccount {
+            id: "c".into(),
+            label: "claude@example.test".into(),
+            backend: BackendId::Claude,
+            plan: Some("max".into()),
+            status: AccountStatus::Healthy,
+            reset_at: 0,
+            inflight: 0,
+            sticky_sessions: 0,
+            month: Counters::default(),
+            observation: Some(serde_json::json!({
+                "plan": "max",
+                "five_hour": {"utilization": 0.07},
+                "seven_day": {"utilization": 0.42},
+                "reset_credits": 2,
+            })),
+            quota: None,
+        };
+        assert_eq!(quota(&account, 1_000), "5h 93% · 7d 58%");
+        assert_eq!(credits(&account), "2");
+        assert_eq!(quota_color(&account, 1_000), GREEN);
+
+        let exhausted = MonitorAccount {
+            observation: Some(serde_json::json!({
+                "five_hour": {"utilization": 1.0},
+                "seven_day": {"utilization": 0.1},
+            })),
+            ..account
+        };
+        assert_eq!(quota_color(&exhausted, 1_000), RED);
+    }
+
+    #[test]
     fn quota_palette_tracks_lowest_window_and_staleness() {
         let mut account = MonitorAccount {
             id: "a".into(),
@@ -786,6 +883,7 @@ mod tests {
             inflight: 0,
             sticky_sessions: 0,
             month: Counters::default(),
+            observation: None,
             quota: Some(UsageSnapshot {
                 rate_limit: Some(RateLimit {
                     allowed: Some(true),
@@ -842,6 +940,7 @@ mod tests {
                         inflight: 0,
                         sticky_sessions: 0,
                         month: Counters::default(),
+                        observation: None,
                         quota: None,
                     }],
                     month: Counters::default(),
