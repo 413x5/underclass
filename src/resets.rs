@@ -805,6 +805,25 @@ fn expiry_ms(value: Option<&str>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    /// The surfaces the reset tests route over.
+    fn test_surfaces()
+    -> std::collections::HashMap<crate::models::BackendId, Vec<crate::models::Surface>> {
+        std::collections::HashMap::from([
+            (
+                crate::models::BackendId::Codex,
+                vec![crate::models::Surface::OpenAI],
+            ),
+            (
+                crate::models::BackendId::Copilot,
+                vec![crate::models::Surface::OpenAI],
+            ),
+            (
+                crate::models::BackendId::Claude,
+                vec![crate::models::Surface::Anthropic],
+            ),
+        ])
+    }
+
     use super::*;
     use axum::{
         Json, Router,
@@ -916,7 +935,7 @@ mod tests {
         account.status = AccountStatus::Cooling;
         account.reset_at = now_ms() + 60_000;
         store.upsert_account(&account);
-        let pool = Arc::new(Mutex::new(PoolCore::new(&store)));
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
         let client = reqwest::Client::new();
         let tokens = TokenManager::new(store.clone(), client.clone());
         let manager = ResetManager::new(client, base, true);
@@ -949,6 +968,7 @@ mod tests {
             account_id: Some("chatgpt-account".into()),
             residency: None,
             enterprise_url: None,
+            plan: None,
             status: AccountStatus::Cooling,
             reset_at: now_ms() + 3_600_000,
             created_at: 0,
@@ -978,7 +998,7 @@ mod tests {
         let store = Arc::new(Store::in_memory().unwrap());
         let account = cooling_account("account-1");
         store.upsert_account(&account);
-        let pool = Arc::new(Mutex::new(PoolCore::new(&store)));
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
         let client = reqwest::Client::new();
         let tokens = TokenManager::new(store.clone(), client.clone());
         // Disabled automatic redemption must not gate the operator path.
@@ -1027,7 +1047,7 @@ mod tests {
         let store = Arc::new(Store::in_memory().unwrap());
         let account = cooling_account("account-1");
         store.upsert_account(&account);
-        let pool = Arc::new(Mutex::new(PoolCore::new(&store)));
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
         let client = reqwest::Client::new();
         let tokens = TokenManager::new(store.clone(), client.clone());
         let manager = ResetManager::new(client, base, true);
@@ -1139,13 +1159,14 @@ mod tests {
             account_id: Some("chatgpt-account".into()),
             residency: None,
             enterprise_url: None,
+            plan: None,
             status: AccountStatus::Cooling,
             reset_at: now_ms() + 3_600_000,
             created_at: 0,
             updated_at: 0,
         };
         store.upsert_account(&account);
-        let pool = Arc::new(Mutex::new(PoolCore::new(&store)));
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
         let client = reqwest::Client::new();
         let tokens = TokenManager::new(store.clone(), client.clone());
         let manager = ResetManager::new(client, base.clone(), true);

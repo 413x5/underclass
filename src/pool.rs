@@ -1,4 +1,4 @@
-use crate::models::{Account, AccountStatus, BackendId, Binding, Outcome};
+use crate::models::{Account, AccountStatus, BackendId, Binding, Outcome, Surface};
 use crate::store::Store;
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
@@ -40,19 +40,33 @@ pub struct PoolCore {
     pub accounts: HashMap<String, AccountState>,
     bindings: LruCache<String, (String, i64)>,
     catalog: HashMap<BackendId, HashSet<String>>,
-    unknown_model_backend: BackendId,
+    /// Which request surfaces each backend can serve, as declared by the backend itself.
+    surfaces: HashMap<BackendId, Vec<Surface>>,
+    /// Per-account, per-model cooldowns: the upstream refused this model on this account while
+    /// the account keeps serving its other models.
+    model_cooldowns: HashMap<String, HashMap<String, i64>>,
 }
 
 impl PoolCore {
-    pub fn new(store: &Store) -> Self {
+    /// @cc [owner:ghuntley,label:pool] pool-surfaces-from-backends
+    /// `PoolCore::new` MUST take the surface declarations of the registered backends and MUST
+    /// NOT infer them from backend names or model catalogs.
+    pub fn new(store: &Store, surfaces: HashMap<BackendId, Vec<Surface>>) -> Self {
         let mut core = Self {
             accounts: HashMap::new(),
             bindings: LruCache::new(NonZeroUsize::new(DEFAULT_BINDING_CAP).unwrap()),
             catalog: HashMap::new(),
-            unknown_model_backend: BackendId::Codex,
+            surfaces,
+            model_cooldowns: HashMap::new(),
         };
         for a in store.list_accounts() {
-            core.accounts.insert(a.id.clone(), AccountState { account: a, inflight: 0 });
+            core.accounts.insert(
+                a.id.clone(),
+                AccountState {
+                    account: a,
+                    inflight: 0,
+                },
+            );
         }
         for b in store.list_bindings() {
             core.bindings.put(b.cache_key, (b.account_id, b.bound_at));
@@ -74,21 +88,40 @@ impl PoolCore {
             .is_some_and(|set| set.contains(model))
     }
 
-    fn eligible_backends(&self, model: &str) -> Vec<BackendId> {
+    fn eligible_backends(&self, model: &str, surface: Surface) -> Vec<BackendId> {
         let mut out: Vec<BackendId> = BackendId::all()
             .into_iter()
+            .filter(|b| self.serves_surface(*b, surface))
             .filter(|b| self.serves(*b, model))
             .collect();
-        if out.is_empty() {
-            out.push(self.unknown_model_backend);
+        if out.is_empty()
+            && let Some(fallback) = self.fallback_backend(surface)
+        {
+            out.push(fallback);
         }
         out
     }
 
+    /// Whether a backend can serve the given request surface at all.
+    pub fn serves_surface(&self, backend: BackendId, surface: Surface) -> bool {
+        self.surfaces
+            .get(&backend)
+            .is_some_and(|list| list.contains(&surface))
+    }
+
+    /// The backend an unknown model falls back to on a surface: the first registered backend
+    /// that declares the surface, in a stable order.
+    fn fallback_backend(&self, surface: Surface) -> Option<BackendId> {
+        BackendId::all()
+            .into_iter()
+            .find(|b| self.serves_surface(*b, surface))
+    }
+
     /// @cc [owner:ghuntley,label:pool] sweep-readmits-expired-cooling
     /// `sweep(now)` MUST return every account whose `Cooling` state has `reset_at <= now` back to
-    /// `Healthy` (eligible for selection again), and MUST evict sticky bindings older than
-    /// `BINDING_TTL_MS`. It MUST NOT touch Cooling accounts whose reset has not passed.
+    /// `Healthy` (eligible for selection again), MUST evict expired per-model cooldowns, and MUST
+    /// evict sticky bindings older than `BINDING_TTL_MS`. It MUST NOT touch Cooling accounts
+    /// whose reset has not passed.
     pub fn sweep(&mut self, now: i64) -> Vec<String> {
         let mut readmitted = Vec::new();
         for state in self.accounts.values_mut() {
@@ -97,6 +130,21 @@ impl PoolCore {
                 state.account.reset_at = 0;
                 readmitted.push(state.account.id.clone());
             }
+        }
+        let expired: Vec<String> = self
+            .model_cooldowns
+            .iter_mut()
+            .filter_map(|(account_id, models)| {
+                models.retain(|_, until_ms| *until_ms > now);
+                if models.is_empty() {
+                    Some(account_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for account_id in expired {
+            self.model_cooldowns.remove(&account_id);
         }
         loop {
             let expired = match self.bindings.peek_lru() {
@@ -113,6 +161,29 @@ impl PoolCore {
         readmitted
     }
 
+    /// @cc [owner:ghuntley,label:pool] model-cooldown-scopes-one-model
+    /// `report_model_quota` MUST record a cooldown for one model on one account until
+    /// `until_ms`, MUST NOT change the account's status, and MUST never shorten an existing
+    /// cooldown for the same account and model.
+    pub fn report_model_quota(&mut self, account_id: &str, model: &str, until_ms: i64) {
+        let models = self
+            .model_cooldowns
+            .entry(account_id.to_string())
+            .or_default();
+        let entry = models.entry(model.to_string()).or_insert(until_ms);
+        if until_ms > *entry {
+            *entry = until_ms;
+        }
+    }
+
+    /// Whether the account is cooling for the given model.
+    pub fn model_cooling_until(&self, account_id: &str, model: &str) -> Option<i64> {
+        self.model_cooldowns
+            .get(account_id)
+            .and_then(|models| models.get(model))
+            .copied()
+    }
+
     /// @cc [owner:ghuntley,label:pool] select-sticky-healthy-never-unhealthy
     /// Selection MUST return, in priority order: (1) the account bound to the sticky key when it
     /// is Healthy and serves the model (decision `StickyHit`); (2) on rebinding, a Healthy account
@@ -121,8 +192,15 @@ impl PoolCore {
     /// account that is Cooling, AuthError, or Disabled. When no eligible Healthy account exists it
     /// MUST fail with `Saturated { until_ms = min reset_at over eligible cooling accounts }` or,
     /// if none are cooling, `NoAccounts`. Requests without a sticky key MUST NOT create bindings.
-    pub fn select(&mut self, now: i64, sticky: Option<&str>, model: &str) -> Result<Selection, SelectError> {
-        self.select_excluding(now, sticky, model, &HashSet::new())
+    /// Only backends that declare the requested `surface` are eligible.
+    pub fn select(
+        &mut self,
+        now: i64,
+        sticky: Option<&str>,
+        model: &str,
+        surface: Surface,
+    ) -> Result<Selection, SelectError> {
+        self.select_excluding(now, sticky, model, surface, &HashSet::new())
     }
 
     /// @cc [owner:ghuntley,label:pool] select-excluding-skips-excluded
@@ -135,10 +213,12 @@ impl PoolCore {
         now: i64,
         sticky: Option<&str>,
         model: &str,
+        surface: Surface,
         exclude: &HashSet<String>,
     ) -> Result<Selection, SelectError> {
         self.sweep(now);
-        let backends: HashSet<BackendId> = self.eligible_backends(model).into_iter().collect();
+        let backends: HashSet<BackendId> =
+            self.eligible_backends(model, surface).into_iter().collect();
 
         let find_healthy = |core: &Self, backend_filter: Option<BackendId>| -> Option<String> {
             let mut candidates: Vec<(u32, &String)> = core
@@ -149,6 +229,11 @@ impl PoolCore {
                         && s.account.healthy()
                         && backends.contains(&s.account.backend)
                         && backend_filter.is_none_or(|b| s.account.backend == b)
+                        && !core
+                            .model_cooldowns
+                            .get(*id)
+                            .and_then(|models| models.get(model))
+                            .is_some_and(|until_ms| *until_ms > now)
                 })
                 .map(|(id, s)| (s.inflight, id))
                 .collect();
@@ -190,29 +275,52 @@ impl PoolCore {
 
         if let Some(next) = find_healthy(self, None) {
             let backend = self.accounts[&next].account.backend;
-            let decision = if sticky.is_some() { Decision::NewBinding } else { Decision::Unsticky };
+            let decision = if sticky.is_some() {
+                Decision::NewBinding
+            } else {
+                Decision::Unsticky
+            };
             if let Some(key) = sticky {
                 self.bind(key, &next, now);
             }
-            return Ok(Selection { account_id: next, backend, decision });
+            return Ok(Selection {
+                account_id: next,
+                backend,
+                decision,
+            });
         }
 
-        match self.min_reset(|a| backends.contains(&a.backend), now) {
+        match self.min_reset(|a| backends.contains(&a.backend), model, now) {
             Some(until_ms) => Err(SelectError::Saturated { until_ms }),
             None => Err(SelectError::NoAccounts),
         }
     }
 
-    fn min_reset(&self, eligible: impl Fn(&Account) -> bool, _now: i64) -> Option<i64> {
-        self.accounts
+    /// The earliest moment an eligible account can serve the model again.
+    fn min_reset(&self, eligible: impl Fn(&Account) -> bool, model: &str, now: i64) -> Option<i64> {
+        let mut deadlines: Vec<i64> = self
+            .accounts
             .values()
             .filter(|s| s.account.status == AccountStatus::Cooling && eligible(&s.account))
             .map(|s| s.account.reset_at)
-            .min()
+            .collect();
+        deadlines.extend(
+            self.model_cooldowns
+                .iter()
+                .filter(|(id, _)| {
+                    self.accounts
+                        .get(*id)
+                        .is_some_and(|state| eligible(&state.account))
+                })
+                .filter_map(|(_, models)| models.get(model).copied())
+                .filter(|until_ms| *until_ms > now),
+        );
+        deadlines.into_iter().min()
     }
 
     fn bind(&mut self, key: &str, account_id: &str, now: i64) {
-        self.bindings.put(key.to_string(), (account_id.to_string(), now));
+        self.bindings
+            .put(key.to_string(), (account_id.to_string(), now));
     }
 
     pub fn bindings(&self) -> Vec<Binding> {
@@ -248,13 +356,14 @@ impl PoolCore {
     /// @cc [owner:ghuntley,label:pool] report-quota-transitions
     /// `report` MUST transition the account to `Cooling { reset_at = until_ms }` on
     /// `Outcome::QuotaExhausted` and to `AuthError` on `Outcome::AuthFailed`, and MUST NOT change
-    /// the account's status on `Outcome::Ok` or `Outcome::Transient`.
+    /// the account's status on `Outcome::Ok`, `Outcome::Transient`, or a model-scoped quota
+    /// rejection.
     pub fn report(&mut self, account_id: &str, outcome: Outcome) -> Option<AccountStatus> {
         let state = self.accounts.get_mut(account_id)?;
         let new_status = match outcome {
             Outcome::QuotaExhausted { until_ms } => Some((AccountStatus::Cooling, until_ms)),
             Outcome::AuthFailed => Some((AccountStatus::AuthError, 0)),
-            Outcome::Transient | Outcome::Ok => None,
+            Outcome::Transient | Outcome::Ok | Outcome::ModelQuotaExhausted { .. } => None,
         };
         if let Some((status, reset_at)) = new_status {
             state.account.status = status;
@@ -273,7 +382,13 @@ impl PoolCore {
     }
 
     pub fn insert_account(&mut self, account: Account) {
-        self.accounts.insert(account.id.clone(), AccountState { account, inflight: 0 });
+        self.accounts.insert(
+            account.id.clone(),
+            AccountState {
+                account,
+                inflight: 0,
+            },
+        );
     }
 
     pub fn sync_account(&mut self, account: Account) {
@@ -298,8 +413,7 @@ impl PoolCore {
             }
             self.sync_account(account);
         }
-        let live: std::collections::HashSet<String> =
-            self.accounts.keys().cloned().collect();
+        let live: std::collections::HashSet<String> = self.accounts.keys().cloned().collect();
         let stale: Vec<String> = store
             .list_accounts()
             .into_iter()
@@ -345,6 +459,7 @@ mod tests {
             account_id: None,
             residency: None,
             enterprise_url: None,
+            plan: None,
             status: AccountStatus::Healthy,
             reset_at: 0,
             created_at: 0,
@@ -354,7 +469,17 @@ mod tests {
 
     fn core_with(backends: &[(BackendId, &[&str], &[&str])]) -> PoolCore {
         let store = Store::in_memory().unwrap();
-        let mut core = PoolCore::new(&store);
+        let surfaces = backends
+            .iter()
+            .map(|(backend, _, _)| {
+                let surface = match backend {
+                    BackendId::Claude => Surface::Anthropic,
+                    _ => Surface::OpenAI,
+                };
+                (*backend, vec![surface])
+            })
+            .collect();
+        let mut core = PoolCore::new(&store, surfaces);
         for (backend, models, ids) in backends {
             core.set_catalog(*backend, models.iter().map(|s| s.to_string()).collect());
             for id in *ids {
@@ -367,8 +492,12 @@ mod tests {
     #[test]
     fn sticky_key_pins_to_one_account() {
         let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a", "b"])]);
-        let s1 = core.select(0, Some("k1"), "gpt-5.5").unwrap();
-        let s2 = core.select(1, Some("k1"), "gpt-5.5").unwrap();
+        let s1 = core
+            .select(0, Some("k1"), "gpt-5.5", Surface::OpenAI)
+            .unwrap();
+        let s2 = core
+            .select(1, Some("k1"), "gpt-5.5", Surface::OpenAI)
+            .unwrap();
         assert_eq!(s1.account_id, s2.account_id);
         assert_eq!(s2.decision, Decision::StickyHit);
     }
@@ -379,9 +508,16 @@ mod tests {
             (BackendId::Codex, &["gpt-5.5"], &["a", "b"]),
             (BackendId::Copilot, &["gpt-5.5"], &["c"]),
         ]);
-        let first = core.select(0, Some("k"), "gpt-5.5").unwrap();
-        core.report(&first.account_id, Outcome::QuotaExhausted { until_ms: 10_000 });
-        let second = core.select(1, Some("k"), "gpt-5.5").unwrap();
+        let first = core
+            .select(0, Some("k"), "gpt-5.5", Surface::OpenAI)
+            .unwrap();
+        core.report(
+            &first.account_id,
+            Outcome::QuotaExhausted { until_ms: 10_000 },
+        );
+        let second = core
+            .select(1, Some("k"), "gpt-5.5", Surface::OpenAI)
+            .unwrap();
         assert_ne!(second.account_id, first.account_id);
         assert_eq!(second.backend, BackendId::Codex);
         assert_eq!(second.decision, Decision::StickyRebind);
@@ -392,20 +528,24 @@ mod tests {
         let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a"])]);
         core.report("a", Outcome::QuotaExhausted { until_ms: 100 });
         assert!(matches!(
-            core.select(50, Some("k"), "gpt-5.5"),
+            core.select(50, Some("k"), "gpt-5.5", Surface::OpenAI),
             Err(SelectError::Saturated { until_ms: 100 })
         ));
         assert!(matches!(
-            core.select(150, Some("k"), "gpt-5.5"),
+            core.select(150, Some("k"), "gpt-5.5", Surface::OpenAI),
             Ok(Selection { .. })
         ));
     }
 
     #[test]
     fn unknown_model_routes_to_codex_pass_through() {
-        let mut core = core_with(&[(BackendId::Copilot, &["gpt-4.1"], &["c"])]);
-        core.insert_account(account("a", BackendId::Codex));
-        let s = core.select(0, Some("k"), "totally-unknown-model").unwrap();
+        let mut core = core_with(&[
+            (BackendId::Codex, &["gpt-5.5"], &["a"]),
+            (BackendId::Copilot, &["gpt-4.1"], &["c"]),
+        ]);
+        let s = core
+            .select(0, Some("k"), "totally-unknown-model", Surface::OpenAI)
+            .unwrap();
         assert_eq!(s.backend, BackendId::Codex);
         assert_eq!(s.account_id, "a");
     }
@@ -416,7 +556,7 @@ mod tests {
             (BackendId::Codex, &["gpt-5.5"], &["a"]),
             (BackendId::Copilot, &["gpt-4.1"], &["c"]),
         ]);
-        let s = core.select(0, None, "gpt-4.1").unwrap();
+        let s = core.select(0, None, "gpt-4.1", Surface::OpenAI).unwrap();
         assert_eq!(s.backend, BackendId::Copilot);
     }
 
@@ -425,7 +565,7 @@ mod tests {
         let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a", "b"])]);
         core.acquire("a");
         core.acquire("a");
-        let s = core.select(0, None, "gpt-5.5").unwrap();
+        let s = core.select(0, None, "gpt-5.5", Surface::OpenAI).unwrap();
         assert_eq!(s.account_id, "b");
         core.release("a");
         core.release("a");
@@ -444,7 +584,7 @@ mod tests {
         let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a", "b"])]);
         core.report("a", Outcome::QuotaExhausted { until_ms: 500 });
         core.report("b", Outcome::QuotaExhausted { until_ms: 300 });
-        match core.select(100, Some("k"), "gpt-5.5") {
+        match core.select(100, Some("k"), "gpt-5.5", Surface::OpenAI) {
             Err(SelectError::Saturated { until_ms }) => assert_eq!(until_ms, 300),
             other => panic!("expected saturated, got {other:?}"),
         }
@@ -454,7 +594,7 @@ mod tests {
     fn no_accounts_error_when_nothing_configured() {
         let mut core = core_with(&[]);
         assert!(matches!(
-            core.select(0, Some("k"), "gpt-5.5"),
+            core.select(0, Some("k"), "gpt-5.5", Surface::OpenAI),
             Err(SelectError::NoAccounts)
         ));
     }
@@ -462,7 +602,7 @@ mod tests {
     #[test]
     fn unsticky_requests_do_not_bind() {
         let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a"])]);
-        let s = core.select(0, None, "gpt-5.5").unwrap();
+        let s = core.select(0, None, "gpt-5.5", Surface::OpenAI).unwrap();
         assert_eq!(s.decision, Decision::Unsticky);
         assert!(core.bindings().is_empty());
     }
@@ -470,11 +610,72 @@ mod tests {
     #[test]
     fn new_binding_created_for_sticky_request_on_miss() {
         let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a"])]);
-        let s = core.select(0, Some("k"), "gpt-5.5").unwrap();
+        let s = core
+            .select(0, Some("k"), "gpt-5.5", Surface::OpenAI)
+            .unwrap();
         assert_eq!(s.decision, Decision::NewBinding);
         let bindings = core.bindings();
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].account_id, "a");
         assert_eq!(bindings[0].cache_key, "k");
+    }
+
+    /// @cc [owner:ghuntley,label:pool] surfaces-partition-selection
+    /// Selection MUST only return accounts whose backend declares the requested surface, and an
+    /// unknown model MUST fall back to a backend that declares that surface.
+    #[test]
+    fn surfaces_partition_selection() {
+        let mut core = core_with(&[
+            (BackendId::Codex, &["gpt-5.5"], &["codex-a"]),
+            (BackendId::Copilot, &["gpt-5.5"], &["copilot-a"]),
+            (BackendId::Claude, &["claude-opus-5-5"], &["claude-a"]),
+        ]);
+        let openai = core
+            .select(0, Some("k"), "gpt-5.5", Surface::OpenAI)
+            .unwrap();
+        assert!(openai.backend != BackendId::Claude);
+        let anthropic = core
+            .select(0, Some("k2"), "claude-opus-5-5", Surface::Anthropic)
+            .unwrap();
+        assert_eq!(anthropic.backend, BackendId::Claude);
+        assert_eq!(anthropic.account_id, "claude-a");
+        // An unknown model falls back to a backend that serves the requested surface.
+        let unknown = core
+            .select(0, Some("k3"), "claude-unknown-model", Surface::Anthropic)
+            .unwrap();
+        assert_eq!(unknown.backend, BackendId::Claude);
+    }
+
+    #[test]
+    fn anthropic_surface_never_selects_an_openai_account() {
+        let mut core = core_with(&[
+            (BackendId::Codex, &["gpt-5.5"], &["codex-a"]),
+            (BackendId::Claude, &["claude-opus-5-5"], &["claude-a"]),
+        ]);
+        for _ in 0..5 {
+            let selection = core
+                .select(0, None, "claude-opus-5-5", Surface::Anthropic)
+                .unwrap();
+            assert_eq!(selection.backend, BackendId::Claude);
+        }
+    }
+
+    #[test]
+    fn saturation_is_measured_per_surface() {
+        let mut core = core_with(&[
+            (BackendId::Codex, &["gpt-5.5"], &["codex-a"]),
+            (BackendId::Claude, &["claude-opus-5-5"], &["claude-a"]),
+        ]);
+        core.report("codex-a", Outcome::QuotaExhausted { until_ms: 10_000 });
+        // The Anthropic surface has a healthy account and must not report saturation.
+        assert!(
+            core.select(0, None, "claude-opus-5-5", Surface::Anthropic)
+                .is_ok()
+        );
+        // The OpenAI surface is saturated until its account's reset.
+        assert!(matches!(
+            core.select(0, None, "gpt-5.5", Surface::OpenAI),
+            Err(SelectError::Saturated { until_ms: 10_000 })
+        ));
     }
 }

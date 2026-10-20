@@ -1,13 +1,13 @@
-use crate::models::{now_ms, AccountStatus, BackendId, RequestLogEntry};
+use crate::models::{AccountStatus, BackendId, RequestLogEntry, now_ms};
 use crate::proxy::AppState;
-use axum::extract::{Path, Query, State};
 use crate::store::UsageQuery;
+use axum::Json;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::json;
-use chrono::Datelike;
 use std::sync::Arc;
 
 pub const UI_HTML: &str = include_str!("ui.html");
@@ -52,10 +52,11 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         .iter()
         .filter(|b| b.account_id == account.id)
         .count();
+    drop(pool);
     json!({
         "id": account.id,
         "backend": account.backend.as_str(),
-        "plan": account.chatgpt_plan(),
+        "plan": account.plan_label(),
         "label": account.label,
         "status": account.status,
         "reset_at": account.reset_at,
@@ -66,6 +67,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         "enterprise_url": account.enterprise_url,
         "created_at": account.created_at,
         "usage": state.resets.snapshot(&account.id),
+        "observation": state.observations.lock().unwrap().get(&account.id).cloned(),
     })
 }
 
@@ -79,12 +81,7 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
     let requests: Vec<RequestLogEntry> = state.logs.lock().unwrap().iter().rev().cloned().collect();
     let catalog: serde_json::Map<String, serde_json::Value> = BackendId::all()
         .iter()
-        .map(|b| {
-            (
-                b.as_str().to_string(),
-                json!(state.store.catalog(*b)),
-            )
-        })
+        .map(|b| (b.as_str().to_string(), json!(state.store.catalog(*b))))
         .collect();
     Json(json!({
         "accounts": accounts,
@@ -98,17 +95,38 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
 fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
     if query.from_ms.is_none() && query.to_ms.is_none() {
         let now = chrono::Utc::now();
-        let start = now.date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+        let start = now
+            .date_naive()
+            .with_day(1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
         query.from_ms = Some(start);
     }
-    if query.from_ms.zip(query.to_ms).is_some_and(|(from, to)| from >= to) {
+    if query
+        .from_ms
+        .zip(query.to_ms)
+        .is_some_and(|(from, to)| from >= to)
+    {
         return Err((StatusCode::BAD_REQUEST, "from_ms must precede to_ms").into_response());
     }
-    if query.group_by.as_deref().unwrap_or("").split(',').any(|part| !part.is_empty() && !matches!(part, "model" | "account_id" | "cache_key")) {
+    if query
+        .group_by
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .any(|part| !part.is_empty() && !matches!(part, "model" | "account_id" | "cache_key"))
+    {
         return Err((StatusCode::BAD_REQUEST, "invalid group_by").into_response());
     }
     if query.cache_key.is_some() && query.missing_key == Some(true) {
-        return Err((StatusCode::BAD_REQUEST, "cache_key conflicts with missing_key").into_response());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cache_key conflicts with missing_key",
+        )
+            .into_response());
     }
     Ok(query)
 }
@@ -116,25 +134,49 @@ fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
 /// @cc [owner:ghuntley,label:security] usage-admin-query
 /// Usage summaries MUST be available only under the admin token gate and MUST report unknown
 /// requests separately from measured input and output totals.
-pub async fn usage_summary(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
-    let query = match usage_query(query) { Ok(query) => query, Err(response) => return response };
+pub async fn usage_summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    let query = match usage_query(query) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     match state.store.usage_summary(&query) {
         Ok(groups) => {
-            let total_query = UsageQuery { group_by: None, ..query.clone() };
+            let total_query = UsageQuery {
+                group_by: None,
+                ..query.clone()
+            };
             match state.store.usage_summary(&total_query) {
                 Ok(totals) => Json(json!({"groups": groups, "totals": totals.first(), "from_ms": query.from_ms, "to_ms": query.to_ms})).into_response(),
                 Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
             }
-        },
-        Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "usage.query_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response()
+        }
     }
 }
 
-pub async fn usage_requests(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
-    let query = match usage_query(query) { Ok(query) => query, Err(response) => return response };
+pub async fn usage_requests(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    let query = match usage_query(query) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     match state.store.usage_records(&query) {
-        Ok(requests) => Json(json!({"requests": requests, "from_ms": query.from_ms, "to_ms": query.to_ms})).into_response(),
-        Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+        Ok(requests) => {
+            Json(json!({"requests": requests, "from_ms": query.from_ms, "to_ms": query.to_ms}))
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "usage.query_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response()
+        }
     }
 }
 
@@ -173,6 +215,14 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::Claude => crate::claude::start_flow(
+            state.client.clone(),
+            state.store.clone(),
+            state.flows.clone(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string()),
     };
     match result {
         Ok(flow_id) => {
@@ -194,13 +244,52 @@ pub async fn flow_status(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     }
 }
 
-pub async fn delete_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+#[derive(Deserialize)]
+pub struct FlowCodeBody {
+    pub code: String,
+}
+
+/// @cc [owner:ghuntley,label:security] claude-flow-code-never-echoed
+/// `submit_flow_code` MUST exchange the pasted authorization code for tokens and MUST NOT echo
+/// the code, the state, or any token back to the caller.
+pub async fn submit_flow_code(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<FlowCodeBody>,
+) -> Response {
+    match crate::claude::submit_code(
+        state.client.clone(),
+        state.store.clone(),
+        state.flows.clone(),
+        &id,
+        &body.code,
+    )
+    .await
+    {
+        Ok(account_id) => {
+            Json(json!({ "account_id": account_id, "status": "authorized" })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "flow_failed", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn delete_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
     state.store.delete_account(&id);
     state.pool.lock().unwrap().remove_account(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn disable_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn disable_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
     set_status(&state, &id, AccountStatus::Disabled, 0)
 }
 
@@ -211,7 +300,10 @@ pub async fn disable_account(State(state): State<Arc<AppState>>, Path(id): Path<
 /// account it MUST preserve both the `Cooling` status and its existing `reset_at` deadline, since
 /// that deadline originates from upstream quota rather than an operator action. For an already
 /// `Healthy` account it MUST leave the status `Healthy` and clear `reset_at` to 0.
-pub async fn enable_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn enable_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
     let Some(account) = state.store.get_account(&id) else {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     };
@@ -248,13 +340,25 @@ pub async fn relogin_account(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::Claude => crate::claude::start_flow(
+            state.client.clone(),
+            state.store.clone(),
+            state.flows.clone(),
+            Some(id.clone()),
+        )
+        .await
+        .map_err(|e| e.to_string()),
     };
     match result {
         Ok(flow_id) => {
             let flow = state.flows.get(&flow_id);
             Json(json!({ "flow_id": flow_id, "flow": flow })).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("failed to start flow: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to start flow: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -266,7 +370,8 @@ pub struct ResetQuery {
 
 /// @cc [owner:ghuntley,label:pool] manual-reset-endpoint-outcomes
 /// `reset_account` MUST return 404 for an unknown account id and otherwise delegate to
-/// `ResetManager::manual_reset` with the `force` query flag. Every non-2xx response MUST carry a
+/// `ResetManager::manual_reset` with the `force` query flag for a ChatGPT/Codex account, or to
+/// the Claude Code redemption path for a Claude account. Every non-2xx response MUST carry a
 /// JSON body with a stable `error` code and a human `message`; refusals that `force` can override
 /// (`not_rate_limited`, `already_redeemed`) and `no_credit` MUST be 409, `not_codex` 400, and
 /// upstream failures 502.
@@ -283,6 +388,44 @@ pub async fn reset_account(
         )
             .into_response();
     };
+    if account.backend == BackendId::Claude {
+        let token = match state.tokens.access_token(&account).await {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(error = %e, "claude.reset.token_unavailable");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": "upstream_error", "message": "no usable credential" })),
+                )
+                    .into_response();
+            }
+        };
+        return match crate::claude::manual_reset(
+            &state.client,
+            &account,
+            &token,
+            &state.pool,
+            &state.store,
+            query.force,
+        )
+        .await
+        {
+            Ok(outcome) => Json(json!({
+                "account_id": account.id,
+                "label": account.label,
+                "outcome": outcome.outcome,
+                "credit_id": outcome.credit_id,
+                "status": outcome.status,
+                "available_resets": outcome.available_resets,
+            }))
+            .into_response(),
+            Err(error) => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": error.code(), "message": error.message() })),
+            )
+                .into_response(),
+        };
+    }
     match state
         .resets
         .manual_reset(
@@ -341,7 +484,8 @@ pub async fn get_catalog(
     let Some(backend) = BackendId::parse(&backend) else {
         return (StatusCode::NOT_FOUND, "unknown backend").into_response();
     };
-    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) })).into_response()
+    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) }))
+        .into_response()
 }
 
 pub async fn put_catalog(
@@ -355,7 +499,8 @@ pub async fn put_catalog(
     state.store.set_catalog(backend, &body.models);
     let ids: Vec<String> = body.models.iter().map(|m| m.id.clone()).collect();
     state.pool.lock().unwrap().set_catalog(backend, ids);
-    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) })).into_response()
+    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) }))
+        .into_response()
 }
 
 pub async fn client_key(State(state): State<Arc<AppState>>) -> Response {
@@ -379,7 +524,11 @@ pub async fn refresh_copilot_catalog(State(state): State<Arc<AppState>>) -> Resp
             Ok(models) if !models.is_empty() => {
                 state.store.set_catalog(BackendId::Copilot, &models);
                 let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-                state.pool.lock().unwrap().set_catalog(BackendId::Copilot, ids);
+                state
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .set_catalog(BackendId::Copilot, ids);
                 refreshed += 1;
             }
             Ok(_) => {}

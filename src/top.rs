@@ -98,7 +98,9 @@ pub fn admin_http_target(
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err("server URL must be an HTTP(S) origin without credentials, path, or query".into());
+        return Err(
+            "server URL must be an HTTP(S) origin without credentials, path, or query".into(),
+        );
     }
     let token = if url_override.is_some() {
         std::env::var("UNDERCLASS_UI_TOKEN")
@@ -419,7 +421,13 @@ fn draw_accounts(
             let cells = if compact {
                 vec![
                     Cell::from(display_text(&account.label)),
-                    Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
+                    Cell::from(display_text(account.plan.as_deref().unwrap_or(
+                        if account.backend == BackendId::Codex {
+                            "unknown"
+                        } else {
+                            "—"
+                        },
+                    ))),
                     Cell::from(status).style(Style::default().fg(status_color(account.status))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
@@ -430,7 +438,13 @@ fn draw_accounts(
             } else {
                 vec![
                     Cell::from(display_text(&account.label)),
-                    Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
+                    Cell::from(display_text(account.plan.as_deref().unwrap_or(
+                        if account.backend == BackendId::Codex {
+                            "unknown"
+                        } else {
+                            "—"
+                        },
+                    ))),
                     Cell::from(account.backend.as_str()),
                     Cell::from(status).style(Style::default().fg(status_color(account.status))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
@@ -819,10 +833,16 @@ mod tests {
                     now_ms: 120_000,
                     month_start_ms: 0,
                     accounts: vec![MonitorAccount {
-                        id: "account".into(), label: "test account".into(),
-                        backend: BackendId::Codex, plan: Some("plus".into()),
-                        status: AccountStatus::Healthy, reset_at: 0, inflight: 0,
-                        sticky_sessions: 0, month: Counters::default(), quota: None,
+                        id: "account".into(),
+                        label: "test account".into(),
+                        backend: BackendId::Codex,
+                        plan: Some("plus".into()),
+                        status: AccountStatus::Healthy,
+                        reset_at: 0,
+                        inflight: 0,
+                        sticky_sessions: 0,
+                        month: Counters::default(),
+                        quota: None,
                     }],
                     month: Counters::default(),
                     last_minute: Counters::default(),
@@ -833,8 +853,13 @@ mod tests {
             };
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             if width >= 80 {
-                let screen = terminal.backend().buffer().content().iter()
-                    .map(|cell| cell.symbol()).collect::<String>();
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
                 assert!(screen.contains("PLAN"));
                 assert!(screen.contains("plus"));
             }

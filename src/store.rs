@@ -1,10 +1,10 @@
 use crate::models::{Account, AccountStatus, BackendId, Binding, ModelInfo};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::stats::{self, CountRow, Dim, Interval, Series, TallyRow, Totals};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
-use serde::Serialize;
-use rusqlite::types::Value;
-use crate::stats::{self, CountRow, Dim, Interval, Series, TallyRow, Totals};
 
 fn usage_dim_sql(dim: Dim) -> (&'static str, &'static str) {
     match dim {
@@ -99,7 +99,9 @@ impl UsageQuery {
                 values.push(value);
             }
         }
-        if self.missing_key == Some(true) { predicates.push("cache_key IS NULL".into()); }
+        if self.missing_key == Some(true) {
+            predicates.push("cache_key IS NULL".into());
+        }
         (predicates.join(" AND "), values)
     }
 }
@@ -134,6 +136,7 @@ fn schema() -> &'static str {
         account_id TEXT,
         residency TEXT,
         enterprise_url TEXT,
+        plan TEXT,
         status TEXT NOT NULL DEFAULT 'healthy',
         reset_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
@@ -229,6 +232,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !columns.iter().any(|c| c == "plan") {
+        conn.execute("ALTER TABLE accounts ADD COLUMN plan TEXT", [])?;
+    }
     let mut stmt = conn.prepare("PRAGMA table_info(usage_records)")?;
     let columns: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -240,7 +246,10 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("saw_output", "INTEGER"),
     ] {
         if !columns.iter().any(|c| c == name) {
-            conn.execute(&format!("ALTER TABLE usage_records ADD COLUMN {name} {ty}"), [])?;
+            conn.execute(
+                &format!("ALTER TABLE usage_records ADD COLUMN {name} {ty}"),
+                [],
+            )?;
         }
     }
     Ok(())
@@ -276,21 +285,31 @@ impl Store {
     /// @cc [owner:ghuntley,label:accounting] monitor-account-totals-complete
     /// `monitor_account_totals` MUST include every upstream attempt in `[from_ms, to_ms)` for
     /// every account without pagination, and MUST count missing token pairs as unknown.
-    pub fn monitor_account_totals(&self, from_ms: i64, to_ms: i64) -> rusqlite::Result<Vec<UsageSummary>> {
+    pub fn monitor_account_totals(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> rusqlite::Result<Vec<UsageSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT account_id, MAX(account_label), COUNT(*), \
              SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END), \
              COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) \
-             FROM usage_records WHERE ts >= ?1 AND ts < ?2 GROUP BY account_id"
+             FROM usage_records WHERE ts >= ?1 AND ts < ?2 GROUP BY account_id",
         )?;
         let rows = stmt.query_map(params![from_ms, to_ms], |r| {
             let requests: i64 = r.get(2)?;
             let unknown: i64 = r.get(3)?;
             Ok(UsageSummary {
-                model: None, account_id: r.get(0)?, account_label: r.get(1)?, cache_key: None,
-                requests, measured_requests: requests - unknown, unknown_requests: unknown,
-                input_tokens: r.get(4)?, output_tokens: r.get(5)?,
+                model: None,
+                account_id: r.get(0)?,
+                account_label: r.get(1)?,
+                cache_key: None,
+                requests,
+                measured_requests: requests - unknown,
+                unknown_requests: unknown,
+                input_tokens: r.get(4)?,
+                output_tokens: r.get(5)?,
             })
         })?;
         rows.collect()
@@ -309,22 +328,67 @@ impl Store {
 
     pub fn usage_summary(&self, query: &UsageQuery) -> rusqlite::Result<Vec<UsageSummary>> {
         let (filter, mut values) = query.where_sql();
-        let requested: Vec<&str> = query.group_by.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()).collect();
-        let groups: Vec<&str> = ["model", "account_id", "cache_key"].into_iter().filter(|name| requested.contains(name)).collect();
-        let select_dim = |name: &str| if groups.contains(&name) { name.to_string() } else { format!("NULL AS {name}") };
-        let label = if groups.contains(&"account_id") { "MAX(account_label) AS account_label" } else { "NULL AS account_label" };
-        let group_sql = if groups.is_empty() { String::new() } else { format!(" GROUP BY {}", groups.join(",")) };
-        let pagination = if groups.is_empty() { String::new() } else {
-            values.push(Value::Integer(query.limit.unwrap_or(100).clamp(1, 1000) as i64));
-            values.push(Value::Integer(query.offset.unwrap_or(0).min(i64::MAX as usize) as i64));
+        let requested: Vec<&str> = query
+            .group_by
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let groups: Vec<&str> = ["model", "account_id", "cache_key"]
+            .into_iter()
+            .filter(|name| requested.contains(name))
+            .collect();
+        let select_dim = |name: &str| {
+            if groups.contains(&name) {
+                name.to_string()
+            } else {
+                format!("NULL AS {name}")
+            }
+        };
+        let label = if groups.contains(&"account_id") {
+            "MAX(account_label) AS account_label"
+        } else {
+            "NULL AS account_label"
+        };
+        let group_sql = if groups.is_empty() {
+            String::new()
+        } else {
+            format!(" GROUP BY {}", groups.join(","))
+        };
+        let pagination = if groups.is_empty() {
+            String::new()
+        } else {
+            values.push(Value::Integer(
+                query.limit.unwrap_or(100).clamp(1, 1000) as i64
+            ));
+            values.push(Value::Integer(
+                query.offset.unwrap_or(0).min(i64::MAX as usize) as i64,
+            ));
             " LIMIT ? OFFSET ?".to_string()
         };
-        let sql = format!("SELECT {},{},{},{},COUNT(*),COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens FROM usage_records WHERE {filter}{group_sql} ORDER BY input_tokens DESC,model,account_id,cache_key{pagination}", select_dim("model"), select_dim("account_id"), label, select_dim("cache_key"));
+        let sql = format!(
+            "SELECT {},{},{},{},COUNT(*),COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens FROM usage_records WHERE {filter}{group_sql} ORDER BY input_tokens DESC,model,account_id,cache_key{pagination}",
+            select_dim("model"),
+            select_dim("account_id"),
+            label,
+            select_dim("cache_key")
+        );
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| Ok(UsageSummary {
-            model: r.get(0)?, account_id: r.get(1)?, account_label: r.get(2)?, cache_key: r.get(3)?, requests: r.get(4)?, measured_requests: r.get(5)?, unknown_requests: r.get(6)?, input_tokens: r.get(7)?, output_tokens: r.get(8)?,
-        }))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            Ok(UsageSummary {
+                model: r.get(0)?,
+                account_id: r.get(1)?,
+                account_label: r.get(2)?,
+                cache_key: r.get(3)?,
+                requests: r.get(4)?,
+                measured_requests: r.get(5)?,
+                unknown_requests: r.get(6)?,
+                input_tokens: r.get(7)?,
+                output_tokens: r.get(8)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -334,13 +398,31 @@ impl Store {
         let offset = query.offset.unwrap_or(0).min(i64::MAX as usize) as i64;
         values.push(Value::Integer(limit));
         values.push(Value::Integer(offset));
-        let sql = format!("SELECT id,request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens,duration_ms,stream_outcome,error_code,saw_output FROM usage_records WHERE {filter} ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?");
+        let sql = format!(
+            "SELECT id,request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens,duration_ms,stream_outcome,error_code,saw_output FROM usage_records WHERE {filter} ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?"
+        );
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| Ok(UsageRecord {
-            id: r.get(0)?, request_id: r.get(1)?, ts: r.get(2)?, endpoint: r.get(3)?, backend: r.get(4)?, model: r.get(5)?, account_id: r.get(6)?, account_label: r.get(7)?, cache_key: r.get(8)?, status: r.get(9)?, input_tokens: r.get(10)?, output_tokens: r.get(11)?,
-            duration_ms: r.get(12)?, stream_outcome: r.get(13)?, error_code: r.get(14)?, saw_output: r.get(15)?,
-        }))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            Ok(UsageRecord {
+                id: r.get(0)?,
+                request_id: r.get(1)?,
+                ts: r.get(2)?,
+                endpoint: r.get(3)?,
+                backend: r.get(4)?,
+                model: r.get(5)?,
+                account_id: r.get(6)?,
+                account_label: r.get(7)?,
+                cache_key: r.get(8)?,
+                status: r.get(9)?,
+                input_tokens: r.get(10)?,
+                output_tokens: r.get(11)?,
+                duration_ms: r.get(12)?,
+                stream_outcome: r.get(13)?,
+                error_code: r.get(14)?,
+                saw_output: r.get(15)?,
+            })
+        })?;
         rows.collect()
     }
     /// @cc [owner:ghuntley,label:persistence] upstream-event-write-through
@@ -376,7 +458,13 @@ impl Store {
     }
 
     /// Per-bucket counts from `usage_records` with `ts` in `[from, to)`.
-    pub fn stats_counts(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<CountRow>> {
+    pub fn stats_counts(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+        dim: Dim,
+    ) -> rusqlite::Result<Vec<CountRow>> {
         let (key, label) = usage_dim_sql(dim);
         let sql = format!(
             "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), COUNT(DISTINCT request_id), COUNT(*), COUNT(DISTINCT cache_key), \
@@ -386,16 +474,31 @@ impl Store {
         );
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![from, to, bucket_ms], |r| Ok(CountRow {
-            bucket: r.get(0)?, key: r.get(1)?, label: r.get(2)?, requests: r.get(3)?, attempts: r.get(4)?,
-            sessions: r.get(5)?, input_tokens: r.get(6)?, output_tokens: r.get(7)?, unmeasured: r.get(8)?,
-        }))?;
+        let rows = stmt.query_map(params![from, to, bucket_ms], |r| {
+            Ok(CountRow {
+                bucket: r.get(0)?,
+                key: r.get(1)?,
+                label: r.get(2)?,
+                requests: r.get(3)?,
+                attempts: r.get(4)?,
+                sessions: r.get(5)?,
+                input_tokens: r.get(6)?,
+                output_tokens: r.get(7)?,
+                unmeasured: r.get(8)?,
+            })
+        })?;
         rows.collect()
     }
 
     /// Per-bucket attempt outcomes: the recorded stream outcome, `http_<status>` for non-2xx,
     /// `network_error` for no response, or `unknown` for 2xx rows recorded before outcomes existed.
-    pub fn stats_outcomes(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<TallyRow>> {
+    pub fn stats_outcomes(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+        dim: Dim,
+    ) -> rusqlite::Result<Vec<TallyRow>> {
         let (key, label) = usage_dim_sql(dim);
         let sql = format!(
             "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), \
@@ -406,11 +509,20 @@ impl Store {
     }
 
     /// Per-bucket upstream event counts by kind.
-    pub fn stats_events(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<TallyRow>> {
+    pub fn stats_events(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+        dim: Dim,
+    ) -> rusqlite::Result<Vec<TallyRow>> {
         let (key, label) = match dim {
             Dim::Total => ("'*'", "'*'"),
             Dim::Model => ("COALESCE(model,'(unknown)')", "COALESCE(model,'(unknown)')"),
-            Dim::Account => ("COALESCE(account_id,'(unknown)')", "COALESCE(account_label,account_id,'(unknown)')"),
+            Dim::Account => (
+                "COALESCE(account_id,'(unknown)')",
+                "COALESCE(account_label,account_id,'(unknown)')",
+            ),
         };
         let sql = format!(
             "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), kind, COUNT(*) \
@@ -419,12 +531,24 @@ impl Store {
         self.tally(&sql, from, to, bucket_ms)
     }
 
-    fn tally(&self, sql: &str, from: i64, to: i64, bucket_ms: i64) -> rusqlite::Result<Vec<TallyRow>> {
+    fn tally(
+        &self,
+        sql: &str,
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+    ) -> rusqlite::Result<Vec<TallyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![from, to, bucket_ms], |r| Ok(TallyRow {
-            bucket: r.get(0)?, key: r.get(1)?, label: r.get(2)?, name: r.get(3)?, count: r.get(4)?,
-        }))?;
+        let rows = stmt.query_map(params![from, to, bucket_ms], |r| {
+            Ok(TallyRow {
+                bucket: r.get(0)?,
+                key: r.get(1)?,
+                label: r.get(2)?,
+                name: r.get(3)?,
+                count: r.get(4)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -438,25 +562,42 @@ impl Store {
         );
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![from - stats::MAX_ATTEMPT_MS, to, from], |r| Ok(Interval {
-            key: r.get(0)?, start: r.get(1)?, end: r.get(2)?,
-        }))?;
+        let rows = stmt.query_map(params![from - stats::MAX_ATTEMPT_MS, to, from], |r| {
+            Ok(Interval {
+                key: r.get(0)?,
+                start: r.get(1)?,
+                end: r.get(2)?,
+            })
+        })?;
         rows.collect()
     }
 
     /// @cc [owner:ghuntley,label:accounting] stats-series-raw
     /// `stats_series` MUST aggregate exactly the usage rows and upstream events with `ts` in
     /// `[from, to)` into `bucket_ms` buckets per `dim` key, with concurrency from attempt lifetimes.
-    pub fn stats_series(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Vec<Series>> {
+    pub fn stats_series(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+        dim: Dim,
+    ) -> rusqlite::Result<Vec<Series>> {
         let counts = self.stats_counts(from, to, bucket_ms, dim)?;
         let outcomes = self.stats_outcomes(from, to, bucket_ms, dim)?;
         let events = self.stats_events(from, to, bucket_ms, dim)?;
         let intervals = self.stats_intervals(from, to, dim)?;
-        Ok(stats::assemble(from, to, bucket_ms, &counts, &outcomes, &events, &intervals))
+        Ok(stats::assemble(
+            from, to, bucket_ms, &counts, &outcomes, &events, &intervals,
+        ))
     }
 
     /// Exact distinct request and session counts per `dim` key over `[from, to)`.
-    pub fn stats_distinct(&self, from: i64, to: i64, dim: Dim) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+    pub fn stats_distinct(
+        &self,
+        from: i64,
+        to: i64,
+        dim: Dim,
+    ) -> rusqlite::Result<Vec<(String, i64, i64)>> {
         let (key, _) = usage_dim_sql(dim);
         let sql = format!(
             "SELECT {key} AS k, COUNT(DISTINCT request_id), COUNT(DISTINCT cache_key) FROM usage_records \
@@ -469,20 +610,34 @@ impl Store {
     }
 
     /// Stored finished-day rollups for days in `[from_day, to_day)`: `(day, key, label, totals)`.
-    pub fn stats_daily(&self, from_day: i64, to_day: i64, dim: Dim) -> rusqlite::Result<Vec<(i64, String, String, Totals)>> {
+    pub fn stats_daily(
+        &self,
+        from_day: i64,
+        to_day: i64,
+        dim: Dim,
+    ) -> rusqlite::Result<Vec<(i64, String, String, Totals)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT day, key, label, totals FROM stats_daily WHERE day >= ?1 AND day < ?2 AND dim = ?3 ORDER BY day, key",
         )?;
         let rows = stmt.query_map(params![from_day, to_day, dim.as_str()], |r| {
             let totals: String = r.get(3)?;
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, serde_json::from_str(&totals).unwrap_or_default()))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                serde_json::from_str(&totals).unwrap_or_default(),
+            ))
         })?;
         rows.collect()
     }
 
     /// Days in `[from_day, to_day)` that already have a stored rollup.
-    pub fn stats_rolled_days(&self, from_day: i64, to_day: i64) -> rusqlite::Result<std::collections::BTreeSet<i64>> {
+    pub fn stats_rolled_days(
+        &self,
+        from_day: i64,
+        to_day: i64,
+    ) -> rusqlite::Result<std::collections::BTreeSet<i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT day FROM stats_daily WHERE day >= ?1 AND day < ?2 AND dim = 'total'",
@@ -501,12 +656,22 @@ impl Store {
         let mut rows: Vec<(Dim, String, String, Totals)> = Vec::new();
         for dim in Dim::all() {
             for series in self.stats_series(from, to, stats::DAY_MS, dim)? {
-                let totals = series.buckets.into_iter().next().map(|b| b.totals).unwrap_or_default();
+                let totals = series
+                    .buckets
+                    .into_iter()
+                    .next()
+                    .map(|b| b.totals)
+                    .unwrap_or_default();
                 rows.push((dim, series.key, series.label, totals));
             }
         }
         if !rows.iter().any(|(dim, ..)| *dim == Dim::Total) {
-            rows.push((Dim::Total, stats::TOTAL_KEY.into(), stats::TOTAL_KEY.into(), Totals::default()));
+            rows.push((
+                Dim::Total,
+                stats::TOTAL_KEY.into(),
+                stats::TOTAL_KEY.into(),
+                Totals::default(),
+            ));
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -561,7 +726,9 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch(schema())?;
         migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     #[allow(dead_code)]
@@ -569,7 +736,9 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(schema())?;
         migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn list_accounts(&self) -> Vec<Account> {
@@ -578,7 +747,7 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at
+                        token_refreshed_at, plan
                  FROM accounts ORDER BY created_at",
             )
             .expect("prepare accounts");
@@ -597,6 +766,7 @@ impl Store {
                     account_id: row.get(6)?,
                     residency: row.get(7)?,
                     enterprise_url: row.get(8)?,
+                    plan: row.get(14)?,
                     status: parse_status(&status),
                     reset_at: row.get(10)?,
                     created_at: row.get(11)?,
@@ -613,7 +783,7 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at
+                        token_refreshed_at, plan
                  FROM accounts WHERE id = ?1",
             )
             .expect("prepare account");
@@ -631,6 +801,7 @@ impl Store {
                 account_id: row.get(6)?,
                 residency: row.get(7)?,
                 enterprise_url: row.get(8)?,
+                plan: row.get(14)?,
                 status: parse_status(&status),
                 reset_at: row.get(10)?,
                 created_at: row.get(11)?,
@@ -645,13 +816,13 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO accounts (id, backend, label, refresh_token, access_token, expires_at, account_id,
-                                   residency, enterprise_url, status, reset_at, created_at, updated_at,
+                                   residency, enterprise_url, plan, status, reset_at, created_at, updated_at,
                                    token_refreshed_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
                 label=?3, refresh_token=?4, access_token=?5, expires_at=?6, account_id=?7,
-                residency=?8, enterprise_url=?9, status=?10, reset_at=?11, updated_at=?13,
-                token_refreshed_at=?14",
+                residency=?8, enterprise_url=?9, plan=?10, status=?11, reset_at=?12, updated_at=?14,
+                token_refreshed_at=?15",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -662,6 +833,7 @@ impl Store {
                 a.account_id,
                 a.residency,
                 a.enterprise_url,
+                a.plan,
                 status_str(a.status),
                 a.reset_at,
                 a.created_at,
@@ -678,8 +850,11 @@ impl Store {
             .expect("delete account");
         conn.execute("DELETE FROM bindings WHERE account_id = ?1", params![id])
             .expect("delete bindings of account");
-        conn.execute("DELETE FROM reset_attempts WHERE account_id = ?1", params![id])
-            .expect("delete reset attempt of account");
+        conn.execute(
+            "DELETE FROM reset_attempts WHERE account_id = ?1",
+            params![id],
+        )
+        .expect("delete reset attempt of account");
     }
 
     /// @cc [owner:ghuntley,label:persistence] reset-attempt-idempotency
@@ -708,8 +883,11 @@ impl Store {
 
     pub fn clear_reset_attempt(&self, account_id: &str) {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM reset_attempts WHERE account_id = ?1", params![account_id])
-            .expect("clear reset attempt");
+        conn.execute(
+            "DELETE FROM reset_attempts WHERE account_id = ?1",
+            params![account_id],
+        )
+        .expect("clear reset attempt");
     }
 
     pub fn finish_reset_attempt(&self, account_id: &str) {
@@ -754,7 +932,15 @@ impl Store {
                     token_refreshed_at = ?7,
                     updated_at = ?7
              WHERE id = ?1",
-            params![id, refresh_token, access_token, expires_at, chatgpt_account_id, residency, now],
+            params![
+                id,
+                refresh_token,
+                access_token,
+                expires_at,
+                chatgpt_account_id,
+                residency,
+                now
+            ],
         )
         .expect("update tokens");
     }
@@ -835,8 +1021,11 @@ impl Store {
     pub fn set_catalog(&self, backend: BackendId, models: &[ModelInfo]) {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().expect("catalog tx");
-        tx.execute("DELETE FROM catalog WHERE backend = ?1", params![backend.as_str()])
-            .expect("clear catalog");
+        tx.execute(
+            "DELETE FROM catalog WHERE backend = ?1",
+            params![backend.as_str()],
+        )
+        .expect("clear catalog");
         for m in models {
             tx.execute(
                 "INSERT INTO catalog (backend, model_id, name, context, input, output) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -849,9 +1038,13 @@ impl Store {
 
     pub fn config_get(&self, key: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT value FROM config WHERE key = ?1", params![key], |r| r.get(0))
-            .optional()
-            .expect("config get")
+        conn.query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .expect("config get")
     }
 
     pub fn config_set(&self, key: &str, value: &str) {
@@ -882,7 +1075,8 @@ mod tests {
     /// rows, and default the new column to 0 so the account reads back rather than erroring.
     #[test]
     fn opening_a_legacy_store_adds_the_rotation_column_without_losing_rows() {
-        let path = std::env::temp_dir().join(format!("underclass-legacy-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("underclass-legacy-{}.db", uuid::Uuid::new_v4()));
         {
             // Recreate the pre-migration accounts table exactly as it shipped.
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -911,11 +1105,16 @@ mod tests {
         }
 
         let store = Store::open(&path).unwrap();
-        let account = store.get_account("legacy").expect("legacy row must survive migration");
+        let account = store
+            .get_account("legacy")
+            .expect("legacy row must survive migration");
         assert_eq!(account.label, "owner@example.test");
         assert_eq!(account.expires_at, 999);
         assert_eq!(account.reset_at, 4242);
-        assert_eq!(account.token_refreshed_at, 0, "new column must default to never-rotated");
+        assert_eq!(
+            account.token_refreshed_at, 0,
+            "new column must default to never-rotated"
+        );
 
         // Re-opening must be a no-op rather than a duplicate-column error.
         drop(store);
@@ -933,39 +1132,99 @@ mod tests {
             (119_999, "a", None, None),
             (120_000, "b", Some(3), Some(1)),
         ] {
-            store.insert_usage(&UsageRecord {
-                id: 0, request_id: format!("request-{ts}"), ts, endpoint: "/v1/responses".into(),
-                backend: "codex".into(), model: "model".into(), account_id: account.into(),
-                account_label: account.into(), cache_key: Some("secret-session".into()),
-                status: 200, input_tokens: input, output_tokens: output, ..Default::default()
-            }).unwrap();
+            store
+                .insert_usage(&UsageRecord {
+                    id: 0,
+                    request_id: format!("request-{ts}"),
+                    ts,
+                    endpoint: "/v1/responses".into(),
+                    backend: "codex".into(),
+                    model: "model".into(),
+                    account_id: account.into(),
+                    account_label: account.into(),
+                    cache_key: Some("secret-session".into()),
+                    status: 200,
+                    input_tokens: input,
+                    output_tokens: output,
+                    ..Default::default()
+                })
+                .unwrap();
         }
         let bins = store.monitor_minute_bins(120_000).unwrap();
         assert_eq!(bins.len(), 60);
         assert_eq!(&bins[57..], &[1, 2, 1]);
         let totals = store.monitor_account_totals(60_000, 120_000).unwrap();
         assert_eq!(totals.len(), 1);
-        assert_eq!((totals[0].requests, totals[0].unknown_requests, totals[0].input_tokens, totals[0].output_tokens), (2, 1, 10, 4));
+        assert_eq!(
+            (
+                totals[0].requests,
+                totals[0].unknown_requests,
+                totals[0].input_tokens,
+                totals[0].output_tokens
+            ),
+            (2, 1, 10, 4)
+        );
     }
 
     #[test]
     fn usage_survives_reopen_and_splits_unknown_from_measured() {
-        let path = std::env::temp_dir().join(format!("underclass-usage-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("underclass-usage-{}.db", uuid::Uuid::new_v4()));
         {
             let store = Store::open(&path).unwrap();
-            for (key, input) in [(Some("session-a"), Some(12)), (Some("session-a"), None), (Some("session-b"), Some(5))] {
-                store.insert_usage(&UsageRecord {
-                    id: 0, request_id: uuid::Uuid::new_v4().to_string(), ts: 100, endpoint: "/v1/responses".into(), backend: "codex".into(), model: "model-a".into(), account_id: "account-a".into(), account_label: "alice".into(), cache_key: key.map(str::to_string), status: 200, input_tokens: input, output_tokens: input.map(|n| n / 2), ..Default::default()
-                }).unwrap();
+            for (key, input) in [
+                (Some("session-a"), Some(12)),
+                (Some("session-a"), None),
+                (Some("session-b"), Some(5)),
+            ] {
+                store
+                    .insert_usage(&UsageRecord {
+                        id: 0,
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        ts: 100,
+                        endpoint: "/v1/responses".into(),
+                        backend: "codex".into(),
+                        model: "model-a".into(),
+                        account_id: "account-a".into(),
+                        account_label: "alice".into(),
+                        cache_key: key.map(str::to_string),
+                        status: 200,
+                        input_tokens: input,
+                        output_tokens: input.map(|n| n / 2),
+                        ..Default::default()
+                    })
+                    .unwrap();
             }
         }
         let store = Store::open(&path).unwrap();
-        let query = UsageQuery { from_ms: Some(0), group_by: Some("model,account_id,cache_key".into()), cache_key: Some("session-a".into()), ..Default::default() };
+        let query = UsageQuery {
+            from_ms: Some(0),
+            group_by: Some("model,account_id,cache_key".into()),
+            cache_key: Some("session-a".into()),
+            ..Default::default()
+        };
         let group = &store.usage_summary(&query).unwrap()[0];
-        assert_eq!((group.requests, group.measured_requests, group.unknown_requests, group.input_tokens, group.output_tokens), (2, 1, 1, 12, 6));
+        assert_eq!(
+            (
+                group.requests,
+                group.measured_requests,
+                group.unknown_requests,
+                group.input_tokens,
+                group.output_tokens
+            ),
+            (2, 1, 1, 12, 6)
+        );
         assert_eq!(group.account_label.as_deref(), Some("alice"));
         assert_eq!(store.usage_records(&query).unwrap().len(), 2);
-        let page = store.usage_summary(&UsageQuery { from_ms: Some(0), group_by: Some("cache_key".into()), limit: Some(1), offset: Some(1), ..Default::default() }).unwrap();
+        let page = store
+            .usage_summary(&UsageQuery {
+                from_ms: Some(0),
+                group_by: Some("cache_key".into()),
+                limit: Some(1),
+                offset: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(page.len(), 1);
         drop(store);
         std::fs::remove_file(path).unwrap();
@@ -984,7 +1243,11 @@ mod tests {
     #[test]
     fn pruning_removes_expired_rows_and_caps_newest_rows() {
         let store = Store::in_memory().unwrap();
-        for row in [binding("expired", 1), binding("old", 100), binding("new", 200)] {
+        for row in [
+            binding("expired", 1),
+            binding("old", 100),
+            binding("new", 200),
+        ] {
             store.upsert_binding(&row);
         }
 

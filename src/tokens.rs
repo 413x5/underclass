@@ -1,5 +1,5 @@
 use crate::jwt;
-use crate::models::{now_ms, Account};
+use crate::models::{Account, now_ms};
 use crate::store::Store;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -62,7 +62,9 @@ impl TokenManager {
     /// @cc [owner:ghuntley,label:auth] proactive-refresh-margin
     /// `access_token` MUST return the cached Codex access token while it remains valid beyond
     /// `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh otherwise. For Copilot
-    /// it MUST return the stored GitHub token directly (it never expires or refreshes).
+    /// it MUST return the stored GitHub token directly (it never expires or refreshes). For Claude
+    /// it MUST return the stored OAuth token while it remains valid beyond the same margin, and
+    /// MUST refresh it otherwise.
     pub async fn access_token(&self, account: &Account) -> Result<String, TokenError> {
         match account.backend {
             crate::models::BackendId::Copilot => account
@@ -71,7 +73,23 @@ impl TokenManager {
                 .ok_or(TokenError::MissingToken),
             crate::models::BackendId::Codex => {
                 if let Some(token) = &account.access_token {
-                    if account.expires_at.saturating_sub(PROACTIVE_REFRESH_MARGIN_MS) > now_ms() {
+                    if account
+                        .expires_at
+                        .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
+                        > now_ms()
+                    {
+                        return Ok(token.clone());
+                    }
+                }
+                self.force_refresh(&account.id).await
+            }
+            crate::models::BackendId::Claude => {
+                if let Some(token) = &account.access_token {
+                    if account
+                        .expires_at
+                        .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
+                        > now_ms()
+                    {
                         return Ok(token.clone());
                     }
                 }
@@ -95,7 +113,10 @@ impl TokenManager {
             .get_account(account_id)
             .ok_or(TokenError::MissingToken)?;
 
-        let refresh_token = account.refresh_token.clone().ok_or(TokenError::MissingToken)?;
+        let refresh_token = account
+            .refresh_token
+            .clone()
+            .ok_or(TokenError::MissingToken)?;
 
         match account.backend {
             crate::models::BackendId::Copilot => Ok(refresh_token),
@@ -120,6 +141,26 @@ impl TokenManager {
                 );
                 Ok(tokens.access_token)
             }
+            crate::models::BackendId::Claude => {
+                let tokens = crate::claude::refresh(&self.client, &refresh_token)
+                    .await
+                    .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
+                let expires_at = now_ms() + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
+                // The Anthropic refresh grant rotates the refresh token: persist the new one
+                // immediately or the account is left holding an invalidated credential.
+                self.store.update_tokens(
+                    account_id,
+                    tokens
+                        .refresh_token
+                        .as_deref()
+                        .or(Some(refresh_token.as_str())),
+                    Some(&tokens.access_token),
+                    expires_at,
+                    None,
+                    None,
+                );
+                Ok(tokens.access_token)
+            }
         }
     }
 }
@@ -141,6 +182,7 @@ mod tests {
             account_id: None,
             residency: None,
             enterprise_url: None,
+            plan: None,
             status: AccountStatus::Healthy,
             reset_at: 0,
             created_at: 0,
@@ -170,13 +212,19 @@ mod tests {
 
     #[test]
     fn copilot_and_credential_less_accounts_are_never_due() {
-        assert!(!rotation_due(&account(BackendId::Copilot, Some("gh-token"), 0), i64::MAX));
+        assert!(!rotation_due(
+            &account(BackendId::Copilot, Some("gh-token"), 0),
+            i64::MAX
+        ));
         assert!(!rotation_due(&account(BackendId::Codex, None, 0), i64::MAX));
     }
 
     #[test]
     fn a_clock_behind_the_last_rotation_is_not_due() {
         let due = account(BackendId::Codex, Some("refresh"), 10 * DAY);
-        assert!(!rotation_due(&due, 0), "saturating_sub must not wrap into a false due");
+        assert!(
+            !rotation_due(&due, 0),
+            "saturating_sub must not wrap into a false due"
+        );
     }
 }

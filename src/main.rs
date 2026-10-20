@@ -1,11 +1,14 @@
 use underclass::provider::BackendMap;
-use underclass::{cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api, store, tokens, top, ui};
+use underclass::{
+    claude, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api,
+    store, tokens, top, ui,
+};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// How often the scheduled rotation loop re-evaluates which refresh tokens are due. The rotation
 /// window itself is `tokens::ROTATION_INTERVAL_MS`; this only bounds how late a due token can be,
@@ -13,9 +16,15 @@ use std::path::Path;
 const ROTATION_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 /// How often stats retention pruning and finished-day rollups run.
 const STATS_TICK: std::time::Duration = std::time::Duration::from_secs(900);
+/// How often the Claude Code accounts' own usage is polled: plan, quota windows, and banked
+/// reset credits.
+const CLAUDE_USAGE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Parser)]
-#[command(name = "underclass", about = "pooled multi-subscription codex/copilot proxy for opencode")]
+#[command(
+    name = "underclass",
+    about = "pooled multi-subscription codex/copilot proxy for opencode"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -137,10 +146,12 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     };
 
     seed_catalog(&store, models::BackendId::Codex, codex::default_catalog());
-    seed_catalog(&store, models::BackendId::Copilot, copilot::fallback_catalog());
-
-    let core = pool::PoolCore::new(&store);
-    let pool = Arc::new(Mutex::new(core));
+    seed_catalog(
+        &store,
+        models::BackendId::Copilot,
+        copilot::fallback_catalog(),
+    );
+    seed_catalog(&store, models::BackendId::Claude, claude::default_catalog());
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -161,7 +172,21 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             cooldown_ms: cfg.copilot_cooldown_ms,
         }),
     );
+    backends.insert(
+        models::BackendId::Claude,
+        Arc::new(claude::ClaudeBackend {
+            cooldown_ms: cfg.claude_cooldown_ms,
+        }),
+    );
+    // The pool learns which surfaces each backend serves from the backends themselves.
+    let surfaces: HashMap<models::BackendId, Vec<models::Surface>> = backends
+        .iter()
+        .map(|(id, backend)| (*id, backend.surfaces().to_vec()))
+        .collect();
     let backends = Arc::new(backends);
+
+    let core = pool::PoolCore::new(&store, surfaces);
+    let pool = Arc::new(Mutex::new(core));
 
     let state = Arc::new(proxy::AppState {
         store: store.clone(),
@@ -180,6 +205,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             cfg.auto_codex_resets,
         )),
         stream_usage_unsupported: Mutex::new(Default::default()),
+        observations: Mutex::new(Default::default()),
         stats_retention_days: cfg.stats_retention_days,
     });
 
@@ -224,7 +250,17 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     }
 
     refresh_copilot_catalogs_on_boot(&state).await;
+    refresh_claude_catalogs_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                poll_claude_usage(&state).await;
+                tokio::time::sleep(CLAUDE_USAGE_POLL).await;
+            }
+        });
+    }
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -239,7 +275,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         tokio::spawn(async move {
             loop {
                 for account in state.store.list_accounts() {
-                    state.resets.poll_account(&account, &state.tokens, &state.pool, &state.store).await;
+                    state
+                        .resets
+                        .poll_account(&account, &state.tokens, &state.pool, &state.store)
+                        .await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             }
@@ -251,6 +290,11 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route("/models", axum::routing::get(proxy::models))
         .route("/responses", axum::routing::post(proxy::infer))
         .route("/chat/completions", axum::routing::post(proxy::infer))
+        .route("/messages", axum::routing::post(proxy::messages))
+        .route(
+            "/messages/count_tokens",
+            axum::routing::post(proxy::messages),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             proxy::require_proxy_key,
@@ -263,15 +307,42 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route("/monitor", axum::routing::get(monitor::snapshot))
         .with_state(state.clone());
 
+    // Some clients post to `<base>/messages` rather than `<base>/v1/messages`; the alias serves
+    // the same Anthropic surface at the root.
+    let anthropic_alias = axum::Router::new()
+        .route("/messages", axum::routing::post(proxy::messages))
+        .route(
+            "/messages/count_tokens",
+            axum::routing::post(proxy::messages),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            proxy::require_proxy_key,
+        ))
+        .with_state(state.clone());
+
     let app = axum::Router::new()
         .route("/admin/api/state", axum::routing::get(ui::state))
         .route("/admin/api/usage", axum::routing::get(ui::usage_summary))
-        .route("/admin/api/usage/requests", axum::routing::get(ui::usage_requests))
+        .route(
+            "/admin/api/usage/requests",
+            axum::routing::get(ui::usage_requests),
+        )
         .route("/admin/api/monitor", axum::routing::get(monitor::snapshot))
-        .route("/admin/api/stats", axum::routing::get(stats_api::stats_handler))
-        .route("/admin/api/events/import", axum::routing::post(stats_api::import_handler))
+        .route(
+            "/admin/api/stats",
+            axum::routing::get(stats_api::stats_handler),
+        )
+        .route(
+            "/admin/api/events/import",
+            axum::routing::post(stats_api::import_handler),
+        )
         .route("/admin/api/flows", axum::routing::post(ui::start_flow))
         .route("/admin/api/flows/{id}", axum::routing::get(ui::flow_status))
+        .route(
+            "/admin/api/flows/{id}/code",
+            axum::routing::post(ui::submit_flow_code),
+        )
         .route(
             "/admin/api/accounts/{id}",
             axum::routing::delete(ui::delete_account),
@@ -306,15 +377,21 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             ui::require_ui_token,
         ))
         .route("/", axum::routing::get(ui::index))
+        .merge(anthropic_alias)
         .nest("/v1", v1)
-        .layer(axum::middleware::from_fn(underclass::correlation::middleware))
+        .layer(axum::middleware::from_fn(
+            underclass::correlation::middleware,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     let monitor_socket = bind_monitor_socket(&cfg.monitor_socket_path())?;
     println!("underclass listening on http://{bind_addr}");
     println!("web ui: http://{bind_addr}/");
-    tokio::try_join!(axum::serve(listener, app), axum::serve(monitor_socket, local_app))?;
+    tokio::try_join!(
+        axum::serve(listener, app),
+        axum::serve(monitor_socket, local_app)
+    )?;
     Ok(())
 }
 
@@ -334,7 +411,9 @@ fn bind_monitor_socket(path: &Path) -> std::io::Result<tokio::net::UnixListener>
                 return Err(error);
             }
             match std::os::unix::net::UnixStream::connect(path) {
-                Err(connect_error) if connect_error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                Err(connect_error)
+                    if connect_error.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
                     std::fs::remove_file(path)?;
                     tokio::net::UnixListener::bind(path)?
                 }
@@ -354,16 +433,17 @@ mod monitor_socket_tests {
     #[tokio::test]
     async fn keeps_live_socket_and_recovers_stale_socket() {
         // macOS expands std::env::temp_dir() to a long per-user path that can exceed SUN_LEN.
-        let dir = std::path::PathBuf::from("/tmp").join(format!(
-            "ucm-{}",
-            &uuid::Uuid::new_v4().to_string()[..8]
-        ));
+        let dir = std::path::PathBuf::from("/tmp")
+            .join(format!("ucm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
         let path = dir.join("monitor.sock");
         let first = bind_monitor_socket(&path).unwrap();
         assert!(bind_monitor_socket(&path).is_err());
         drop(first);
         let second = bind_monitor_socket(&path).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
         drop(second);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -372,7 +452,11 @@ mod monitor_socket_tests {
     use std::os::unix::fs::PermissionsExt;
 }
 
-fn seed_catalog(store: &store::Store, backend: models::BackendId, defaults: Vec<models::ModelInfo>) {
+fn seed_catalog(
+    store: &store::Store,
+    backend: models::BackendId,
+    defaults: Vec<models::ModelInfo>,
+) {
     if store.catalog(backend).is_empty() {
         store.set_catalog(backend, &defaults);
     }
@@ -391,16 +475,118 @@ async fn refresh_copilot_catalogs_on_boot(state: &Arc<proxy::AppState>) {
         };
         if let Ok(catalog) = copilot::fetch_catalog(&state.client, &account, &token).await {
             if !catalog.is_empty() {
-                state.store.set_catalog(models::BackendId::Copilot, &catalog);
+                state
+                    .store
+                    .set_catalog(models::BackendId::Copilot, &catalog);
                 let ids: Vec<String> = catalog.iter().map(|m| m.id.clone()).collect();
-                state.pool.lock().unwrap().set_catalog(models::BackendId::Copilot, ids);
+                state
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .set_catalog(models::BackendId::Copilot, ids);
             }
         }
     }
 }
 
+/// Refreshes the Claude model catalog from Anthropic's Models API.
+async fn refresh_claude_catalogs_on_boot(state: &Arc<proxy::AppState>) {
+    let accounts: Vec<models::Account> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|a| a.backend == models::BackendId::Claude)
+        .collect();
+    for account in accounts {
+        let Ok(token) = state.tokens.access_token(&account).await else {
+            continue;
+        };
+        if let Ok(catalog) = claude::fetch_catalog(&state.client, &account, &token).await
+            && !catalog.is_empty()
+        {
+            state.store.set_catalog(models::BackendId::Claude, &catalog);
+            let ids: Vec<String> = catalog.iter().map(|m| m.id.clone()).collect();
+            state
+                .pool
+                .lock()
+                .unwrap()
+                .set_catalog(models::BackendId::Claude, ids);
+        }
+    }
+}
+
+/// Polls each Claude account's own usage API for its plan, quota windows, and banked reset
+/// credits, and cools an account whose window is spent.
+///
+/// The account usage API is a first-party endpoint, so this never sends anything that looks like
+/// a Claude Code request.
+async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
+    let accounts: Vec<models::Account> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|a| a.backend == models::BackendId::Claude)
+        .filter(|a| a.status != models::AccountStatus::Disabled)
+        .collect();
+    for account in accounts {
+        let Ok(token) = state.tokens.access_token(&account).await else {
+            continue;
+        };
+        let Ok(snapshot) = claude::fetch_usage(&state.client, &account, &token).await else {
+            continue;
+        };
+        state
+            .observations
+            .lock()
+            .unwrap()
+            .insert(account.id.clone(), claude::usage_view(&snapshot));
+        if let Some(plan) = snapshot.plan.clone()
+            && account.plan.as_deref() != Some(plan.as_str())
+        {
+            let mut updated = account.clone();
+            updated.plan = Some(plan);
+            updated.updated_at = models::now_ms();
+            state.store.upsert_account(&updated);
+            state.pool.lock().unwrap().sync_account(updated);
+        }
+        let Some(until) = snapshot.exhausted_reset_ms() else {
+            continue;
+        };
+        let now = models::now_ms();
+        if until <= now {
+            continue;
+        }
+        let current = {
+            state
+                .pool
+                .lock()
+                .unwrap()
+                .account(&account.id)
+                .map(|a| a.reset_at)
+                .unwrap_or(0)
+        };
+        if until <= current {
+            continue;
+        }
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .set_status(&account.id, models::AccountStatus::Cooling, until);
+        state
+            .store
+            .update_account_status(&account.id, models::AccountStatus::Cooling, until);
+        logging::log_account_state(
+            &account.id,
+            Some(&account.label),
+            "cooling",
+            &format!("subscription window exhausted until {until}"),
+        );
+    }
+}
+
 fn is_generic_label(label: &str) -> bool {
-    matches!(label, "chatgpt" | "github") || label.trim().is_empty()
+    matches!(label, "chatgpt" | "github" | "claude") || label.trim().is_empty()
 }
 
 /// @cc [owner:ghuntley,label:auth] scheduled-rotation-never-bricks-account
@@ -416,7 +602,9 @@ async fn rotate_due_tokens(state: &Arc<proxy::AppState>) {
             continue;
         }
         match state.tokens.force_refresh(&account.id).await {
-            Ok(_) => logging::log_token_rotation(&account.id, &account.label, "rotated", "scheduled"),
+            Ok(_) => {
+                logging::log_token_rotation(&account.id, &account.label, "rotated", "scheduled")
+            }
             Err(e) => logging::log_token_rotation(
                 &account.id,
                 &account.label,
@@ -435,6 +623,7 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
         .filter(|a| is_generic_label(&a.label))
         .collect();
     for account in accounts {
+        let mut plan = None;
         let identity = match account.backend {
             models::BackendId::Codex => {
                 let token = match state.tokens.access_token(&account).await {
@@ -449,12 +638,29 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
                 };
                 copilot::fetch_github_identity(&state.client, &token).await
             }
+            models::BackendId::Claude => {
+                let token = match state.tokens.access_token(&account).await {
+                    Ok(token) => token,
+                    Err(_) => continue,
+                };
+                match claude::fetch_profile(&state.client, &token).await {
+                    Ok(profile) => {
+                        let identity = claude::identity_from_profile(&profile);
+                        plan = identity.plan.clone();
+                        Some(identity.label)
+                    }
+                    Err(_) => None,
+                }
+            }
         };
         let Some(identity) = identity else {
             continue;
         };
         let mut updated = account.clone();
         updated.label = identity;
+        if let Some(plan) = plan {
+            updated.plan = Some(plan);
+        }
         updated.updated_at = models::now_ms();
         state.store.upsert_account(&updated);
         state.pool.lock().unwrap().sync_account(updated);

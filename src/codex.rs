@@ -1,18 +1,22 @@
 use crate::flows::{FlowRegistry, FlowState};
 use crate::jwt;
-use crate::models::{now_ms, Account, Outcome};
+use crate::models::{Account, Outcome, now_ms};
 use crate::provider::Backend;
 use crate::store::Store;
 use http::HeaderMap;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-pub const USER_AGENT: &str = concat!("opencode/", env!("CARGO_PKG_VERSION"), " (underclass-pool-proxy)");
+pub const USER_AGENT: &str = concat!(
+    "opencode/",
+    env!("CARGO_PKG_VERSION"),
+    " (underclass-pool-proxy)"
+);
 
 pub fn codex_endpoint() -> String {
     std::env::var("UNDERCLASS_CODEX_UPSTREAM").unwrap_or_else(|_| CODEX_ENDPOINT.to_string())
@@ -63,7 +67,10 @@ async fn init_device_code(client: &Client) -> Result<DeviceCodeInit, AuthError> 
     Ok(resp.json().await?)
 }
 
-async fn poll_device_token(client: &Client, init: &DeviceCodeInit) -> Result<DeviceCodeToken, AuthError> {
+async fn poll_device_token(
+    client: &Client,
+    init: &DeviceCodeInit,
+) -> Result<DeviceCodeToken, AuthError> {
     let resp = client
         .post(format!("{ISSUER}/api/accounts/deviceauth/token"))
         .header("User-Agent", USER_AGENT)
@@ -83,7 +90,11 @@ async fn poll_device_token(client: &Client, init: &DeviceCodeInit) -> Result<Dev
     Ok(resp.json().await?)
 }
 
-async fn exchange_code(client: &Client, code: &str, verifier: &str) -> Result<TokenResponse, AuthError> {
+async fn exchange_code(
+    client: &Client,
+    code: &str,
+    verifier: &str,
+) -> Result<TokenResponse, AuthError> {
     let resp = client
         .post(format!("{ISSUER}/oauth/token"))
         .form(&[
@@ -161,73 +172,103 @@ pub async fn start_flow(
             match poll_device_token(&client, &init).await {
                 Err(AuthError::Failed(_)) => continue,
                 Err(_) => {
-                    flows.set_state(&flow_id, FlowState::Failed {
-                        message: "device authorization failed".into(),
-                    });
+                    flows.set_state(
+                        &flow_id,
+                        FlowState::Failed {
+                            message: "device authorization failed".into(),
+                        },
+                    );
                     return;
                 }
-                Ok(code) => match exchange_code(&client, &code.authorization_code, &code.code_verifier).await {
-                    Ok(tokens) => {
-                        let claims = jwt::parse_jwt_claims(&tokens.access_token);
-                        let account_id_claim =
-                            claims.as_ref().and_then(|c| jwt::extract_account_id(c));
-                        let residency = claims.as_ref().and_then(|c| jwt::extract_residency(c))
-                            .or_else(|| {
-                                tokens.id_token.as_deref()
-                                    .and_then(jwt::parse_jwt_claims)
-                                    .as_ref()
-                                    .and_then(|c| jwt::extract_residency(c))
-                            });
-                        let identity = identity_from_token(&tokens.access_token).or_else(|| {
-                            tokens.id_token.as_deref().and_then(identity_from_token)
-                        });
-                        let ts = now_ms();
-                        match flows.get(&flow_id).and_then(|f| f.replace_account) {
-                            Some(existing_id) => {
-                                if let Some(mut account) = store.get_account(&existing_id) {
+                Ok(code) => {
+                    match exchange_code(&client, &code.authorization_code, &code.code_verifier)
+                        .await
+                    {
+                        Ok(tokens) => {
+                            let claims = jwt::parse_jwt_claims(&tokens.access_token);
+                            let account_id_claim =
+                                claims.as_ref().and_then(|c| jwt::extract_account_id(c));
+                            let residency = claims
+                                .as_ref()
+                                .and_then(|c| jwt::extract_residency(c))
+                                .or_else(|| {
+                                    tokens
+                                        .id_token
+                                        .as_deref()
+                                        .and_then(jwt::parse_jwt_claims)
+                                        .as_ref()
+                                        .and_then(|c| jwt::extract_residency(c))
+                                });
+                            let identity =
+                                identity_from_token(&tokens.access_token).or_else(|| {
+                                    tokens.id_token.as_deref().and_then(identity_from_token)
+                                });
+                            let ts = now_ms();
+                            match flows.get(&flow_id).and_then(|f| f.replace_account) {
+                                Some(existing_id) => {
+                                    if let Some(mut account) = store.get_account(&existing_id) {
+                                        account.refresh_token = Some(tokens.refresh_token);
+                                        account.access_token = Some(tokens.access_token.clone());
+                                        account.expires_at =
+                                            ts + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
+                                        account.account_id =
+                                            account_id_claim.or(account.account_id);
+                                        account.residency = residency.or(account.residency);
+                                        account.status = crate::models::AccountStatus::Healthy;
+                                        account.reset_at = 0;
+                                        account.token_refreshed_at = ts;
+                                        account.updated_at = ts;
+                                        store.upsert_account(&account);
+                                        flows.set_state(
+                                            &flow_id,
+                                            FlowState::Authorized {
+                                                account_id: account.id,
+                                            },
+                                        );
+                                    } else {
+                                        flows.set_state(
+                                            &flow_id,
+                                            FlowState::Failed {
+                                                message: "account being replaced no longer exists"
+                                                    .into(),
+                                            },
+                                        );
+                                    }
+                                }
+                                None => {
+                                    let mut account = crate::flows::new_account(
+                                        crate::models::BackendId::Codex,
+                                        identity.unwrap_or_else(|| "chatgpt".into()),
+                                    );
                                     account.refresh_token = Some(tokens.refresh_token);
                                     account.access_token = Some(tokens.access_token.clone());
-                                    account.expires_at = ts + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
-                                    account.account_id = account_id_claim.or(account.account_id);
-                                    account.residency = residency.or(account.residency);
-                                    account.status = crate::models::AccountStatus::Healthy;
-                                    account.reset_at = 0;
+                                    account.expires_at =
+                                        ts + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
+                                    account.account_id = account_id_claim;
+                                    account.residency = residency;
                                     account.token_refreshed_at = ts;
-                                    account.updated_at = ts;
                                     store.upsert_account(&account);
-                                    flows.set_state(&flow_id, FlowState::Authorized {
-                                        account_id: account.id,
-                                    });
-                                } else {
-                                    flows.set_state(&flow_id, FlowState::Failed {
-                                        message: "account being replaced no longer exists".into(),
-                                    });
+                                    flows.set_state(
+                                        &flow_id,
+                                        FlowState::Authorized {
+                                            account_id: account.id.clone(),
+                                        },
+                                    );
                                 }
                             }
-                            None => {
-                                let mut account = crate::flows::new_account(
-                                    crate::models::BackendId::Codex,
-                                    identity.unwrap_or_else(|| "chatgpt".into()),
-                                );
-                                account.refresh_token = Some(tokens.refresh_token);
-                                account.access_token = Some(tokens.access_token.clone());
-                                account.expires_at = ts + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
-                                account.account_id = account_id_claim;
-                                account.residency = residency;
-                                account.token_refreshed_at = ts;
-                                store.upsert_account(&account);
-                                flows.set_state(&flow_id, FlowState::Authorized {
-                                    account_id: account.id.clone(),
-                                });
-                            }
+                            return;
                         }
-                        return;
+                        Err(e) => {
+                            flows.set_state(
+                                &flow_id,
+                                FlowState::Failed {
+                                    message: e.to_string(),
+                                },
+                            );
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        flows.set_state(&flow_id, FlowState::Failed { message: e.to_string() });
-                        return;
-                    }
-                },
+                }
             }
         }
     });
@@ -239,9 +280,15 @@ pub struct CodexBackend {
 }
 
 impl Backend for CodexBackend {
-    fn usage_is_chat(&self, _path: &str) -> bool { false }
+    fn usage_is_chat(&self, _path: &str) -> bool {
+        false
+    }
     fn id(&self) -> crate::models::BackendId {
         crate::models::BackendId::Codex
+    }
+
+    fn surfaces(&self) -> &'static [crate::models::Surface] {
+        &[crate::models::Surface::OpenAI]
     }
 
     fn default_cooldown_ms(&self) -> i64 {
@@ -283,7 +330,9 @@ impl Backend for CodexBackend {
             .any(|v| legacy_quota.iter().any(|q| v.eq_ignore_ascii_case(q)))
             || (error.is_none() && {
                 let lower = body.to_ascii_lowercase();
-                legacy_quota.iter().any(|q| lower.contains(&q.to_ascii_lowercase()))
+                legacy_quota
+                    .iter()
+                    .any(|q| lower.contains(&q.to_ascii_lowercase()))
             });
         if status == 429 || quota_body {
             let body_deadline = if error_type == Some("usage_limit_reached")
@@ -339,6 +388,7 @@ impl Backend for CodexBackend {
         token: &str,
         _sticky: Option<&str>,
         _body: &Value,
+        _client: &HeaderMap,
         headers: &mut HeaderMap,
     ) {
         headers.insert(
@@ -366,7 +416,13 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
     let entries: &[(&str, &str, i64, i64, i64)] = &[
         ("gpt-5.4", "GPT-5.4", 400_000, 272_000, 128_000),
         ("gpt-5.4-mini", "GPT-5.4 Mini", 400_000, 272_000, 128_000),
-        ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 400_000, 272_000, 128_000),
+        (
+            "gpt-5.3-codex-spark",
+            "GPT-5.3 Codex Spark",
+            400_000,
+            272_000,
+            128_000,
+        ),
         ("gpt-5.5", "GPT-5.5", 400_000, 272_000, 128_000),
         ("gpt-5.6-sol", "GPT-5.6 Sol", 400_000, 272_000, 128_000),
         ("gpt-5.6-terra", "GPT-5.6 Terra", 400_000, 272_000, 128_000),
@@ -376,13 +432,15 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
     ];
     entries
         .iter()
-        .map(|(id, name, context, input, output)| crate::models::ModelInfo {
-            id: id.to_string(),
-            name: name.to_string(),
-            context: *context,
-            input: *input,
-            output: *output,
-        })
+        .map(
+            |(id, name, context, input, output)| crate::models::ModelInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                context: *context,
+                input: *input,
+                output: *output,
+            },
+        )
         .collect()
 }
 
@@ -479,10 +537,20 @@ mod tests {
         account.account_id = Some("acct-123".into());
         account.residency = Some("eu".into());
         let mut headers = HeaderMap::new();
-        backend.inject_headers(&account, "tok", None, &Value::Null, &mut headers);
+        backend.inject_headers(
+            &account,
+            "tok",
+            None,
+            &Value::Null,
+            &HeaderMap::new(),
+            &mut headers,
+        );
         assert_eq!(headers.get("authorization").unwrap(), "Bearer tok");
         assert_eq!(headers.get("ChatGPT-Account-Id").unwrap(), "acct-123");
-        assert_eq!(headers.get("x-openai-internal-codex-residency").unwrap(), "eu");
+        assert_eq!(
+            headers.get("x-openai-internal-codex-residency").unwrap(),
+            "eu"
+        );
         assert_eq!(headers.get("originator").unwrap(), "opencode");
     }
 }

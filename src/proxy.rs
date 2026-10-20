@@ -1,11 +1,11 @@
 use crate::logging;
-use crate::models::{now_ms, BackendId, Outcome, RequestLogEntry};
+use crate::models::{AccountStatus, BackendId, Outcome, RequestLogEntry, Surface, now_ms};
 use crate::pool::{Decision, PoolCore, SelectError, Selection};
 use crate::provider::BackendMap;
 use crate::store::Store;
 use crate::store::{UpstreamEvent, UsageRecord};
-use crate::usage::{StreamEnd, StreamOutcome, UsageTap, usage_from_json};
 use crate::tokens::TokenManager;
+use crate::usage::{StreamEnd, StreamOutcome, UsageTap, usage_from_dialect};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,6 +26,30 @@ const PRE_OUTPUT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
 /// Upper bound on bytes buffered while holding a stream before its first output.
 const PRE_OUTPUT_HOLD_BYTES: usize = 1024 * 1024;
 
+/// Client headers that never travel upstream: credentials and transport-level headers. The
+/// proxy injects the selected account's credential itself (CONTRACTS
+/// `outbound-credential-stripping`), and the transport headers belong to the client's hop.
+const STRIPPED_CLIENT_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "cookie",
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "accept-encoding",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-request-id",
+];
+
 pub struct AppState {
     pub store: Arc<Store>,
     pub pool: Arc<Mutex<PoolCore>>,
@@ -38,6 +62,9 @@ pub struct AppState {
     pub ui_token: String,
     pub resets: Arc<crate::resets::ResetManager>,
     pub stream_usage_unsupported: Mutex<std::collections::HashSet<BackendId>>,
+    /// Per-account observations a backend reported about its last upstream response, keyed by
+    /// account id. Backends decide what to report; the proxy only stores it.
+    pub observations: Mutex<std::collections::HashMap<String, Value>>,
     /// How long usage rows, upstream events, and daily rollups are kept.
     pub stats_retention_days: i64,
 }
@@ -80,14 +107,10 @@ impl Drop for UsageFinish {
             report.saw_output,
             duration_ms,
         );
-        if let Some(entry) = self
-            .logs
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.request_id == self.record.request_id && entry.account.as_deref() == Some(self.record.account_id.as_str()))
-        {
+        if let Some(entry) = self.logs.lock().unwrap().iter_mut().rev().find(|entry| {
+            entry.request_id == self.record.request_id
+                && entry.account.as_deref() == Some(self.record.account_id.as_str())
+        }) {
             entry.stream_outcome = self.record.stream_outcome.clone();
             entry.error_code = self.record.error_code.clone();
         }
@@ -98,14 +121,24 @@ impl Drop for UsageFinish {
             _ => false,
         };
         if notable {
-            self.store.insert_upstream_event(&event_for(&self.record, kind, self.detail, report.error_code.clone()));
+            self.store.insert_upstream_event(&event_for(
+                &self.record,
+                kind,
+                self.detail,
+                report.error_code.clone(),
+            ));
         }
         // Written last: once the usage row is visible, the event and annotation already exist.
         persist_usage(&self.store, &self.record);
     }
 }
 
-fn event_for(record: &UsageRecord, kind: &str, detail: &str, error_code: Option<String>) -> UpstreamEvent {
+fn event_for(
+    record: &UsageRecord,
+    kind: &str,
+    detail: &str,
+    error_code: Option<String>,
+) -> UpstreamEvent {
     UpstreamEvent {
         ts: now_ms(),
         source: "proxy".into(),
@@ -152,9 +185,29 @@ fn persist_usage(store: &Store, record: &UsageRecord) {
 
 /// `started_ms` is when the attempt began, so `ts .. ts + duration_ms` is the attempt's lifetime.
 #[allow(clippy::too_many_arguments)]
-fn usage_record(request_id: &str, path: &str, model: &str, sticky: Option<&str>, selection: &Selection, account: &crate::models::Account, status: u16, started_ms: i64) -> UsageRecord {
+fn usage_record(
+    request_id: &str,
+    path: &str,
+    model: &str,
+    sticky: Option<&str>,
+    selection: &Selection,
+    account: &crate::models::Account,
+    status: u16,
+    started_ms: i64,
+) -> UsageRecord {
     UsageRecord {
-        id: 0, request_id: request_id.to_string(), ts: started_ms, endpoint: path.to_string(), backend: selection.backend.as_str().to_string(), model: model.to_string(), account_id: selection.account_id.clone(), account_label: account.label.clone(), cache_key: sticky.map(str::to_string), status, input_tokens: None, output_tokens: None,
+        id: 0,
+        request_id: request_id.to_string(),
+        ts: started_ms,
+        endpoint: path.to_string(),
+        backend: selection.backend.as_str().to_string(),
+        model: model.to_string(),
+        account_id: selection.account_id.clone(),
+        account_label: account.label.clone(),
+        cache_key: sticky.map(str::to_string),
+        status,
+        input_tokens: None,
+        output_tokens: None,
         ..Default::default()
     }
 }
@@ -175,8 +228,8 @@ fn usage_is_stream(body: &Value, content_type: &[u8]) -> bool {
 
 /// @cc [owner:ghuntley,label:security] proxy-key-gate
 /// When a proxy key is configured, requests to `/v1/*` MUST be rejected with 401 unless the
-/// `Authorization` header carries exactly `Bearer <proxy_key>`. When no key is configured
-/// (localhost-only mode) requests pass.
+/// `Authorization` header carries exactly `Bearer <proxy_key>`, or the `x-api-key` header
+/// carries exactly `<proxy_key>`. When no key is configured (localhost-only mode) requests pass.
 pub async fn require_proxy_key(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -188,7 +241,13 @@ pub async fn require_proxy_key(
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| {
+                req.headers()
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            });
         match provided {
             Some(key) if key == *expected => {}
             _ => {
@@ -232,9 +291,7 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
 fn upstream_error_response(status: StatusCode, content_type: &str, body: String) -> Response {
     (
         status,
-        [
-            (http::header::CONTENT_TYPE, content_type.to_string()),
-        ],
+        [(http::header::CONTENT_TYPE, content_type.to_string())],
         body,
     )
         .into_response()
@@ -268,7 +325,10 @@ enum Attempt {
     Failover(Option<Response>),
     /// The stream failed with a capacity code before any output; `replay` holds what upstream
     /// sent, for the client if no other account succeeds.
-    Overloaded { account_id: String, replay: Response },
+    Overloaded {
+        account_id: String,
+        replay: Response,
+    },
 }
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
@@ -278,6 +338,37 @@ enum Attempt {
 /// been excluded for an overload before output, a failed selection MUST return that held upstream
 /// response instead, without a reset attempt.
 pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    run(state, req, Surface::OpenAI).await
+}
+
+/// The Anthropic Messages API surface. Only official Claude Code clients are admitted.
+pub async fn messages(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    run(state, req, Surface::Anthropic).await
+}
+
+/// @cc [owner:ghuntley,label:proxy] surface-client-admission
+/// A request MUST be rejected with 403 before any pooled credential is used when no backend
+/// serving the requested surface admits it as a client.
+fn surface_accepts_client(
+    state: &AppState,
+    surface: Surface,
+    headers: &HeaderMap,
+    body: &Value,
+) -> bool {
+    let serving: Vec<_> = state
+        .backends
+        .values()
+        .filter(|backend| backend.surfaces().contains(&surface))
+        .collect();
+    if serving.is_empty() {
+        return true;
+    }
+    serving
+        .iter()
+        .any(|backend| backend.accepts_client(headers, body))
+}
+
+async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
     let started = Instant::now();
     let request_id = req
         .extensions()
@@ -286,8 +377,24 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         .unwrap_or("unknown")
         .to_string();
     let path = req.uri().path().to_string();
-    let session_header = req
-        .headers()
+    // The routes are nested under `/v1`, so the router hands the handler a path without that
+    // prefix. The upstream URL is built from it; the usage record keeps the client's route.
+    let endpoint = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path().to_string())
+        .unwrap_or_else(|| path.clone());
+    // The Anthropic API is called with the client's own query string (`?beta=true`).
+    let target = match surface {
+        Surface::Anthropic => req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| path.clone()),
+        Surface::OpenAI => path.clone(),
+    };
+    let client_headers = req.headers().clone();
+    let session_header = client_headers
         .get("session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
@@ -320,14 +427,31 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         }
     };
 
-    let model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let sticky = extract_sticky_key(&body, session_header.as_deref());
+    if !surface_accepts_client(&state, surface, &client_headers, &body) {
+        return attach_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "this endpoint only accepts official Claude Code clients",
+                "client_not_allowed",
+            ),
+            &request_id,
+        );
+    }
 
-    state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
+    let model = crate::models::normalize_model_name(
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    );
+    let sticky = match surface {
+        Surface::Anthropic => crate::claude::sticky_key(&client_headers, &body),
+        Surface::OpenAI => extract_sticky_key(&body, session_header.as_deref()),
+    };
+
+    state
+        .resets
+        .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+        .await;
 
     let total_accounts = state.pool.lock().unwrap().accounts.len().max(1);
     let mut last_upstream: Option<Response> = None;
@@ -340,17 +464,23 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 
     while attempts < max_attempts {
         attempts += 1;
-        let mut selection = state
-            .pool
-            .lock()
-            .unwrap()
-            .select_excluding(now_ms(), sticky.as_deref(), &model, &overloaded);
+        let mut selection = state.pool.lock().unwrap().select_excluding(
+            now_ms(),
+            sticky.as_deref(),
+            &model,
+            surface,
+            &overloaded,
+        );
 
         if selection.is_err()
             && !overloaded.is_empty()
             && let Some(replay) = last_upstream.take()
         {
-            logging::log_request_completed(&request_id, replay.status().as_u16(), started.elapsed().as_millis() as u64);
+            logging::log_request_completed(
+                &request_id,
+                replay.status().as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
             return attach_request_id(replay, &request_id);
         }
 
@@ -358,8 +488,17 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
             reset_after_quota = true;
             // Always select again: the reset attempt can wait on the shared reset lock and on
             // usage fetches, during which cooling deadlines may pass even if nothing was redeemed.
-            state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
-            selection = state.pool.lock().unwrap().select_excluding(now_ms(), sticky.as_deref(), &model, &overloaded);
+            state
+                .resets
+                .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+                .await;
+            selection = state.pool.lock().unwrap().select_excluding(
+                now_ms(),
+                sticky.as_deref(),
+                &model,
+                surface,
+                &overloaded,
+            );
         }
 
         let selection = match selection {
@@ -391,9 +530,18 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
             account_label(&state, &selection.account_id).as_deref(),
         );
 
-        if selection.decision == Decision::NewBinding || selection.decision == Decision::StickyRebind {
+        if selection.decision == Decision::NewBinding
+            || selection.decision == Decision::StickyRebind
+        {
             if let Some(key) = &sticky {
-                if let Some(binding) = state.pool.lock().unwrap().bindings().into_iter().find(|b| b.cache_key == *key) {
+                if let Some(binding) = state
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .bindings()
+                    .into_iter()
+                    .find(|b| b.cache_key == *key)
+                {
                     state.store.upsert_binding(&binding);
                     state.store.prune_bindings(
                         now_ms(),
@@ -407,17 +555,23 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         match attempt_account(
             &state,
             &request_id,
-            &path,
+            &endpoint,
+            &target,
             &model,
             sticky.as_deref(),
             &selection,
             body_bytes.clone(),
+            &client_headers,
             &mut refreshed,
         )
         .await
         {
             Attempt::Respond(resp) => {
-                logging::log_request_completed(&request_id, resp.status().as_u16(), started.elapsed().as_millis() as u64);
+                logging::log_request_completed(
+                    &request_id,
+                    resp.status().as_u16(),
+                    started.elapsed().as_millis() as u64,
+                );
                 return resp;
             }
             Attempt::Overloaded { account_id, replay } => {
@@ -428,7 +582,11 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
                 last_upstream = passthrough.or(last_upstream);
                 if attempts == max_attempts && !reset_after_quota {
                     reset_after_quota = true;
-                    if state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await {
+                    if state
+                        .resets
+                        .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+                        .await
+                    {
                         max_attempts += 1;
                     }
                 }
@@ -436,7 +594,11 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         }
     }
 
-    let saturated = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
+    let saturated = state
+        .pool
+        .lock()
+        .unwrap()
+        .select(now_ms(), sticky.as_deref(), &model, surface);
     if let Err(SelectError::Saturated { until_ms }) = saturated {
         record_saturated(&state, &request_id, &model, until_ms);
         return attach_request_id(saturated_response(until_ms), &request_id);
@@ -467,11 +629,13 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 async fn attempt_account(
     state: &Arc<AppState>,
     request_id: &str,
-    path: &str,
+    endpoint: &str,
+    target: &str,
     model: &str,
     sticky: Option<&str>,
     selection: &Selection,
     body_bytes: axum::body::Bytes,
+    client_headers: &HeaderMap,
     refreshed: &mut std::collections::HashSet<String>,
 ) -> Attempt {
     let started = Instant::now();
@@ -479,7 +643,12 @@ async fn attempt_account(
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
         return Attempt::Failover(None);
     };
-    let account = state.pool.lock().unwrap().account(&selection.account_id).cloned();
+    let account = state
+        .pool
+        .lock()
+        .unwrap()
+        .account(&selection.account_id)
+        .cloned();
     let Some(account) = account else {
         return Attempt::Failover(None);
     };
@@ -499,29 +668,60 @@ async fn attempt_account(
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, "token.unavailable");
             report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-            logging::log_account_state(&selection.account_id, label, "auth_error", "missing or unusable credential");
+            logging::log_account_state(
+                &selection.account_id,
+                label,
+                "auth_error",
+                "missing or unusable credential",
+            );
             drop(guard);
             return Attempt::Failover(None);
         }
     };
 
-    let url = backend.rewrite_url(path, &account);
+    let url = backend.rewrite_url(target, &account);
     let mut headers = HeaderMap::new();
+    if backend.forward_client_headers() {
+        for (name, value) in client_headers.iter() {
+            if STRIPPED_CLIENT_HEADERS.contains(&name.as_str()) {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
+        }
+    }
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
-    headers.insert(
-        http::header::ACCEPT,
-        http::HeaderValue::from_static("text/event-stream, application/json"),
-    );
+    if !headers.contains_key(http::header::ACCEPT) {
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("text/event-stream, application/json"),
+        );
+    }
     let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
-    backend.inject_headers(&account, &token, sticky, &outbound_body, &mut headers);
-    backend.prepare_body(&mut outbound_body);
+    backend.inject_headers(
+        &account,
+        &token,
+        sticky,
+        &outbound_body,
+        client_headers,
+        &mut headers,
+    );
     let fallback_body = outbound_body.clone();
-    let auto_usage = !state.stream_usage_unsupported.lock().unwrap().contains(&selection.backend)
-        && backend.auto_stream_usage(path, &mut outbound_body);
-    let outbound_bytes = serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec());
+    let auto_usage = !state
+        .stream_usage_unsupported
+        .lock()
+        .unwrap()
+        .contains(&selection.backend)
+        && backend.auto_stream_usage(endpoint, &mut outbound_body);
+    let outbound_bytes = if backend.forward_body_verbatim() {
+        // The upstream validates the client's own body, so it travels byte for byte.
+        body_bytes.to_vec()
+    } else {
+        backend.prepare_body(&mut outbound_body);
+        serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec())
+    };
 
     let mut response = match state
         .client
@@ -534,7 +734,9 @@ async fn attempt_account(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, backend = %selection.backend.as_str(), "upstream.network_error");
-            let record = usage_record(request_id, path, model, sticky, selection, &account, 0, started_ms);
+            let record = usage_record(
+                request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
+            );
             persist_usage(&state.store, &record);
             report_outcome(state, &selection.account_id, Outcome::Transient);
             drop(guard);
@@ -546,39 +748,103 @@ async fn attempt_account(
         let status = response.status();
         let rejection = response.text().await.unwrap_or_default();
         if rejection.contains("stream_options") || rejection.contains("include_usage") {
-            let rejected = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+            let rejected = usage_record(
+                request_id,
+                endpoint,
+                model,
+                sticky,
+                selection,
+                &account,
+                status.as_u16(),
+                started_ms,
+            );
             persist_usage(&state.store, &rejected);
-            state.stream_usage_unsupported.lock().unwrap().insert(selection.backend);
+            state
+                .stream_usage_unsupported
+                .lock()
+                .unwrap()
+                .insert(selection.backend);
             tracing::warn!(request_id = %request_id, backend = %selection.backend.as_str(), "usage.stream_option_unsupported");
-            let retry_bytes = serde_json::to_vec(&fallback_body).unwrap_or_else(|_| body_bytes.to_vec());
-            response = match state.client.post(&url).headers(headers).body(retry_bytes).send().await {
+            let retry_bytes =
+                serde_json::to_vec(&fallback_body).unwrap_or_else(|_| body_bytes.to_vec());
+            response = match state
+                .client
+                .post(&url)
+                .headers(headers)
+                .body(retry_bytes)
+                .send()
+                .await
+            {
                 Ok(resp) => resp,
                 Err(error) => {
                     tracing::warn!(request_id = %request_id, error = %error, "upstream.network_error");
-                    let record = usage_record(request_id, path, model, sticky, selection, &account, 0, started_ms);
+                    let record = usage_record(
+                        request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
+                    );
                     persist_usage(&state.store, &record);
                     drop(guard);
                     return Attempt::Failover(None);
                 }
             };
         } else {
-            let record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+            let record = usage_record(
+                request_id,
+                endpoint,
+                model,
+                sticky,
+                selection,
+                &account,
+                status.as_u16(),
+                started_ms,
+            );
             persist_usage(&state.store, &record);
-            push_log(state, request_id, model, Some(selection.backend.as_str().to_string()), Some(selection.account_id.clone()), Some(account.label.clone()), sticky.unwrap_or("none"), status.as_u16(), started.elapsed().as_millis() as u64);
+            push_log(
+                state,
+                request_id,
+                model,
+                Some(selection.backend.as_str().to_string()),
+                Some(selection.account_id.clone()),
+                Some(account.label.clone()),
+                sticky.unwrap_or("none"),
+                status.as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
             drop(guard);
-            return Attempt::Failover(Some(upstream_error_response(status, "application/json", rejection)));
+            return Attempt::Failover(Some(upstream_error_response(
+                status,
+                "application/json",
+                rejection,
+            )));
         }
     }
 
+    let response_headers = response.headers().clone();
     let status = response.status();
+    observe_response(
+        state,
+        &*backend,
+        &account,
+        &selection.account_id,
+        &response_headers,
+    );
 
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
         && refreshed.insert(selection.account_id.clone())
     {
         let body_text = response.text().await.unwrap_or_default();
-        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+        let mut record = usage_record(
+            request_id,
+            endpoint,
+            model,
+            sticky,
+            selection,
+            &account,
+            status.as_u16(),
+            started_ms,
+        );
         if let Ok(value) = serde_json::from_str::<Value>(&body_text)
-            && let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+            && let Some(counts) = usage_from_dialect(&value, backend.usage_dialect(endpoint))
+        {
             record.input_tokens = Some(counts.input_tokens);
             record.output_tokens = Some(counts.output_tokens);
         }
@@ -592,7 +858,12 @@ async fn attempt_account(
             Err(e) => {
                 tracing::warn!(request_id = %request_id, error = %e, "token.refresh_failed");
                 report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-                logging::log_account_state(&selection.account_id, label, "auth_error", "refresh rejected");
+                logging::log_account_state(
+                    &selection.account_id,
+                    label,
+                    "auth_error",
+                    "refresh rejected",
+                );
                 drop(guard);
                 return Attempt::Failover(None);
             }
@@ -602,9 +873,18 @@ async fn attempt_account(
     if !status.is_success() {
         let resp_headers = response.headers().clone();
         let body_text = response.text().await.unwrap_or_default();
-        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+        let mut record = usage_record(
+            request_id,
+            endpoint,
+            model,
+            sticky,
+            selection,
+            &account,
+            status.as_u16(),
+            started_ms,
+        );
         if let Ok(value) = serde_json::from_str::<Value>(&body_text) {
-            if let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+            if let Some(counts) = usage_from_dialect(&value, backend.usage_dialect(endpoint)) {
                 record.input_tokens = Some(counts.input_tokens);
                 record.output_tokens = Some(counts.output_tokens);
             }
@@ -616,29 +896,63 @@ async fn attempt_account(
         persist_usage(&state.store, &record);
         let kind = crate::usage::event_kind(record.error_code.as_deref());
         if record.error_code.is_some() && matches!(kind, "overloaded" | "policy_blocked") {
-            state.store.insert_upstream_event(&event_for(&record, kind, "http", record.error_code.clone()));
+            state.store.insert_upstream_event(&event_for(
+                &record,
+                kind,
+                "http",
+                record.error_code.clone(),
+            ));
         }
         let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
+        if let Outcome::ModelQuotaExhausted { until_ms } = outcome {
+            state
+                .pool
+                .lock()
+                .unwrap()
+                .report_model_quota(&selection.account_id, &model, until_ms);
+            let mut event = event_for(&record, "quota_cooling", "http", record.error_code.clone());
+            event.until_ms = Some(until_ms);
+            state.store.insert_upstream_event(&event);
+            logging::log_account_state(
+                &selection.account_id,
+                label,
+                "model_cooling",
+                &format!("{model} until {until_ms}"),
+            );
+        }
         if let Some(new_status) = {
             let mut pool = state.pool.lock().unwrap();
             pool.report(&selection.account_id, outcome.clone())
         } {
             let reset_at = {
                 let pool = state.pool.lock().unwrap();
-                pool.account(&selection.account_id).map(|a| a.reset_at).unwrap_or(0)
+                pool.account(&selection.account_id)
+                    .map(|a| a.reset_at)
+                    .unwrap_or(0)
             };
             state
                 .store
                 .update_account_status(&selection.account_id, new_status, reset_at);
             match &outcome {
                 Outcome::QuotaExhausted { until_ms } => {
-                    logging::log_account_state(&selection.account_id, label, "cooling", &format!("until {until_ms}"));
-                    let mut event = event_for(&record, "quota_cooling", "http", record.error_code.clone());
+                    logging::log_account_state(
+                        &selection.account_id,
+                        label,
+                        "cooling",
+                        &format!("until {until_ms}"),
+                    );
+                    let mut event =
+                        event_for(&record, "quota_cooling", "http", record.error_code.clone());
                     event.until_ms = Some(*until_ms);
                     state.store.insert_upstream_event(&event);
                 }
                 Outcome::AuthFailed => {
-                    logging::log_account_state(&selection.account_id, label, "auth_error", "upstream rejected credentials");
+                    logging::log_account_state(
+                        &selection.account_id,
+                        label,
+                        "auth_error",
+                        "upstream rejected credentials",
+                    );
                 }
                 _ => {}
             }
@@ -677,8 +991,17 @@ async fn attempt_account(
         let mut finish = UsageFinish {
             store: state.store.clone(),
             logs: state.logs.clone(),
-            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
-            tap: UsageTap::new(is_stream, backend.usage_is_chat(path)),
+            record: usage_record(
+                request_id,
+                endpoint,
+                model,
+                sticky,
+                selection,
+                &account,
+                status.as_u16(),
+                started_ms,
+            ),
+            tap: UsageTap::new(is_stream, backend.usage_dialect(endpoint)),
             ended: None,
             detail: "stream",
         };
@@ -687,8 +1010,25 @@ async fn attempt_account(
             hold_until_output(&mut stream, &mut finish, &mut held).await;
         }
         if let Some(code) = finish.tap.overload_before_output().map(str::to_string) {
-            logging::log_overload_failover(request_id, model, &selection.account_id, &account.label, &code, started.elapsed().as_millis() as u64);
-            push_log(state, request_id, model, Some(selection.backend.as_str().to_string()), Some(selection.account_id.clone()), Some(account.label.clone()), sticky.unwrap_or("none"), status_code.as_u16(), started.elapsed().as_millis() as u64);
+            logging::log_overload_failover(
+                request_id,
+                model,
+                &selection.account_id,
+                &account.label,
+                &code,
+                started.elapsed().as_millis() as u64,
+            );
+            push_log(
+                state,
+                request_id,
+                model,
+                Some(selection.backend.as_str().to_string()),
+                Some(selection.account_id.clone()),
+                Some(account.label.clone()),
+                sticky.unwrap_or("none"),
+                status_code.as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
             finish.ended.get_or_insert(StreamEnd::Eof);
             finish.detail = "stream_failover";
             // Dropping `finish` persists the failed attempt and its `overloaded` event.
@@ -698,20 +1038,31 @@ async fn attempt_account(
                 .status(status_code)
                 .body(Body::from(held.into_iter().flatten().collect::<Vec<u8>>()))
                 .expect("valid replay response");
-            replay.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
-            return Attempt::Overloaded { account_id: selection.account_id.clone(), replay };
+            replay
+                .headers_mut()
+                .insert(http::header::CONTENT_TYPE, content_type);
+            return Attempt::Overloaded {
+                account_id: selection.account_id.clone(),
+                replay,
+            };
         }
         let body_stream = Body::from_stream(futures::stream::unfold(
             (stream, Some(guard), finish, held),
             |(mut stream, guard, mut finish, mut held)| async move {
                 if let Some(chunk) = held.pop_front() {
-                    return Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish, held)));
+                    return Some((
+                        Ok::<_, std::io::Error>(chunk),
+                        (stream, guard, finish, held),
+                    ));
                 }
                 if finish.ended.is_some() {
                     // The hold already reached EOF or an upstream error; do not poll again.
                     return match finish.ended {
                         Some(StreamEnd::UpstreamError) if guard.is_some() => Some((
-                            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "upstream stream error")),
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "upstream stream error",
+                            )),
                             (stream, None, finish, held),
                         )),
                         _ => None,
@@ -720,8 +1071,11 @@ async fn attempt_account(
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         finish.tap.feed(&chunk);
-                        Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish, held)))
-                    },
+                        Some((
+                            Ok::<_, std::io::Error>(chunk),
+                            (stream, guard, finish, held),
+                        ))
+                    }
                     Some(Err(_)) => {
                         finish.ended.get_or_insert(StreamEnd::UpstreamError);
                         Some((
@@ -754,7 +1108,8 @@ async fn attempt_account(
             .status(status_code)
             .body(body_stream)
             .expect("valid stream response");
-        resp.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
+        resp.headers_mut()
+            .insert(http::header::CONTENT_TYPE, content_type);
         Attempt::Respond(resp)
     }
 }
@@ -764,8 +1119,11 @@ async fn attempt_account(
 /// sees model output or a terminal event, the stream ends or errors, `PRE_OUTPUT_HOLD` elapses,
 /// or `PRE_OUTPUT_HOLD_BYTES` are buffered, whichever comes first. It MUST NOT drop or reorder a
 /// chunk, and a stream end observed while holding MUST be recorded in `finish.ended`.
-async fn hold_until_output<S>(stream: &mut S, finish: &mut UsageFinish, held: &mut VecDeque<axum::body::Bytes>)
-where
+async fn hold_until_output<S>(
+    stream: &mut S,
+    finish: &mut UsageFinish,
+    held: &mut VecDeque<axum::body::Bytes>,
+) where
     S: futures::Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
 {
     let deadline = tokio::time::Instant::now() + PRE_OUTPUT_HOLD;
@@ -799,6 +1157,57 @@ fn account_label(state: &AppState, account_id: &str) -> Option<String> {
         .map(|a| a.label.clone())
 }
 
+/// Records what the backend observed about an upstream response, and cools the account when the
+/// upstream reports a window it cannot serve.
+fn observe_response(
+    state: &Arc<AppState>,
+    backend: &dyn crate::provider::Backend,
+    account: &crate::models::Account,
+    account_id: &str,
+    headers: &HeaderMap,
+) {
+    let now = now_ms();
+    if let Some(observation) = backend.observe_response(account, headers, now) {
+        state
+            .observations
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), observation);
+    }
+    let Some(until) = backend.exhausted_until_ms(headers) else {
+        return;
+    };
+    if until <= now {
+        return;
+    }
+    let current = {
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .account(account_id)
+            .map(|a| a.reset_at)
+            .unwrap_or(0)
+    };
+    if until <= current {
+        return;
+    }
+    state
+        .pool
+        .lock()
+        .unwrap()
+        .set_status(account_id, AccountStatus::Cooling, until);
+    state
+        .store
+        .update_account_status(account_id, AccountStatus::Cooling, until);
+    logging::log_account_state(
+        account_id,
+        Some(&account.label),
+        "cooling",
+        &format!("upstream window exhausted until {until}"),
+    );
+}
+
 fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {
     let status_change = {
         let mut pool = state.pool.lock().unwrap();
@@ -809,7 +1218,9 @@ fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {
             let pool = state.pool.lock().unwrap();
             pool.account(account_id).map(|a| a.reset_at).unwrap_or(0)
         };
-        state.store.update_account_status(account_id, new_status, reset_at);
+        state
+            .store
+            .update_account_status(account_id, new_status, reset_at);
     }
 }
 
@@ -891,7 +1302,10 @@ mod tests {
     #[test]
     fn sticky_key_falls_back_to_session_header() {
         let body = json!({"model": "gpt-5.5"});
-        assert_eq!(extract_sticky_key(&body, Some("sess-3")).as_deref(), Some("sess-3"));
+        assert_eq!(
+            extract_sticky_key(&body, Some("sess-3")).as_deref(),
+            Some("sess-3")
+        );
     }
 
     #[test]
@@ -906,7 +1320,10 @@ mod tests {
     fn stream_request_overrides_incorrect_json_content_type() {
         let body = json!({"stream": true});
         assert!(usage_is_stream(&body, b"application/json"));
-        assert!(usage_is_stream(&json!({}), b"text/event-stream; charset=utf-8"));
+        assert!(usage_is_stream(
+            &json!({}),
+            b"text/event-stream; charset=utf-8"
+        ));
         assert!(!usage_is_stream(&json!({}), b"application/json"));
     }
 }

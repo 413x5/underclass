@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum BackendId {
     Codex,
     Copilot,
+    Claude,
 }
 
 impl BackendId {
@@ -12,6 +13,7 @@ impl BackendId {
         match self {
             BackendId::Codex => "codex",
             BackendId::Copilot => "copilot",
+            BackendId::Claude => "claude",
         }
     }
 
@@ -19,13 +21,37 @@ impl BackendId {
         match s {
             "codex" => Some(BackendId::Codex),
             "copilot" => Some(BackendId::Copilot),
+            "claude" => Some(BackendId::Claude),
             _ => None,
         }
     }
 
-    pub fn all() -> [BackendId; 2] {
-        [BackendId::Codex, BackendId::Copilot]
+    pub fn all() -> [BackendId; 3] {
+        [BackendId::Codex, BackendId::Copilot, BackendId::Claude]
     }
+}
+
+/// The model name without a trailing parenthesised suffix, lowercased.
+///
+/// Claude Code appends a thinking suffix such as `(high)` to the model name; the suffix is not
+/// part of the model's identity, so routing and accounting use the base name.
+pub fn normalize_model_name(model: &str) -> String {
+    let trimmed = model.trim().to_ascii_lowercase();
+    match trimmed.rfind('(') {
+        Some(open) if trimmed.ends_with(')') => trimmed[..open].trim().to_string(),
+        _ => trimmed,
+    }
+}
+
+/// The wire protocol a client speaks. Backends declare which surfaces they can serve, so the
+/// pool never routes an Anthropic-shaped request to a backend that only speaks OpenAI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Surface {
+    /// OpenAI-shaped: `/v1/responses`, `/v1/chat/completions`.
+    OpenAI,
+    /// Anthropic Messages API: `/v1/messages`, `/v1/messages/count_tokens`.
+    Anthropic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +84,10 @@ pub struct Account {
     pub residency: Option<String>,
     #[serde(default)]
     pub enterprise_url: Option<String>,
+    /// Subscription plan reported by the upstream, when the backend exposes one
+    /// (`pro`/`max`/`team`/`enterprise` for Claude Code accounts).
+    #[serde(default)]
+    pub plan: Option<String>,
     pub status: AccountStatus,
     #[serde(default)]
     pub reset_at: i64,
@@ -92,6 +122,15 @@ impl Account {
     pub fn healthy(&self) -> bool {
         self.status == AccountStatus::Healthy
     }
+
+    /// The plan this account runs on, for display. Codex derives it from the stored access
+    /// token's claims; other backends report it at onboarding and store it on the account.
+    pub fn plan_label(&self) -> Option<String> {
+        match self.backend {
+            BackendId::Codex => self.chatgpt_plan(),
+            _ => self.plan.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,7 +157,14 @@ pub struct Binding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Ok,
-    QuotaExhausted { until_ms: i64 },
+    QuotaExhausted {
+        until_ms: i64,
+    },
+    /// The upstream refused this model on this account, but the account still serves other
+    /// models: the cooldown applies to the model, not to the account.
+    ModelQuotaExhausted {
+        until_ms: i64,
+    },
     AuthFailed,
     Transient,
 }

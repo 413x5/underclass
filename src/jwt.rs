@@ -1,5 +1,5 @@
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 
 /// @cc [owner:ghuntley,label:auth] jwt-malformed-returns-none
@@ -41,7 +41,11 @@ pub fn extract_residency(claims: &Value) -> Option<String> {
         .get("https://api.openai.com/auth")
         .and_then(|auth| auth.get("chatgpt_compute_residency"))
         .and_then(|v| v.as_str())
-        .or_else(|| claims.get("chatgpt_compute_residency").and_then(|v| v.as_str()));
+        .or_else(|| {
+            claims
+                .get("chatgpt_compute_residency")
+                .and_then(|v| v.as_str())
+        });
     match residency {
         Some(r) if r != "no_constraint" && !r.is_empty() => Some(r.to_string()),
         _ => None,
@@ -92,7 +96,8 @@ mod tests {
 
     #[test]
     fn account_id_namespaced_claim() {
-        let t = encode_token(&json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acc-2"}}));
+        let t =
+            encode_token(&json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acc-2"}}));
         let claims = parse_jwt_claims(&t).unwrap();
         assert_eq!(extract_account_id(&claims).as_deref(), Some("acc-2"));
     }
@@ -109,7 +114,9 @@ mod tests {
         let t = encode_token(&json!({"chatgpt_compute_residency": "no_constraint"}));
         let claims = parse_jwt_claims(&t).unwrap();
         assert_eq!(extract_residency(&claims), None);
-        let t = encode_token(&json!({"https://api.openai.com/auth": {"chatgpt_compute_residency": "eu"}}));
+        let t = encode_token(
+            &json!({"https://api.openai.com/auth": {"chatgpt_compute_residency": "eu"}}),
+        );
         let claims = parse_jwt_claims(&t).unwrap();
         assert_eq!(extract_residency(&claims).as_deref(), Some("eu"));
     }
@@ -120,7 +127,9 @@ mod tests {
         let claims = parse_jwt_claims(&t).unwrap();
         assert_eq!(extract_email(&claims).as_deref(), Some("a@b.c"));
 
-        let t = encode_token(&json!({"https://api.openai.com/profile": {"email": "x@y.z", "name": "Geo"}}));
+        let t = encode_token(
+            &json!({"https://api.openai.com/profile": {"email": "x@y.z", "name": "Geo"}}),
+        );
         let claims = parse_jwt_claims(&t).unwrap();
         assert_eq!(extract_email(&claims).as_deref(), Some("x@y.z"));
         assert_eq!(extract_display_name(&claims).as_deref(), Some("Geo"));
