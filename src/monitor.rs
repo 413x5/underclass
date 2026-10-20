@@ -126,13 +126,14 @@ fn collect(state: &AppState) -> rusqlite::Result<MonitorSnapshot> {
             .values()
             .map(|item| {
                 let account = &item.account;
+                let (status, reset_at) = effective_status(account.status, account.reset_at, now);
                 MonitorAccount {
                     id: account.id.clone(),
                     label: account.label.clone(),
                     backend: account.backend,
                     plan: account.plan_label(),
-                    status: account.status,
-                    reset_at: account.reset_at,
+                    status,
+                    reset_at,
                     inflight: item.inflight,
                     sticky_sessions: bindings.get(&account.id).copied().unwrap_or(0),
                     month: by_account.get(&account.id).cloned().unwrap_or_default(),
@@ -172,4 +173,34 @@ fn collect(state: &AppState) -> rusqlite::Result<MonitorSnapshot> {
         minute_bins,
         recent,
     })
+}
+
+/// @cc [owner:ghuntley,label:monitor] monitor-expired-cooldown
+/// An account reported by the monitor MUST be `Healthy` with `reset_at == 0` when its persisted
+/// `Cooling` deadline is at or before the snapshot time, matching pool sweep semantics without
+/// mutating the pool or store.
+fn effective_status(status: AccountStatus, reset_at: i64, now: i64) -> (AccountStatus, i64) {
+    if status == AccountStatus::Cooling && reset_at <= now {
+        (AccountStatus::Healthy, 0)
+    } else {
+        (status, reset_at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_status;
+    use crate::models::AccountStatus;
+
+    #[test]
+    fn expired_cooldown_is_displayed_as_healthy() {
+        assert_eq!(
+            effective_status(AccountStatus::Cooling, 99, 100),
+            (AccountStatus::Healthy, 0)
+        );
+        assert_eq!(
+            effective_status(AccountStatus::Cooling, 101, 100),
+            (AccountStatus::Cooling, 101)
+        );
+    }
 }
