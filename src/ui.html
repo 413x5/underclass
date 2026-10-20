@@ -219,13 +219,24 @@ async function api(path, opts = {}) {
   return res;
 }
 
-function fmtReset(ms, row) {
-  if (row.status !== 'cooling' || ms <= 0) return '—';
+function fmtDuration(ms) {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60), h = Math.floor(m / 60);
   if (h > 0) return h + 'h ' + (m % 60) + 'm';
   if (m > 0) return m + 'm ' + (s % 60) + 's';
   return s + 's';
+}
+
+// An account can be healthy while one billing surface is cooling, so the account-wide status alone
+// would misreport availability. Remaining times are computed server-side; the browser clock may not
+// be the server clock.
+function fmtReset(ms, row) {
+  if (row.status === 'cooling' && ms > 0) return fmtDuration(ms);
+  const scopes = (row.cooling_scopes || []).filter((s) => s.remaining_ms > 0);
+  if (!scopes.length) return '—';
+  const [first] = scopes;
+  const extra = scopes.length > 1 ? ' +' + (scopes.length - 1) : '';
+  return first.scope + ' ' + fmtDuration(first.remaining_ms) + extra;
 }
 
 async function loadState() {

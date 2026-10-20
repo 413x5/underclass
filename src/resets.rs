@@ -951,6 +951,7 @@ mod tests {
             enterprise_url: None,
             status: AccountStatus::Cooling,
             reset_at: now_ms() + 3_600_000,
+            scope_cooling: Default::default(),
             created_at: 0,
             updated_at: 0,
         }
@@ -1141,6 +1142,7 @@ mod tests {
             enterprise_url: None,
             status: AccountStatus::Cooling,
             reset_at: now_ms() + 3_600_000,
+            scope_cooling: Default::default(),
             created_at: 0,
             updated_at: 0,
         };

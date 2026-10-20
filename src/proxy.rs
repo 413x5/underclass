@@ -609,22 +609,44 @@ async fn attempt_account(
         } else {
             body_text
         };
-        if let Some(new_status) = {
+        // The transition, the snapshot, and the write share one critical section: a second lock
+        // acquisition would let a concurrent scope transition interleave, and because this write
+        // covers the whole `scope_cooling` map it would persist a snapshot missing the other scope.
+        let transition = {
             let mut pool = state.pool.lock().unwrap();
-            pool.report(&selection.account_id, outcome.clone())
-        } {
-            let reset_at = {
-                let pool = state.pool.lock().unwrap();
-                pool.account(&selection.account_id).map(|a| a.reset_at).unwrap_or(0)
-            };
-            state
-                .store
-                .update_account_status(&selection.account_id, new_status, reset_at);
+            let transition = pool.report_for(&selection.account_id, model, outcome.clone());
+            transition.and_then(|transition| {
+                let updated = pool.account(&selection.account_id).cloned();
+                if let Some(updated) = &updated {
+                    state.store.update_account_health(updated);
+                }
+                updated.map(|updated| (transition, updated))
+            })
+        };
+        if let Some((transition, updated)) = transition {
+            // The pool keeps the later of an existing and a newly reported deadline, so the event
+            // and its log line must carry the effective deadline the routing decision uses rather
+            // than this response's own value.
+            let effective_until = Some(match &transition {
+                crate::pool::HealthTransition::Scope(scope) => updated.scope_cooling.get(scope).copied(),
+                crate::pool::HealthTransition::Account(_) => Some(updated.reset_at),
+            });
             match &outcome {
                 Outcome::QuotaExhausted { until_ms } => {
-                    logging::log_account_state(&selection.account_id, label, "cooling", &format!("until {until_ms}"));
+                    let until_ms = effective_until.flatten().unwrap_or(*until_ms);
+                    let scope = match &transition {
+                        crate::pool::HealthTransition::Scope(scope) => Some(scope.as_str()),
+                        crate::pool::HealthTransition::Account(_) => None,
+                    };
+                    logging::log_account_state(
+                        &selection.account_id,
+                        label,
+                        "cooling",
+                        &format!("until {until_ms} scope {}", scope.unwrap_or("account")),
+                    );
                     let mut event = event_for(&record, "quota_cooling", "http", record.error_code.clone());
-                    event.until_ms = Some(*until_ms);
+                    event.until_ms = Some(until_ms);
+                    event.detail = Some(scope.unwrap_or("account").to_string());
                     state.store.insert_upstream_event(&event);
                 }
                 Outcome::AuthFailed => {
@@ -893,16 +915,14 @@ fn account_label(state: &AppState, account_id: &str) -> Option<String> {
 }
 
 fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {
-    let status_change = {
-        let mut pool = state.pool.lock().unwrap();
-        pool.report(account_id, outcome)
-    };
-    if let Some(new_status) = status_change {
-        let reset_at = {
-            let pool = state.pool.lock().unwrap();
-            pool.account(account_id).map(|a| a.reset_at).unwrap_or(0)
-        };
-        state.store.update_account_status(account_id, new_status, reset_at);
+    // Transition and persist under one lock, as `attempt_account` and `enable_account` do. Writing
+    // after the guard drops would let a concurrent `enable`/`sync_from_store` land in between and
+    // be overwritten by this stale status on the next reload.
+    let mut pool = state.pool.lock().unwrap();
+    if let Some(new_status) = pool.report(account_id, outcome)
+        && let Some(account) = pool.account(account_id)
+    {
+        state.store.update_account_status(account_id, new_status, account.reset_at);
     }
 }
 

@@ -146,6 +146,7 @@ mod tests {
             enterprise_url: None,
             status: AccountStatus::Healthy,
             reset_at: 0,
+            scope_cooling: Default::default(),
             created_at: 0,
             updated_at: refreshed_at,
         }

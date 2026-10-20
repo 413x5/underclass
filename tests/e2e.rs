@@ -16,7 +16,11 @@ use underclass::tokens::TokenManager;
 #[derive(Default)]
 struct MockState {
     failing: BTreeSet<String>,
+    /// Models whose upstream answers `402 Payment Required` (Cline's exhausted-credits signal).
+    payment_required: BTreeSet<String>,
     served_by: VecDeque<String>,
+    /// Upstream model IDs in request order, so a test can assert what was attempted.
+    models: VecDeque<String>,
     fourtwonined: VecDeque<String>,
     chat_usage_options: VecDeque<bool>,
     reject_stream_usage: bool,
@@ -54,6 +58,19 @@ async fn mock_responses(
             axum::http::StatusCode::FORBIDDEN,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
             r#"{"error":{"message":"credential rejected"}}"#.to_string(),
+        ).into_response();
+    }
+
+    let requested_model = serde_json::from_str::<serde_json::Value>(&body).ok()
+        .and_then(|value| value.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    state.lock().unwrap().models.push_back(requested_model.clone());
+    let payment_required = state.lock().unwrap().payment_required.contains(&requested_model);
+    if payment_required {
+        return (
+            axum::http::StatusCode::PAYMENT_REQUIRED,
+            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+            r#"{"error":{"code":"insufficient_credits","message":"credit balance exhausted"}}"#.to_string(),
         ).into_response();
     }
 
@@ -165,6 +182,7 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
         unsafe {
             std::env::set_var("UNDERCLASS_CODEX_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
+            std::env::set_var("UNDERCLASS_CLINE_UPSTREAM", format!("http://{addr}"));
         }
         format!("http://{addr}")
     });
@@ -186,6 +204,7 @@ fn account(id: &str, backend: BackendId, token: &str) -> Account {
         enterprise_url: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
+        scope_cooling: Default::default(),
         created_at: ts,
         updated_at: ts,
     }
@@ -201,6 +220,13 @@ fn copilot_account(id: &str, token: &str) -> Account {
     a
 }
 
+fn cline_account(id: &str, token: &str) -> Account {
+    // Cline holds a static API key; `TokenManager` hands the refresh token to the backend.
+    let mut a = account(id, BackendId::Cline, "unused-access");
+    a.refresh_token = Some(token.to_string());
+    a
+}
+
 fn model(id: &str) -> ModelInfo {
     ModelInfo {
         id: id.into(),
@@ -208,10 +234,25 @@ fn model(id: &str) -> ModelInfo {
         context: 400_000,
         input: 272_000,
         output: 128_000,
+        scope: String::new(),
     }
 }
 
-async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<VecDeque<RequestLogEntry>>>) {
+fn scoped_model(id: &str, scope: &str) -> ModelInfo {
+    ModelInfo {
+        scope: scope.into(),
+        ..model(id)
+    }
+}
+
+async fn spawn_app(
+    store: Arc<Store>,
+    cooldown_ms: i64,
+) -> (
+    String,
+    Arc<Mutex<VecDeque<RequestLogEntry>>>,
+    Arc<Mutex<PoolCore>>,
+) {
     let client = reqwest::Client::new();
     let core = PoolCore::new(&store);
     let pool = Arc::new(Mutex::new(core));
@@ -219,10 +260,14 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
     let mut backends: BackendMap = std::collections::HashMap::new();
     backends.insert(BackendId::Codex, Arc::new(CodexBackend { cooldown_ms }));
     backends.insert(BackendId::Copilot, Arc::new(CopilotBackend { cooldown_ms }));
+    backends.insert(
+        BackendId::Cline,
+        Arc::new(underclass::cline::ClineBackend { cooldown_ms }),
+    );
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
     let state = Arc::new(AppState {
         store,
-        pool,
+        pool: pool.clone(),
         tokens,
         backends: Arc::new(backends),
         client,
@@ -251,6 +296,11 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         .with_state(state.clone());
 
     let admin = axum::Router::new()
+        .route("/admin/api/state", axum::routing::get(underclass::ui::state))
+        .route(
+            "/admin/api/catalog/{backend}",
+            axum::routing::get(underclass::ui::get_catalog).put(underclass::ui::put_catalog),
+        )
         .route("/admin/api/monitor", axum::routing::get(underclass::monitor::snapshot))
         .route("/admin/api/usage", axum::routing::get(underclass::ui::usage_summary))
         .route("/admin/api/usage/requests", axum::routing::get(underclass::ui::usage_requests))
@@ -268,7 +318,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), logs)
+    (format!("http://{addr}"), logs, pool)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -277,7 +327,7 @@ async fn e2e_mid_stream_overload_is_recorded() {
     let store = Arc::new(Store::in_memory().unwrap());
     store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
     store.upsert_account(&codex_account("acc-ovl", "tok-overload"));
-    let (base, logs) = spawn_app(store.clone(), 400).await;
+    let (base, logs, _pool) = spawn_app(store.clone(), 400).await;
     let http = reqwest::Client::new();
     let response = http.post(format!("{base}/v1/responses"))
         .header("Authorization", "Bearer test-key")
@@ -324,7 +374,7 @@ async fn e2e_full_pool_story() {
     store.set_catalog(BackendId::Copilot, &[m]);
     store.upsert_account(&codex_account("acc-1", "tok-acc-1"));
     store.upsert_account(&copilot_account("acc-2", "cop-acc-2"));
-    let (base, logs) = spawn_app(store.clone(), 400).await;
+    let (base, logs, _pool) = spawn_app(store.clone(), 400).await;
     let http = reqwest::Client::new();
 
     let post = |key: Option<&str>, stream: bool| {
@@ -475,7 +525,7 @@ async fn e2e_full_pool_story() {
     store2.set_catalog(BackendId::Copilot, &[m2]);
     store2.upsert_account(&codex_account("acc-1", "bad-token"));
     store2.upsert_account(&copilot_account("acc-2", "tok-good"));
-    let (base2, _logs2) = spawn_app(store2.clone(), 400).await;
+    let (base2, _logs2, _pool2) = spawn_app(store2.clone(), 400).await;
     let resp = http
         .post(format!("{base2}/v1/chat/completions"))
         .header("Authorization", "Bearer test-key")
@@ -581,7 +631,7 @@ async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
     store.upsert_account(&copilot_account("cop-403", "cop-403-token"));
     store.upsert_account(&copilot_account("cop-spare", "cop-spare-token"));
     mock.lock().unwrap().forbidden.insert("cop-403-token".into(), 1);
-    let (base, _logs) = spawn_app(store.clone(), 400).await;
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/v1/responses"))
@@ -617,7 +667,7 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     store.upsert_account(&copilot_account("acct-auth", "tok-auth"));
     store.upsert_account(&copilot_account("acct-cooling", "tok-cooling"));
     store.upsert_account(&copilot_account("acct-disabled", "tok-disabled"));
-    let (base, _logs) = spawn_app(store.clone(), 400).await;
+    let (base, _logs, pool) = spawn_app(store.clone(), 400).await;
     let http = reqwest::Client::new();
 
     let enable = |id: &str| {
@@ -633,26 +683,273 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
         }
     };
 
+    // `enable` reads the pool's live account, so the fixture must move the pool too. A real status
+    // transition persists first and syncs the pool; `PoolCore::sync_from_store` does the same on
+    // its tick, which this mirrors without waiting for it.
+    let set_status = |id: &str, status: AccountStatus, reset_at: i64| {
+        store.update_account_status(id, status, reset_at);
+        let account = store.get_account(id).unwrap();
+        pool.lock().unwrap().sync_account(account);
+    };
+
     assert_eq!(enable("no-such-account").await.status(), 404);
 
     // A stranded auth_error account is exactly the dead end this endpoint exists to undo.
-    store.update_account_status("acct-auth", AccountStatus::AuthError, 0);
+    set_status("acct-auth", AccountStatus::AuthError, 0);
     assert_eq!(enable("acct-auth").await.status(), 204);
     let authed = store.get_account("acct-auth").unwrap();
     assert_eq!(authed.status, AccountStatus::Healthy);
     assert_eq!(authed.reset_at, 0);
 
     // An operator-set disable still clears.
-    store.update_account_status("acct-disabled", AccountStatus::Disabled, 0);
+    set_status("acct-disabled", AccountStatus::Disabled, 0);
     assert_eq!(enable("acct-disabled").await.status(), 204);
     assert_eq!(store.get_account("acct-disabled").unwrap().status, AccountStatus::Healthy);
 
     // A quota cooldown is upstream state, not an operator block: enabling must not wipe it,
     // otherwise the account is re-selected while still out of quota.
     let deadline = now_ms() + 3_600_000;
-    store.update_account_status("acct-cooling", AccountStatus::Cooling, deadline);
+    set_status("acct-cooling", AccountStatus::Cooling, deadline);
     assert_eq!(enable("acct-cooling").await.status(), 204);
     let cooling = store.get_account("acct-cooling").unwrap();
     assert_eq!(cooling.status, AccountStatus::Cooling);
     assert_eq!(cooling.reset_at, deadline, "enable must preserve an upstream quota deadline");
+
+    // Scoped deadlines follow the same split: an operator disable clears them so the account is
+    // fully usable again, while an upstream account-wide cooldown keeps them.
+    let mut scoped = store.get_account("acct-disabled").unwrap();
+    scoped.scope_cooling.insert("credits".into(), deadline);
+    store.update_account_health(&scoped);
+    set_status("acct-disabled", AccountStatus::Disabled, 0);
+    assert_eq!(enable("acct-disabled").await.status(), 204);
+    let cleared = store.get_account("acct-disabled").unwrap();
+    assert_eq!(cleared.status, AccountStatus::Healthy);
+    assert!(
+        cleared.scope_cooling.is_empty(),
+        "an operator recovery must clear scoped cooling: {:?}",
+        cleared.scope_cooling
+    );
+
+    let mut account_wide = store.get_account("acct-cooling").unwrap();
+    account_wide.scope_cooling.insert("credits".into(), deadline);
+    store.update_account_health(&account_wide);
+    pool.lock().unwrap().sync_account(account_wide);
+    assert_eq!(enable("acct-cooling").await.status(), 204);
+    let preserved = store.get_account("acct-cooling").unwrap();
+    assert_eq!(preserved.status, AccountStatus::Cooling);
+    assert_eq!(
+        preserved.scope_cooling.get("credits"),
+        Some(&deadline),
+        "an upstream cooldown must keep its scoped deadlines"
+    );
+}
+
+/// The reported bug: a credits `402` is an account-level-looking signal on one billing surface.
+/// It must cool only that surface, so a ClinePass request through the same key is still attempted
+/// instead of failing fast with "all subscriptions are out of quota".
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_credits_402_keeps_the_clinepass_surface_routable() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    // A test-unique model id keeps the process-wide mock's `payment_required` set from leaking a
+    // 402 into a parallel test that requests a shared Cline model.
+    let credits = scoped_model("cline/anthropic/claude-sonnet-4-6-e2e-blank", "credits");
+    let pass = scoped_model("cline/cline-pass/kimi-k3-e2e-blank", "cline-pass");
+    store.set_catalog(BackendId::Cline, &[credits.clone(), pass.clone()]);
+    store.upsert_account(&cline_account("cline-1", "key-cline-1"));
+    // The mock sees the upstream id: `prepare_body` strips the pool-facing `cline/` prefix.
+    let unavailable = underclass::cline::upstream_model_id(&credits.id).to_string();
+    mock.lock().unwrap().payment_required.insert(unavailable.clone());
+    let (base, _logs, _pool) = spawn_app(store.clone(), 3_600_000).await;
+    let http = reqwest::Client::new();
+
+    let post = |model: &str| {
+        let http = http.clone();
+        let base = base.clone();
+        let model = model.to_string();
+        async move {
+            http.post(format!("{base}/v1/chat/completions"))
+                .header("Authorization", concat!("Bear", "er ", "test-key"))
+                .json(&serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. Credits is out of balance: the only account cools for that surface, so this fails fast.
+    let first = post(&credits.id).await;
+    assert_eq!(first.status(), 429, "an exhausted surface has no other account to fail over to");
+    assert!(first.headers().get(axum::http::header::RETRY_AFTER).is_some());
+
+    let account = store.get_account("cline-1").unwrap();
+    assert_eq!(
+        account.status,
+        AccountStatus::Healthy,
+        "a 402 on credits must not cool the whole Cline account"
+    );
+    assert!(
+        account.scope_cooling.contains_key("credits"),
+        "the credits surface must be recorded, got {:?}",
+        account.scope_cooling
+    );
+
+    // 2. The regression: ClinePass must still be attempted and served.
+    let second = post(&pass.id).await;
+    let status = second.status();
+    let body = second.text().await.unwrap();
+    assert_eq!(status, 200, "ClinePass must still be tried, got {status}: {body}");
+    assert!(
+        body.contains("key-cline-1"),
+        "the request must reach upstream on the same account, got: {body}"
+    );
+    let attempted = mock.lock().unwrap().models.clone();
+    let expected_pass = underclass::cline::upstream_model_id(&pass.id).to_string();
+    assert!(
+        attempted.contains(&expected_pass),
+        "upstream never saw the ClinePass model; attempted: {attempted:?}"
+    );
+
+    // 3. The exhausted surface still fails fast, and the monitor names it.
+    let third = post(&credits.id).await;
+    assert_eq!(third.status(), 429);
+    // The quota_cooling event is recorded for the exhausted surface, so statistics agree with
+    // routing about which surface stopped serving.
+    let stats: serde_json::Value = http
+        .get(format!("{base}/admin/api/stats?since=1h&bucket=minute"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The first credits request reached upstream and recorded exactly one quota event; the
+    // ClinePass request completed. The third credits request never reached upstream: it was refused
+    // by the pool, so it records saturation instead of a second quota event.
+    assert_eq!(stats["totals"]["events"]["quota_cooling"], 1, "{stats}");
+    assert_eq!(stats["totals"]["outcomes"]["completed"], 1, "{stats}");
+    assert!(
+        stats["totals"]["events"]["pool_saturated"].as_i64().unwrap_or(0) >= 1,
+        "the refused credits request must record saturation: {stats}"
+    );
+    let monitor: serde_json::Value = http
+        .get(format!("{base}/admin/api/monitor"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = &monitor["accounts"][0];
+    assert_eq!(entry["status"], "healthy");
+    assert!(
+        entry["cooling_scopes"]["credits"].as_i64().unwrap_or(0) > now_ms(),
+        "monitor must expose the cooling surface: {entry}"
+    );
+    assert!(
+        entry["cooling_scopes"].get("cline-pass").is_none(),
+        "the pass surface was never cooled: {entry}"
+    );
+
+    // The admin state view renders remaining time server-side, so a skewed browser clock cannot
+    // display a live cooldown as expired.
+    let state: serde_json::Value = http
+        .get(format!("{base}/admin/api/state"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let scopes = state["accounts"][0]["cooling_scopes"].as_array().unwrap();
+    assert_eq!(scopes.len(), 1, "{state}");
+    assert_eq!(scopes[0]["scope"], "credits");
+    assert!(
+        scopes[0]["remaining_ms"].as_i64().unwrap() > 0,
+        "the view must carry a live server-computed remainder: {state}"
+    );
+
+    mock.lock().unwrap().payment_required.remove(&unavailable);
+}
+
+/// An operator-edited Cline catalog must not silently drop billing scopes: an empty scope means
+/// account-wide quota, which would reintroduce the credits-402 regression for a hand-edited row.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_catalog_put_backfills_cline_scopes() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(
+        BackendId::Cline,
+        &[scoped_model("cline/anthropic/claude-sonnet-4-6", "credits")],
+    );
+    store.upsert_account(&cline_account("cline-1", "key-cline-1"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    // A payload that omits `scope` entirely, as an older client or a hand edit would.
+    let response = http
+        .put(format!("{base}/admin/api/catalog/cline"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .json(&serde_json::json!({"models": [
+            {"id": "cline/anthropic/claude-sonnet-4-6", "name": "Claude"},
+            {"id": "cline/cline-pass/kimi-k3", "name": "Kimi K3"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let saved: serde_json::Value = response.json().await.unwrap();
+    let scopes: Vec<&str> = saved["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["scope"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        scopes,
+        vec!["credits", "cline-pass"],
+        "a PUT must not leave Cline rows account-wide: {saved}"
+    );
+
+}
+
+/// A rejected key is not a quota signal: it must never be recorded as a cooling surface, or the
+/// next request would keep probing an account whose credentials upstream already refused.
+/// The account-wide `AuthError` transition itself is covered by `pool::tests` and the backend
+/// classification test; this checks the proxy path produces no scope entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cline_auth_failure_never_creates_a_cooling_scope() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let credits = scoped_model("cline/anthropic/claude-sonnet-4-6", "credits");
+    let pass = scoped_model("cline/cline-pass/kimi-k3", "cline-pass");
+    store.set_catalog(BackendId::Cline, &[credits.clone(), pass.clone()]);
+    // The mock rejects any bearer starting with `bad-`.
+    store.upsert_account(&cline_account("cline-bad", "bad-cline-key"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 3_600_000).await;
+    let http = reqwest::Client::new();
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": pass.id, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status(), 200, "a rejected key must not serve the request");
+
+    let account = store.get_account("cline-bad").unwrap();
+    assert!(
+        account.scope_cooling.is_empty(),
+        "a 401 is not a quota scope: {:?}",
+        account.scope_cooling
+    );
+    assert_ne!(
+        account.status,
+        AccountStatus::Cooling,
+        "a 401 must not cool the account as if it were out of quota"
+    );
 }

@@ -136,6 +136,7 @@ fn schema() -> &'static str {
         enterprise_url TEXT,
         status TEXT NOT NULL DEFAULT 'healthy',
         reset_at INTEGER NOT NULL DEFAULT 0,
+        scope_cooling TEXT NOT NULL DEFAULT '{}',
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     );
@@ -152,6 +153,7 @@ fn schema() -> &'static str {
         context INTEGER NOT NULL DEFAULT 0,
         input INTEGER NOT NULL DEFAULT 0,
         output INTEGER NOT NULL DEFAULT 0,
+        scope TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (backend, model_id)
     );
     CREATE TABLE IF NOT EXISTS config (
@@ -226,6 +228,22 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "token_refreshed_at") {
         conn.execute(
             "ALTER TABLE accounts ADD COLUMN token_refreshed_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|c| c == "scope_cooling") {
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN scope_cooling TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    let mut stmt = conn.prepare("PRAGMA table_info(catalog)")?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|c| c == "scope") {
+        conn.execute(
+            "ALTER TABLE catalog ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }
@@ -578,31 +596,12 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at
+                        token_refreshed_at, scope_cooling
                  FROM accounts ORDER BY created_at",
             )
             .expect("prepare accounts");
         let rows = stmt
-            .query_map([], |row| {
-                let backend: String = row.get(1)?;
-                let status: String = row.get(9)?;
-                Ok(Account {
-                    id: row.get(0)?,
-                    backend: BackendId::parse(&backend).unwrap_or(BackendId::Codex),
-                    label: row.get(2)?,
-                    refresh_token: row.get(3)?,
-                    access_token: row.get(4)?,
-                    expires_at: row.get(5)?,
-                    token_refreshed_at: row.get(13)?,
-                    account_id: row.get(6)?,
-                    residency: row.get(7)?,
-                    enterprise_url: row.get(8)?,
-                    status: parse_status(&status),
-                    reset_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
-                })
-            })
+            .query_map([], account_from_row)
             .expect("query accounts");
         rows.filter_map(Result::ok).collect()
     }
@@ -613,32 +612,13 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at
+                        token_refreshed_at, scope_cooling
                  FROM accounts WHERE id = ?1",
             )
             .expect("prepare account");
-        stmt.query_row(params![id], |row| {
-            let backend: String = row.get(1)?;
-            let status: String = row.get(9)?;
-            Ok(Account {
-                id: row.get(0)?,
-                backend: BackendId::parse(&backend).unwrap_or(BackendId::Codex),
-                label: row.get(2)?,
-                refresh_token: row.get(3)?,
-                access_token: row.get(4)?,
-                expires_at: row.get(5)?,
-                token_refreshed_at: row.get(13)?,
-                account_id: row.get(6)?,
-                residency: row.get(7)?,
-                enterprise_url: row.get(8)?,
-                status: parse_status(&status),
-                reset_at: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-            })
-        })
-        .optional()
-        .expect("query account")
+        stmt.query_row(params![id], account_from_row)
+            .optional()
+            .expect("query account")
     }
 
     pub fn upsert_account(&self, a: &Account) {
@@ -646,12 +626,12 @@ impl Store {
         conn.execute(
             "INSERT INTO accounts (id, backend, label, refresh_token, access_token, expires_at, account_id,
                                    residency, enterprise_url, status, reset_at, created_at, updated_at,
-                                   token_refreshed_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                                   token_refreshed_at, scope_cooling)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
                 label=?3, refresh_token=?4, access_token=?5, expires_at=?6, account_id=?7,
                 residency=?8, enterprise_url=?9, status=?10, reset_at=?11, updated_at=?13,
-                token_refreshed_at=?14",
+                token_refreshed_at=?14, scope_cooling=?15",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -667,6 +647,7 @@ impl Store {
                 a.created_at,
                 a.updated_at,
                 a.token_refreshed_at,
+                encode_scopes(&a.scope_cooling),
             ],
         )
         .expect("upsert account");
@@ -728,6 +709,27 @@ impl Store {
             params![id, status_str(status), reset_at, crate::models::now_ms()],
         )
         .expect("update status");
+    }
+
+    /// @cc [owner:ghuntley,label:persistence] health-write-through
+    /// `update_account_health` MUST persist the account's `status`, `reset_at`, and every
+    /// `scope_cooling` deadline in one statement, so a scoped cooldown transition is durable before
+    /// the request that observed it returns and cannot be resurrected by a later single-status
+    /// write. It MUST only update an existing row.
+    pub fn update_account_health(&self, account: &Account) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET status = ?2, reset_at = ?3, scope_cooling = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![
+                account.id,
+                status_str(account.status),
+                account.reset_at,
+                encode_scopes(&account.scope_cooling),
+                crate::models::now_ms(),
+            ],
+        )
+        .expect("update account health");
     }
 
     /// @cc [owner:ghuntley,label:persistence] token-rotation-write-through
@@ -814,7 +816,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT model_id, name, context, input, output FROM catalog
+                "SELECT model_id, name, context, input, output, scope FROM catalog
                  WHERE backend = ?1 ORDER BY model_id",
             )
             .expect("prepare catalog");
@@ -826,6 +828,7 @@ impl Store {
                     context: row.get(2)?,
                     input: row.get(3)?,
                     output: row.get(4)?,
+                    scope: row.get(5)?,
                 })
             })
             .expect("query catalog");
@@ -839,8 +842,8 @@ impl Store {
             .expect("clear catalog");
         for m in models {
             tx.execute(
-                "INSERT INTO catalog (backend, model_id, name, context, input, output) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![backend.as_str(), m.id, m.name, m.context, m.input, m.output],
+                "INSERT INTO catalog (backend, model_id, name, context, input, output, scope) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![backend.as_str(), m.id, m.name, m.context, m.input, m.output, m.scope],
             )
             .expect("insert catalog row");
         }
@@ -863,6 +866,39 @@ impl Store {
         )
         .expect("config set");
     }
+}
+
+pub fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
+    let backend: String = row.get(1)?;
+    let status: String = row.get(9)?;
+    let scopes: String = row.get(14)?;
+    Ok(Account {
+        id: row.get(0)?,
+        backend: BackendId::parse(&backend).unwrap_or(BackendId::Codex),
+        label: row.get(2)?,
+        refresh_token: row.get(3)?,
+        access_token: row.get(4)?,
+        expires_at: row.get(5)?,
+        token_refreshed_at: row.get(13)?,
+        account_id: row.get(6)?,
+        residency: row.get(7)?,
+        enterprise_url: row.get(8)?,
+        status: parse_status(&status),
+        reset_at: row.get(10)?,
+        scope_cooling: decode_scopes(&scopes),
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+/// Scope deadlines are stored as a JSON object so a malformed or legacy value degrades to "no
+/// scoped cooling" instead of losing the account row.
+fn encode_scopes(scopes: &std::collections::BTreeMap<String, i64>) -> String {
+    serde_json::to_string(scopes).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn decode_scopes(raw: &str) -> std::collections::BTreeMap<String, i64> {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn parse_status(s: &str) -> AccountStatus {
@@ -916,11 +952,77 @@ mod tests {
         assert_eq!(account.expires_at, 999);
         assert_eq!(account.reset_at, 4242);
         assert_eq!(account.token_refreshed_at, 0, "new column must default to never-rotated");
+        assert!(
+            account.scope_cooling.is_empty(),
+            "a legacy row has no scoped cooling"
+        );
 
         // Re-opening must be a no-op rather than a duplicate-column error.
         drop(store);
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.list_accounts().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scoped_health_and_catalog_scopes_round_trip() {
+        let store = Store::in_memory().unwrap();
+        let mut account = crate::flows::new_account(crate::models::BackendId::Cline, "owner".into());
+        account.scope_cooling.insert("credits".into(), 5_000);
+        store.upsert_account(&account);
+
+        let loaded = store.get_account(&account.id).expect("account");
+        assert_eq!(loaded.scope_cooling.get("credits"), Some(&5_000));
+
+        // The narrow status write must not resurrect or drop scoped deadlines.
+        store.update_account_status(&account.id, crate::models::AccountStatus::Healthy, 0);
+        let loaded = store.get_account(&account.id).expect("account");
+        assert_eq!(loaded.scope_cooling.get("credits"), Some(&5_000));
+
+        account.scope_cooling.clear();
+        store.update_account_health(&account);
+        let loaded = store.get_account(&account.id).expect("account");
+        assert!(loaded.scope_cooling.is_empty(), "clearing must persist");
+
+        let models = vec![crate::models::ModelInfo {
+            id: "cline/cline-pass/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: "cline-pass".into(),
+        }];
+        store.set_catalog(crate::models::BackendId::Cline, &models);
+        let catalog = store.catalog(crate::models::BackendId::Cline);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].scope, "cline-pass");
+    }
+
+    /// A catalog table created before `scope` existed must gain the column with an account-wide
+    /// default, so pre-fork rows keep their routing behavior.
+    #[test]
+    fn opening_a_legacy_store_adds_the_catalog_scope_column() {
+        let path = std::env::temp_dir().join(format!("underclass-legacy-catalog-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE catalog (
+                    backend TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    context INTEGER NOT NULL DEFAULT 0,
+                    input INTEGER NOT NULL DEFAULT 0,
+                    output INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (backend, model_id)
+                );
+                INSERT INTO catalog (backend, model_id, name) VALUES ('codex', 'gpt-5.5', 'GPT-5.5');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let catalog = store.catalog(crate::models::BackendId::Codex);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].scope, "", "legacy rows stay account-wide");
         let _ = std::fs::remove_file(&path);
     }
 

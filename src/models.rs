@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +65,10 @@ pub struct Account {
     pub status: AccountStatus,
     #[serde(default)]
     pub reset_at: i64,
+    /// Deadline per quota `scope` (for example a Cline billing surface). An entry blocks only the
+    /// models carrying that scope; `status`/`reset_at` still block the whole account.
+    #[serde(default)]
+    pub scope_cooling: BTreeMap<String, i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -95,6 +100,19 @@ impl Account {
     pub fn healthy(&self) -> bool {
         self.status == AccountStatus::Healthy
     }
+
+    /// Whether this account may serve `scope` at `now`: the account itself must be healthy, and a
+    /// scope with a future deadline must not be entered. An empty/absent scope inherits the
+    /// account-wide state only.
+    pub fn healthy_for(&self, scope: Option<&str>, now: i64) -> bool {
+        self.healthy() && self.scope_cooling_until(scope).is_none_or(|until| until <= now)
+    }
+
+    /// The deadline stored for `scope`, or `None` when the scope is absent or names no surface.
+    pub fn scope_cooling_until(&self, scope: Option<&str>) -> Option<i64> {
+        let scope = scope.filter(|scope| !scope.is_empty())?;
+        self.scope_cooling.get(scope).copied()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +126,9 @@ pub struct ModelInfo {
     pub input: i64,
     #[serde(default)]
     pub output: i64,
+    /// Quota scope this model bills against. Empty means the whole account shares one quota.
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[derive(Clone, Debug)]

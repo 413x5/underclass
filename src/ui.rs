@@ -52,6 +52,21 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         .iter()
         .filter(|b| b.account_id == account.id)
         .count();
+    let now = now_ms();
+    // Remaining time is computed here, not in the browser: an operator's clock is not the server's,
+    // and an absolute deadline rendered client-side can show a live cooldown as expired.
+    let mut cooling_scopes: Vec<serde_json::Value> = account
+        .scope_cooling
+        .iter()
+        .map(|(scope, until)| {
+            json!({
+                "scope": scope,
+                "until_ms": until,
+                "remaining_ms": (until - now).max(0),
+            })
+        })
+        .collect();
+    cooling_scopes.sort_by_key(|entry| entry["remaining_ms"].as_i64().unwrap_or(0));
     json!({
         "id": account.id,
         "backend": account.backend.as_str(),
@@ -59,7 +74,8 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         "label": account.label,
         "status": account.status,
         "reset_at": account.reset_at,
-        "cooling_remaining_ms": (account.reset_at - now_ms()).max(0),
+        "cooling_remaining_ms": (account.reset_at - now).max(0),
+        "cooling_scopes": cooling_scopes,
         "inflight": inflight,
         "sticky_sessions": binding_count,
         "account_id": account.account_id,
@@ -70,6 +86,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
 }
 
 pub async fn state(State(state): State<Arc<AppState>>) -> Response {
+    let now = now_ms();
     let accounts: Vec<serde_json::Value> = state
         .store
         .list_accounts()
@@ -90,7 +107,7 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
         "accounts": accounts,
         "requests": requests,
         "catalog": catalog,
-        "now_ms": now_ms(),
+        "now_ms": now,
     }))
     .into_response()
 }
@@ -309,21 +326,35 @@ pub async fn disable_account(State(state): State<Arc<AppState>>, Path(id): Path<
 
 /// @cc [owner:ghuntley,label:pool] enable-clears-recoverable-status
 /// `enable_account` MUST return 404 for an unknown account id. For a `Disabled` or `AuthError`
-/// account it MUST set the status to `Healthy` and clear `reset_at` to 0, so an operator can
-/// recover an account that `PoolCore::select` would otherwise never return. For a `Cooling`
-/// account it MUST preserve both the `Cooling` status and its existing `reset_at` deadline, since
-/// that deadline originates from upstream quota rather than an operator action. For an already
-/// `Healthy` account it MUST leave the status `Healthy` and clear `reset_at` to 0.
+/// account it MUST set the status to `Healthy` and clear both `reset_at` and every scoped cooling
+/// deadline to 0, so an operator can recover an account that `PoolCore::select` would otherwise
+/// never return. For a `Cooling` account it MUST preserve the `Cooling` status and its existing
+/// `reset_at` deadline, since that deadline originates from upstream quota rather than an operator
+/// action, and MUST leave scoped deadlines untouched. For an already `Healthy` account it MUST
+/// leave the status `Healthy`, clear `reset_at`, and clear every scoped deadline.
+/// The read, the pool mutation, and the persistence MUST happen in one critical section, so a quota
+/// or auth transition that lands concurrently is neither lost to a stale snapshot nor resurrected by
+/// the next `sync_from_store`.
 pub async fn enable_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some(account) = state.store.get_account(&id) else {
+    let mut pool = state.pool.lock().unwrap();
+    let Some(current) = pool.account(&id).cloned() else {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     };
-    let (next, reset_at) = match account.status {
-        AccountStatus::Cooling => (AccountStatus::Cooling, account.reset_at),
-        AccountStatus::Disabled | AccountStatus::AuthError => (AccountStatus::Healthy, 0),
-        AccountStatus::Healthy => (AccountStatus::Healthy, 0),
+    let (next, reset_at, clear_scopes) = match current.status {
+        AccountStatus::Cooling => (AccountStatus::Cooling, current.reset_at, false),
+        AccountStatus::Disabled | AccountStatus::AuthError => (AccountStatus::Healthy, 0, true),
+        AccountStatus::Healthy => (AccountStatus::Healthy, 0, true),
     };
-    set_status(&state, &id, next, reset_at)
+    let mut updated = current;
+    updated.status = next;
+    updated.reset_at = reset_at;
+    if clear_scopes {
+        updated.scope_cooling.clear();
+    }
+    updated.updated_at = now_ms();
+    state.store.update_account_health(&updated);
+    pool.sync_account(updated);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn relogin_account(
@@ -433,8 +464,11 @@ fn set_status(state: &Arc<AppState>, id: &str, status: AccountStatus, reset_at: 
     if state.store.get_account(id).is_none() {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     }
+    // Keep the pool and the store in one critical section: a health write outside it can race a
+    // concurrent transition and be reloaded by `sync_from_store` as the newer state.
+    let mut pool = state.pool.lock().unwrap();
+    pool.set_status(id, status, reset_at);
     state.store.update_account_status(id, status, reset_at);
-    state.pool.lock().unwrap().set_status(id, status, reset_at);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -461,9 +495,14 @@ pub async fn put_catalog(
     let Some(backend) = BackendId::parse(&backend) else {
         return (StatusCode::NOT_FOUND, "unknown backend").into_response();
     };
-    state.store.set_catalog(backend, &body.models);
-    let ids: Vec<String> = body.models.iter().map(|m| m.id.clone()).collect();
-    state.pool.lock().unwrap().set_catalog(backend, ids);
+    let mut models = body.models;
+    if backend == BackendId::Cline {
+        // A hand-edited or older client payload may omit `scope`; an empty scope would silently
+        // return Cline to account-wide quota and reintroduce the credits-402 regression.
+        crate::cline::backfill_scopes(&mut models);
+    }
+    state.store.set_catalog(backend, &models);
+    state.pool.lock().unwrap().set_catalog(backend, &models);
     Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) })).into_response()
 }
 
@@ -513,8 +552,7 @@ pub async fn refresh_copilot_catalog(State(state): State<Arc<AppState>>) -> Resp
         match crate::copilot::fetch_catalog(&state.client, &account, &token).await {
             Ok(models) if !models.is_empty() => {
                 state.store.set_catalog(BackendId::Copilot, &models);
-                let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-                state.pool.lock().unwrap().set_catalog(BackendId::Copilot, ids);
+                state.pool.lock().unwrap().set_catalog(BackendId::Copilot, &models);
                 refreshed += 1;
             }
             Ok(_) => {}

@@ -70,6 +70,7 @@ pub fn new_account(backend: BackendId, label: String) -> Account {
         enterprise_url: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
+        scope_cooling: Default::default(),
         created_at: ts,
         updated_at: ts,
     }

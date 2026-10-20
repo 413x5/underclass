@@ -21,3 +21,6 @@ Outbound upstream requests MUST carry only proxy-injected credentials (the selec
 
 @cc [owner:ghuntley,label:cli] nix-monitor-command
 The flake's underclass package MUST put `underclass` and `utop` in `bin`; `utop` MUST invoke `underclass top` with all user arguments preserved.
+
+@cc [owner:ghuntley,label:persistence] health-write-under-pool-lock
+A write that persists an account's `status`, `reset_at`, or `scope_cooling` MUST be performed while the lock guarding the corresponding `PoolCore` is held, and MUST use the pool's current account rather than a snapshot taken outside that lock; otherwise a concurrent transition can be overwritten in the store and resurrected by `sync_from_store`.
