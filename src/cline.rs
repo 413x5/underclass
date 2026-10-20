@@ -37,6 +37,22 @@ pub fn pool_model_id(upstream: &str) -> String {
     format!("{MODEL_PREFIX}{upstream}")
 }
 
+/// The billing surface an upstream Cline model id draws from. ClinePass subscription models bill
+/// against the subscription; every other id spends credits, which are account-level.
+pub const SCOPE_CLINE_PASS: &str = "cline-pass";
+pub const SCOPE_CREDITS: &str = "credits";
+
+/// @cc [owner:ghuntley,label:pool] cline-billing-scope
+/// `quota_scope` MUST return `cline-pass` for an upstream id in the `cline-pass/` namespace and
+/// `credits` for every other id, so a `402` cools only the billing surface that reported it.
+pub fn quota_scope(upstream_id: &str) -> &'static str {
+    if upstream_id.starts_with("cline-pass/") {
+        SCOPE_CLINE_PASS
+    } else {
+        SCOPE_CREDITS
+    }
+}
+
 /// @cc [owner:ghuntley,label:pool] cline-catalog-namespaced
 /// `parse_models_response` MUST expose every upstream model ID under the `cline/` prefix, MUST skip
 /// entries with an empty id or a `:batch` suffix (batch-only pricing), and MUST preserve any
@@ -60,11 +76,29 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
             context: 0,
             input: 0,
             output: 0,
+            scope: quota_scope(id).to_string(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
     out
+}
+
+/// @cc [owner:ghuntley,label:pool] cline-catalog-scope-backfill
+/// A catalog row stored before scopes existed carries an empty scope. `backfill_scopes` MUST set the
+/// scope every current Cline model derives from its id, so an in-place upgrade routes per billing
+/// surface without waiting for the next `/models` refresh. A non-empty stored scope MUST be kept.
+pub fn backfill_scopes(models: &mut [ModelInfo]) -> bool {
+    let mut changed = false;
+    for model in models.iter_mut() {
+        if !model.scope.is_empty() {
+            continue;
+        }
+        // Every id in this catalog is namespaced by `parse_models_response`/`default_catalog`.
+        model.scope = quota_scope(upstream_model_id(&model.id)).to_string();
+        changed = true;
+    }
+    changed
 }
 
 /// @cc [owner:ghuntley,label:pool] cline-catalog-keeps-clinepass
@@ -107,6 +141,7 @@ pub fn default_catalog() -> Vec<ModelInfo> {
             context: 0,
             input: 0,
             output: 0,
+            scope: quota_scope(id).to_string(),
         })
         .collect()
 }
@@ -205,8 +240,7 @@ pub async fn refresh_catalog(
     let mut models = merge_catalog(listing);
     carry_forward_limits(&mut models, &store.catalog(BackendId::Cline));
     store.set_catalog(BackendId::Cline, &models);
-    let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
-    pool.lock().unwrap().set_catalog(BackendId::Cline, ids);
+    pool.lock().unwrap().set_catalog(BackendId::Cline, &models);
     Ok(models)
 }
 
@@ -321,10 +355,12 @@ impl Backend for ClineBackend {
     }
 
     /// @cc [owner:ghuntley,label:pool] cline-402-quota
-    /// Cline reports exhausted credits as `402 Payment Required`, which MUST cool the account for
-    /// the configured cooldown like a `429`. `403` MUST NOT mark the account auth-failed: Cline uses
-    /// it for per-resource access (for example a model outside the account's plan), and a valid key
-    /// must stay in rotation for the models it can serve.
+    /// Cline reports exhausted credits as `402 Payment Required`; `classify` MUST map it to
+    /// `QuotaExhausted` with the configured cooldown so `PoolCore::report_for` can cool the model's
+    /// billing surface rather than silently retrying a surface with no balance.
+    /// `403` MUST NOT mark the account auth-failed: Cline uses it for per-resource access (for
+    /// example a model outside the account's plan), and a valid key must stay in rotation for the
+    /// models it can serve.
     fn classify(&self, status: u16, _body: &str, headers: &HeaderMap, now_ms: i64) -> crate::models::Outcome {
         if status == 402 {
             return crate::models::Outcome::QuotaExhausted {
@@ -446,7 +482,8 @@ mod tests {
             context: 128_000,
             input: 120_000,
             output: 8_000,
-        }];
+            scope: String::new(),
+}];
         let mut fetched = parse_models_response(&json!({"data": [{"id": "openai/gpt-5.4"}]}));
         assert_eq!(fetched[0].context, 0, "the listing reports no limits");
         carry_forward_limits(&mut fetched, &stored);
@@ -464,6 +501,7 @@ mod tests {
                 context: 1,
                 input: 1,
                 output: 1,
+                scope: String::new(),
             },
             ModelInfo {
                 id: "cline/gone/model".into(),
@@ -471,6 +509,7 @@ mod tests {
                 context: 999,
                 input: 999,
                 output: 999,
+                scope: String::new(),
             },
         ];
         let mut fetched = vec![
@@ -480,6 +519,7 @@ mod tests {
                 context: 400_000,
                 input: 0,
                 output: 0,
+                scope: String::new(),
             },
             ModelInfo {
                 id: "cline/brand/new".into(),
@@ -487,6 +527,7 @@ mod tests {
                 context: 0,
                 input: 0,
                 output: 0,
+                scope: String::new(),
             },
         ];
         carry_forward_limits(&mut fetched, &stored);
@@ -501,6 +542,67 @@ mod tests {
         let merged = merge_catalog(fetched);
         assert!(merged.iter().any(|model| model.id == "cline/openai/gpt-5.4"));
         assert!(merged.iter().any(|model| model.id == "cline/cline-pass/kimi-k3"));
+    }
+
+    #[test]
+    fn legacy_rows_gain_scopes_without_losing_existing_ones() {
+        // An in-place upgrade leaves pre-scope rows with `scope: ""`, which would keep a credits
+        // 402 cooling the whole account until the next `/models` refresh.
+        let mut stored = vec![
+            ModelInfo {
+                id: "cline/anthropic/claude-sonnet-4-6".into(),
+                name: "Claude".into(),
+                context: 128_000,
+                input: 120_000,
+                output: 8_000,
+                scope: String::new(),
+            },
+            ModelInfo {
+                id: "cline/cline-pass/kimi-k3".into(),
+                name: "Kimi K3".into(),
+                context: 0,
+                input: 0,
+                output: 0,
+                scope: String::new(),
+            },
+        ];
+        assert!(backfill_scopes(&mut stored));
+        assert_eq!(stored[0].scope, SCOPE_CREDITS);
+        assert_eq!(stored[1].scope, SCOPE_CLINE_PASS);
+        assert_eq!(stored[0].context, 128_000, "operator limits survive the backfill");
+        assert!(!backfill_scopes(&mut stored), "an already-scoped catalog is a no-op");
+
+        stored[0].scope = "operator-surface".into();
+        assert!(!backfill_scopes(&mut stored), "an explicit scope is never overwritten");
+        assert_eq!(stored[0].scope, "operator-surface");
+    }
+
+    #[test]
+    fn every_catalog_entry_carries_a_billing_scope() {
+        assert_eq!(quota_scope("cline-pass/kimi-k3"), SCOPE_CLINE_PASS);
+        assert_eq!(quota_scope("anthropic/claude-sonnet-4-6"), SCOPE_CREDITS);
+        // A pass-looking id must be classified by its namespace, not by a substring.
+        assert_eq!(quota_scope("openai/cline-pass/not-a-pass"), SCOPE_CREDITS);
+
+        let fetched = parse_models_response(&json!({"data": [
+            {"id": "anthropic/claude-sonnet-4-6"},
+            {"id": "cline-pass/kimi-k3"}
+        ]}));
+        let merged = merge_catalog(fetched);
+        for model in &merged {
+            let upstream = upstream_model_id(&model.id);
+            assert_eq!(
+                model.scope,
+                quota_scope(upstream),
+                "{} must bill against its own surface",
+                model.id
+            );
+        }
+        let pass = merged
+            .iter()
+            .find(|m| m.id == "cline/cline-pass/kimi-k3")
+            .expect("pass model present");
+        assert_eq!(pass.scope, SCOPE_CLINE_PASS);
     }
 
     #[test]

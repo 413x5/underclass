@@ -382,6 +382,7 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
             context: *context,
             input: *input,
             output: *output,
+            scope: String::new(),
         })
         .collect()
 }

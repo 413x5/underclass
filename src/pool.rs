@@ -1,4 +1,4 @@
-use crate::models::{Account, AccountStatus, BackendId, Binding, Outcome};
+use crate::models::{Account, AccountStatus, BackendId, Binding, ModelInfo, Outcome};
 use crate::store::Store;
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,15 @@ pub struct Selection {
     pub decision: Decision,
 }
 
+/// What `PoolCore::report_for` changed, so callers can persist and log it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HealthTransition {
+    /// The account-wide `status`/`reset_at` pair changed.
+    Account(AccountStatus),
+    /// Only the `scope` named here entered cooling.
+    Scope(String),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SelectError {
     #[error("all eligible accounts are cooling until {until_ms}")]
@@ -39,7 +48,7 @@ pub struct AccountState {
 pub struct PoolCore {
     pub accounts: HashMap<String, AccountState>,
     bindings: LruCache<String, (String, i64)>,
-    catalog: HashMap<BackendId, HashSet<String>>,
+    catalog: HashMap<BackendId, HashMap<String, String>>,
     unknown_model_backend: BackendId,
 }
 
@@ -58,20 +67,54 @@ impl PoolCore {
             core.bindings.put(b.cache_key, (b.account_id, b.bound_at));
         }
         for backend in BackendId::all() {
-            let ids: HashSet<String> = store.catalog(backend).into_iter().map(|m| m.id).collect();
-            core.catalog.insert(backend, ids);
+            core.set_catalog(backend, &store.catalog(backend));
         }
         core
     }
 
-    pub fn set_catalog(&mut self, backend: BackendId, models: Vec<String>) {
-        self.catalog.insert(backend, models.into_iter().collect());
+    pub fn set_catalog(&mut self, backend: BackendId, models: &[ModelInfo]) {
+        let models = models
+            .iter()
+            .map(|model| (model.id.clone(), model.scope.clone()))
+            .collect();
+        self.catalog.insert(backend, models);
     }
 
     pub fn serves(&self, backend: BackendId, model: &str) -> bool {
         self.catalog
             .get(&backend)
-            .is_some_and(|set| set.contains(model))
+            .is_some_and(|set| set.contains_key(model))
+    }
+
+    /// The scope `backend`'s catalog stores for `model`: `Some(None)` when the backend lists the
+    /// model account-wide, `Some(Some(scope))` when it names a surface, and `None` when the backend
+    /// does not list the model at all. The distinction matters: an explicit empty scope is an
+    /// account-wide quota, not a missing entry.
+    fn declared_scope(&self, backend: BackendId, model: &str) -> Option<Option<String>> {
+        self.catalog
+            .get(&backend)
+            .and_then(|models| models.get(model))
+            .map(|scope| Some(scope.clone()).filter(|scope| !scope.is_empty()))
+    }
+
+    /// The scope a model bills against *for this account*: the reporting backend's declaration is
+    /// authoritative, so a backend that lists the model account-wide never inherits another
+    /// backend's surface. Only a backend that does not list the model falls back to the routing
+    /// view.
+    fn scope_for_account(&self, account_id: &str, model: &str) -> Option<String> {
+        self.account(account_id)
+            .and_then(|account| self.declared_scope(account.backend, model))
+            .unwrap_or_else(|| self.model_scope(model))
+    }
+
+    /// The quota scope `model` bills against for selection, or `None` for account-wide quota. The
+    /// first eligible backend that lists the id decides, so an account-wide declaration wins over a
+    /// later backend's surface.
+    fn model_scope(&self, model: &str) -> Option<String> {
+        self.eligible_backends(model)
+            .into_iter()
+            .find_map(|backend| self.declared_scope(backend, model))
+            .flatten()
     }
 
     fn eligible_backends(&self, model: &str) -> Vec<BackendId> {
@@ -86,15 +129,31 @@ impl PoolCore {
     }
 
     /// @cc [owner:ghuntley,label:pool] sweep-readmits-expired-cooling
-    /// `sweep(now)` MUST return every account whose `Cooling` state has `reset_at <= now` back to
-    /// `Healthy` (eligible for selection again), and MUST evict sticky bindings older than
-    /// `BINDING_TTL_MS`. It MUST NOT touch Cooling accounts whose reset has not passed.
+    /// `sweep(now)` MUST return every account that became selectable again - whose account-wide
+    /// `Cooling` deadline, or any of whose scoped deadlines, has passed - and MUST clear exactly the
+    /// expired deadlines it readmits. It MUST evict sticky bindings older than `BINDING_TTL_MS` and
+    /// MUST NOT clear a deadline that has not passed.
     pub fn sweep(&mut self, now: i64) -> Vec<String> {
         let mut readmitted = Vec::new();
         for state in self.accounts.values_mut() {
+            let mut changed = false;
             if state.account.status == AccountStatus::Cooling && state.account.reset_at <= now {
                 state.account.status = AccountStatus::Healthy;
                 state.account.reset_at = 0;
+                changed = true;
+            }
+            let expired: Vec<String> = state
+                .account
+                .scope_cooling
+                .iter()
+                .filter(|(_, until)| **until <= now)
+                .map(|(scope, _)| scope.clone())
+                .collect();
+            for scope in expired {
+                state.account.scope_cooling.remove(&scope);
+                changed = true;
+            }
+            if changed {
                 readmitted.push(state.account.id.clone());
             }
         }
@@ -115,22 +174,29 @@ impl PoolCore {
 
     /// @cc [owner:ghuntley,label:pool] select-sticky-healthy-never-unhealthy
     /// Selection MUST return, in priority order: (1) the account bound to the sticky key when it
-    /// is Healthy and serves the model (decision `StickyHit`); (2) on rebinding, a Healthy account
-    /// of the bound account's backend when one exists, else any Healthy eligible account; (3) for
-    /// sticky misses, the least-in-flight Healthy eligible account. It MUST NOT ever return an
-    /// account that is Cooling, AuthError, or Disabled. When no eligible Healthy account exists it
-    /// MUST fail with `Saturated { until_ms = min reset_at over eligible cooling accounts }` or,
-    /// if none are cooling, `NoAccounts`. Requests without a sticky key MUST NOT create bindings.
+    /// is Healthy, not cooling for the model's quota scope, and serves the model (decision
+    /// `StickyHit`); (2) on rebinding, an equally eligible account of the bound account's backend
+    /// when one exists, else any eligible account; (3) for sticky misses, the least-in-flight
+    /// eligible account. It MUST NOT ever return an account that is Cooling, AuthError, Disabled,
+    /// or cooling for the requested model's scope. When no eligible account exists it MUST fail
+    /// with `Saturated { until_ms = earliest deadline over eligible cooling accounts and scopes }`
+    /// or, if none are cooling, `NoAccounts`. Requests without a sticky key MUST NOT create
+    /// bindings.
     pub fn select(&mut self, now: i64, sticky: Option<&str>, model: &str) -> Result<Selection, SelectError> {
         self.sweep(now);
         let backends: HashSet<BackendId> = self.eligible_backends(model).into_iter().collect();
+        let scope = self.model_scope(model);
+        let scope = scope.as_deref();
 
         let find_healthy = |core: &Self, backend_filter: Option<BackendId>| -> Option<String> {
             let mut candidates: Vec<(u32, &String)> = core
                 .accounts
                 .iter()
                 .filter(|(_, s)| {
-                    s.account.healthy()
+                    let account_scope = core
+                        .declared_scope(s.account.backend, model)
+                        .unwrap_or_else(|| scope.map(str::to_string));
+                    s.account.healthy_for(account_scope.as_deref(), now)
                         && backends.contains(&s.account.backend)
                         && backend_filter.is_none_or(|b| s.account.backend == b)
                 })
@@ -145,7 +211,12 @@ impl PoolCore {
             if let Some((bound_id, bound_at)) = bound {
                 if now - bound_at <= BINDING_TTL_MS {
                     if let Some(state) = self.accounts.get(&bound_id) {
-                        if state.account.healthy() && backends.contains(&state.account.backend) {
+                        let account_scope = self
+                            .declared_scope(state.account.backend, model)
+                            .unwrap_or_else(|| scope.map(str::to_string));
+                        if state.account.healthy_for(account_scope.as_deref(), now)
+                            && backends.contains(&state.account.backend)
+                        {
                             return Ok(Selection {
                                 account_id: bound_id.clone(),
                                 backend: state.account.backend,
@@ -178,17 +249,52 @@ impl PoolCore {
             return Ok(Selection { account_id: next, backend, decision });
         }
 
-        match self.min_reset(|a| backends.contains(&a.backend), now) {
+        match self.min_reset(|a| backends.contains(&a.backend), model, scope, now) {
             Some(until_ms) => Err(SelectError::Saturated { until_ms }),
             None => Err(SelectError::NoAccounts),
         }
     }
 
-    fn min_reset(&self, eligible: impl Fn(&Account) -> bool, _now: i64) -> Option<i64> {
+    /// @cc [owner:ghuntley,label:pool] saturation-deadline-is-reachable
+    /// `min_reset` MUST only report deadlines from accounts selection could actually return once the
+    /// deadline passes: `Healthy` accounts with a scoped deadline, and `Cooling` accounts (account
+    /// wide or scoped). A `Disabled` or `AuthError` account MUST NOT contribute a scope deadline,
+    /// because the proxy advertises that value as `Retry-After` and the account would not serve at
+    /// that time. For an account with both an account-wide and a scoped deadline, it MUST contribute
+    /// the later of the two, since the account serves only after both have passed.
+    fn min_reset(
+        &self,
+        eligible: impl Fn(&Account) -> bool,
+        model: &str,
+        scope: Option<&str>,
+        now: i64,
+    ) -> Option<i64> {
         self.accounts
             .values()
-            .filter(|s| s.account.status == AccountStatus::Cooling && eligible(&s.account))
-            .map(|s| s.account.reset_at)
+            .filter(|s| eligible(&s.account))
+            .filter(|s| {
+                matches!(
+                    s.account.status,
+                    AccountStatus::Healthy | AccountStatus::Cooling
+                )
+            })
+            .filter_map(|s| {
+                let account_wide =
+                    (s.account.status == AccountStatus::Cooling).then_some(s.account.reset_at);
+                let account_scope = self
+                    .declared_scope(s.account.backend, model)
+                    .unwrap_or_default();
+                let scoped: Option<i64> = s
+                    .account
+                    .scope_cooling_until(account_scope.as_deref().or(scope))
+                    .filter(|until| *until > now);
+                // One account serves only once *every* applicable deadline has passed, so the
+                // advertised retry time is the later of its account-wide and scoped deadlines.
+                match (account_wide, scoped) {
+                    (Some(wide), Some(scoped)) => Some(wide.max(scoped)),
+                    (wide, scoped) => wide.or(scoped),
+                }
+            })
             .min()
     }
 
@@ -229,7 +335,8 @@ impl PoolCore {
     /// @cc [owner:ghuntley,label:pool] report-quota-transitions
     /// `report` MUST transition the account to `Cooling { reset_at = until_ms }` on
     /// `Outcome::QuotaExhausted` and to `AuthError` on `Outcome::AuthFailed`, and MUST NOT change
-    /// the account's status on `Outcome::Ok` or `Outcome::Transient`.
+    /// the account's status on `Outcome::Ok` or `Outcome::Transient`. It is the account-wide entry
+    /// point: it MUST NOT create a scoped deadline.
     pub fn report(&mut self, account_id: &str, outcome: Outcome) -> Option<AccountStatus> {
         let state = self.accounts.get_mut(account_id)?;
         let new_status = match outcome {
@@ -244,6 +351,48 @@ impl PoolCore {
         } else {
             None
         }
+    }
+
+    /// @cc [owner:ghuntley,label:pool] report-for-model-scopes-quota
+    /// `report_for` MUST cool only the requested model's quota scope - recording
+    /// `scope_cooling[scope] = until_ms` - when that model has a non-empty scope for the reporting
+    /// account's backend and the outcome is `QuotaExhausted`, and MUST leave the account-wide
+    /// `status`/`reset_at` untouched so another scope of the same account stays selectable. For a
+    /// model without a scope, and for every non-quota outcome, it MUST delegate to the account-wide
+    /// rules of `report`. When a scoped deadline is already later than `until_ms`, the later
+    /// deadline MUST be kept.
+    pub fn report_for(
+        &mut self,
+        account_id: &str,
+        model: &str,
+        outcome: Outcome,
+    ) -> Option<HealthTransition> {
+        let scope = match &outcome {
+            Outcome::QuotaExhausted { .. } => self.scope_for_account(account_id, model),
+            _ => None,
+        };
+        if let Some(scope) = scope {
+            let Outcome::QuotaExhausted { until_ms } = outcome else {
+                unreachable!("scope is only resolved for quota outcomes");
+            };
+            let state = self.accounts.get_mut(account_id)?;
+            let deadline = state
+                .account
+                .scope_cooling
+                .get(&scope)
+                .copied()
+                .map_or(until_ms, |current| current.max(until_ms));
+            state.account.scope_cooling.insert(scope.clone(), deadline);
+            return Some(HealthTransition::Scope(scope));
+        }
+        self.report(account_id, outcome).map(HealthTransition::Account)
+    }
+
+    /// The scope deadline currently stored for `account_id`, if any.
+    pub fn scope_reset(&self, account_id: &str, scope: &str) -> Option<i64> {
+        self.accounts
+            .get(account_id)
+            .and_then(|s| s.account.scope_cooling.get(scope).copied())
     }
 
     pub fn set_status(&mut self, account_id: &str, status: AccountStatus, reset_at: i64) {
@@ -272,10 +421,15 @@ impl PoolCore {
         let now = crate::models::now_ms();
         for account in store.list_accounts() {
             let mut account = account;
-            if account.status == AccountStatus::Cooling && account.reset_at <= now {
+            let was_cooling = account.status == AccountStatus::Cooling && account.reset_at <= now;
+            let scopes_before = account.scope_cooling.len();
+            if was_cooling {
                 account.status = AccountStatus::Healthy;
                 account.reset_at = 0;
-                store.update_account_status(&account.id, AccountStatus::Healthy, 0);
+            }
+            account.scope_cooling.retain(|_, until| *until > now);
+            if was_cooling || account.scope_cooling.len() != scopes_before {
+                store.update_account_health(&account);
             }
             self.sync_account(account);
         }
@@ -328,6 +482,7 @@ mod tests {
             enterprise_url: None,
             status: AccountStatus::Healthy,
             reset_at: 0,
+            scope_cooling: Default::default(),
             created_at: 0,
             updated_at: 0,
         }
@@ -337,12 +492,26 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let mut core = PoolCore::new(&store);
         for (backend, models, ids) in backends {
-            core.set_catalog(*backend, models.iter().map(|s| s.to_string()).collect());
+            core.set_catalog(*backend, &catalog(models));
             for id in *ids {
                 core.insert_account(account(id, *backend));
             }
         }
         core
+    }
+
+    fn catalog(models: &[&str]) -> Vec<ModelInfo> {
+        models
+            .iter()
+            .map(|id| ModelInfo {
+                id: (*id).to_string(),
+                name: (*id).to_string(),
+                context: 0,
+                input: 0,
+                output: 0,
+                scope: String::new(),
+            })
+            .collect()
     }
 
     #[test]
@@ -457,5 +626,216 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].account_id, "a");
         assert_eq!(bindings[0].cache_key, "k");
+    }
+
+    fn cline_core() -> PoolCore {
+        let mut core = core_with(&[(
+            BackendId::Cline,
+            &["cline/anthropic/claude-sonnet-4-6", "cline/cline-pass/kimi-k3"],
+            &["a"],
+        )]);
+        core.set_catalog(
+            BackendId::Cline,
+            &[
+                ModelInfo {
+                    scope: "credits".into(),
+                    ..catalog(&["cline/anthropic/claude-sonnet-4-6"])[0].clone()
+                },
+                ModelInfo {
+                    scope: "cline-pass".into(),
+                    ..catalog(&["cline/cline-pass/kimi-k3"])[0].clone()
+                },
+            ],
+        );
+        core
+    }
+
+    #[test]
+    fn credits_cooling_leaves_the_other_surface_selectable() {
+        let mut core = cline_core();
+        let transition = core
+            .report_for(
+                "a",
+                "cline/anthropic/claude-sonnet-4-6",
+                Outcome::QuotaExhausted { until_ms: 10_000 },
+            )
+            .expect("reported");
+        assert_eq!(transition, HealthTransition::Scope("credits".into()));
+        assert!(
+            core.accounts["a"].account.healthy(),
+            "a scoped quota must not cool the whole account"
+        );
+
+        assert!(matches!(
+            core.select(1, Some("k"), "cline/anthropic/claude-sonnet-4-6"),
+            Err(SelectError::Saturated { until_ms: 10_000 })
+        ));
+        let pass = core.select(1, Some("k"), "cline/cline-pass/kimi-k3").unwrap();
+        assert_eq!(pass.account_id, "a", "the pass surface must still be tried");
+    }
+
+    #[test]
+    fn account_wide_cooling_blocks_every_surface() {
+        let mut core = cline_core();
+        core.report("a", Outcome::QuotaExhausted { until_ms: 10_000 });
+        for model in ["cline/anthropic/claude-sonnet-4-6", "cline/cline-pass/kimi-k3"] {
+            assert!(matches!(
+                core.select(1, None, model),
+                Err(SelectError::Saturated { until_ms: 10_000 })
+            ));
+        }
+    }
+
+    #[test]
+    fn auth_failure_is_never_scoped() {
+        let mut core = cline_core();
+        let transition = core
+            .report_for("a", "cline/cline-pass/kimi-k3", Outcome::AuthFailed)
+            .expect("reported");
+        assert_eq!(
+            transition,
+            HealthTransition::Account(AccountStatus::AuthError)
+        );
+        assert!(core.accounts["a"].account.scope_cooling.is_empty());
+        assert!(core.select(1, None, "cline/anthropic/claude-sonnet-4-6").is_err());
+    }
+
+    #[test]
+    fn scoped_deadlines_are_pruned_when_they_pass() {
+        let mut core = cline_core();
+        core.report_for(
+            "a",
+            "cline/cline-pass/kimi-k3",
+            Outcome::QuotaExhausted { until_ms: 500 },
+        );
+        assert_eq!(core.scope_reset("a", "cline-pass"), Some(500));
+        assert!(core.sweep(500).contains(&"a".to_string()));
+        assert_eq!(core.scope_reset("a", "cline-pass"), None);
+        assert!(core.select(500, None, "cline/cline-pass/kimi-k3").is_ok());
+    }
+
+    #[test]
+    fn an_account_wide_declaration_never_inherits_another_backends_scope() {
+        // A cross-listed id: Codex lists it account-wide, Cline names a surface for it. A Codex 429
+        // must cool the whole Codex account, not a foreign `credits` surface.
+        let mut core = core_with(&[
+            (BackendId::Codex, &["gpt-5.5"], &["a"]),
+            (BackendId::Cline, &["gpt-5.5"], &["c"]),
+        ]);
+        core.set_catalog(
+            BackendId::Cline,
+            &[ModelInfo {
+                scope: "credits".into(),
+                ..catalog(&["gpt-5.5"])[0].clone()
+            }],
+        );
+
+        let transition = core
+            .report_for("a", "gpt-5.5", Outcome::QuotaExhausted { until_ms: 5_000 })
+            .expect("reported");
+        assert_eq!(
+            transition,
+            HealthTransition::Account(AccountStatus::Cooling),
+            "an account whose backend declares the model account-wide must cool account-wide"
+        );
+        assert!(
+            core.accounts["a"].account.scope_cooling.is_empty(),
+            "the foreign surface must not be recorded: {:?}",
+            core.accounts["a"].account.scope_cooling
+        );
+
+        // The Cline account's own declaration is still authoritative for its own 429.
+        let transition = core
+            .report_for("c", "gpt-5.5", Outcome::QuotaExhausted { until_ms: 5_000 })
+            .expect("reported");
+        assert_eq!(transition, HealthTransition::Scope("credits".into()));
+    }
+
+    #[test]
+    fn disabled_accounts_do_not_advertise_a_saturation_deadline() {
+        // The advertised `Retry-After` must be a time at which some account can actually serve.
+        let mut core = cline_core();
+        core.report_for(
+            "a",
+            "cline/cline-pass/kimi-k3",
+            Outcome::QuotaExhausted { until_ms: 9_000 },
+        );
+        core.set_status("a", AccountStatus::Disabled, 0);
+        assert!(matches!(
+            core.select(1, None, "cline/cline-pass/kimi-k3"),
+            Err(SelectError::NoAccounts)
+        ));
+
+        // The same account cooling (not disabled) does advertise the deadline.
+        core.set_status("a", AccountStatus::Healthy, 0);
+        assert!(matches!(
+            core.select(1, None, "cline/cline-pass/kimi-k3"),
+            Err(SelectError::Saturated { until_ms: 9_000 })
+        ));
+    }
+
+    #[test]
+    fn saturation_waits_for_both_the_account_and_scope_deadlines() {
+        // The advertised retry time must be a time the account can actually serve.
+        let mut core = cline_core();
+        core.report_for(
+            "a",
+            "cline/anthropic/claude-sonnet-4-6",
+            Outcome::QuotaExhausted { until_ms: 7_000 },
+        );
+        core.report("a", Outcome::QuotaExhausted { until_ms: 5_000 });
+        match core.select(1, None, "cline/anthropic/claude-sonnet-4-6") {
+            Err(SelectError::Saturated { until_ms }) => assert_eq!(
+                until_ms, 7_000,
+                "the account is still scope-cooled after its account-wide deadline"
+            ),
+            other => panic!("expected saturated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn later_scoped_deadline_wins() {
+        let mut core = cline_core();
+        for until in [9_000, 5_000] {
+            core.report_for(
+                "a",
+                "cline/anthropic/claude-sonnet-4-6",
+                Outcome::QuotaExhausted { until_ms: until },
+            );
+        }
+        assert_eq!(core.scope_reset("a", "credits"), Some(9_000));
+    }
+
+    #[test]
+    fn scoped_cooling_rebinds_sticky_sessions_to_another_surface() {
+        let mut core = core_with(&[(
+            BackendId::Cline,
+            &["cline/anthropic/claude-sonnet-4-6", "cline/cline-pass/kimi-k3"],
+            &["a"],
+        )]);
+        core.set_catalog(
+            BackendId::Cline,
+            &[
+                ModelInfo {
+                    scope: "credits".into(),
+                    ..catalog(&["cline/anthropic/claude-sonnet-4-6"])[0].clone()
+                },
+                ModelInfo {
+                    scope: "cline-pass".into(),
+                    ..catalog(&["cline/cline-pass/kimi-k3"])[0].clone()
+                },
+            ],
+        );
+        let first = core.select(0, Some("k"), "cline/anthropic/claude-sonnet-4-6").unwrap();
+        core.report_for(
+            &first.account_id,
+            "cline/anthropic/claude-sonnet-4-6",
+            Outcome::QuotaExhausted { until_ms: 1_000 },
+        );
+        // The same sticky key must not keep the credits-only session pinned to a cooling surface;
+        // the pass surface is a different model, so a fresh selection hits the account again.
+        let second = core.select(1, Some("k"), "cline/cline-pass/kimi-k3").unwrap();
+        assert_eq!(second.account_id, "a");
+        assert_eq!(second.decision, Decision::StickyHit);
     }
 }

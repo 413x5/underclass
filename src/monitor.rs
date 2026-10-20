@@ -21,6 +21,9 @@ pub struct MonitorAccount {
     pub plan: Option<String>,
     pub status: AccountStatus,
     pub reset_at: i64,
+    /// Per-billing-surface quota deadlines, so a partially cooled account is not shown as healthy.
+    #[serde(default)]
+    pub cooling_scopes: std::collections::BTreeMap<String, i64>,
     pub inflight: u32,
     pub sticky_sessions: usize,
     pub month: Counters,
@@ -129,6 +132,7 @@ fn collect(state: &AppState) -> rusqlite::Result<MonitorSnapshot> {
                     plan: account.chatgpt_plan(),
                     status: account.status,
                     reset_at: account.reset_at,
+                    cooling_scopes: account.scope_cooling.clone(),
                     inflight: item.inflight,
                     sticky_sessions: bindings.get(&account.id).copied().unwrap_or(0),
                     month: by_account.get(&account.id).cloned().unwrap_or_default(),

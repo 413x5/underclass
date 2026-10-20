@@ -387,6 +387,15 @@ mod monitor_socket_tests {
 fn seed_catalog(store: &store::Store, backend: models::BackendId, defaults: Vec<models::ModelInfo>) {
     if store.catalog(backend).is_empty() {
         store.set_catalog(backend, &defaults);
+        return;
+    }
+    if backend == models::BackendId::Cline {
+        // A catalog written before Cline scopes existed has empty scopes, which would keep a
+        // credits `402` cooling the whole account until the next successful `/models` refresh.
+        let mut catalog = store.catalog(backend);
+        if underclass::cline::backfill_scopes(&mut catalog) {
+            store.set_catalog(backend, &catalog);
+        }
     }
 }
 
@@ -404,8 +413,7 @@ async fn refresh_copilot_catalogs_on_boot(state: &Arc<proxy::AppState>) {
         if let Ok(catalog) = copilot::fetch_catalog(&state.client, &account, &token).await {
             if !catalog.is_empty() {
                 state.store.set_catalog(models::BackendId::Copilot, &catalog);
-                let ids: Vec<String> = catalog.iter().map(|m| m.id.clone()).collect();
-                state.pool.lock().unwrap().set_catalog(models::BackendId::Copilot, ids);
+                state.pool.lock().unwrap().set_catalog(models::BackendId::Copilot, &catalog);
             }
         }
     }

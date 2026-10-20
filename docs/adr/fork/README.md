@@ -27,6 +27,10 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 - [Cline Backend with Responses Translation](cline-backend-responses-translation.md) — third
   backend (API-key onboarding, `cline/` model namespace, ClinePass subscription models) plus
   Responses-to-Chat-Completions translation for Chat-Completions-only upstreams.
+- [Per-Surface Quota Cooling](per-surface-quota-cooling.md) — catalog-declared quota scopes so a
+  `402` on Cline credits does not remove the ClinePass subscription from rotation. It supersedes
+  the account-wide `402` cooldown in [Cline Backend with Responses Translation](cline-backend-responses-translation.md),
+  whose record is left as accepted and unedited.
 - [Prompt Cache Scope Across Subscriptions](prompt-cache-scope-across-subscriptions.md) — measured
   finding that Cline's prompt cache is shared across API keys, so cross-subscription reuse already
   happens and no derived sticky key is needed.

@@ -300,10 +300,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(header, sections[0]);
     if let Some(snapshot) = &app.snapshot {
         let inflight: u32 = snapshot.accounts.iter().map(|a| a.inflight).sum();
+        // A partially cooled account is not fully available, so it must not inflate HEALTHY.
         let healthy = snapshot
             .accounts
             .iter()
-            .filter(|a| a.status == AccountStatus::Healthy)
+            .filter(|a| {
+                a.status == AccountStatus::Healthy
+                    && a.cooling_scopes.values().all(|until| *until <= snapshot.now_ms)
+            })
             .count();
         let summary = vec![
             Line::from(vec![
@@ -409,7 +413,10 @@ fn draw_accounts(
         .enumerate()
         .map(|(index, account)| {
             let status = match account.status {
-                AccountStatus::Healthy => "healthy".to_string(),
+                AccountStatus::Healthy => match scoped_status(account, snapshot.now_ms) {
+                    Some(scoped) => scoped,
+                    None => "healthy".to_string(),
+                },
                 AccountStatus::Cooling => {
                     format!("cooling {}", time_until(account.reset_at, snapshot.now_ms))
                 }
@@ -420,7 +427,7 @@ fn draw_accounts(
                 vec![
                     Cell::from(display_text(&account.label)),
                     Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
-                    Cell::from(status).style(Style::default().fg(status_color(account.status))),
+                    Cell::from(status).style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
                         .style(Style::default().fg(PURPLE)),
@@ -432,7 +439,7 @@ fn draw_accounts(
                     Cell::from(display_text(&account.label)),
                     Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
                     Cell::from(account.backend.as_str()),
-                    Cell::from(status).style(Style::default().fg(status_color(account.status))),
+                    Cell::from(status).style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
                         .style(Style::default().fg(PURPLE)),
@@ -716,6 +723,13 @@ fn quota_color(account: &MonitorAccount, now_ms: i64) -> Color {
     }
 }
 
+fn row_status_color(account: &MonitorAccount, now: i64) -> Color {
+    match account.status {
+        AccountStatus::Healthy if scoped_status(account, now).is_some() => YELLOW,
+        status => status_color(status),
+    }
+}
+
 fn status_color(status: AccountStatus) -> Color {
     match status {
         AccountStatus::Healthy => GREEN,
@@ -723,6 +737,25 @@ fn status_color(status: AccountStatus) -> Color {
         AccountStatus::AuthError => RED,
         AccountStatus::Disabled => MUTED,
     }
+}
+
+/// A healthy account can still have surfaces cooling; showing `healthy` alone would repeat the
+/// bug this exists to fix. The earliest live deadline leads and the rest are counted.
+fn scoped_status(account: &MonitorAccount, now: i64) -> Option<String> {
+    let mut live: Vec<(&String, i64)> = account
+        .cooling_scopes
+        .iter()
+        .filter(|(_, until)| **until > now)
+        .map(|(scope, until)| (scope, *until))
+        .collect();
+    live.sort_by_key(|(_, until)| *until);
+    let (first_scope, first_until) = live.first()?;
+    let extra = live.len() - 1;
+    let suffix = if extra > 0 { format!(" +{extra}") } else { String::new() };
+    Some(format!(
+        "cooling {first_scope} {}{suffix}",
+        time_until(*first_until, now)
+    ))
 }
 
 fn time_until(deadline: i64, now: i64) -> String {
@@ -769,6 +802,7 @@ mod tests {
             plan: Some("plus".into()),
             status: AccountStatus::Healthy,
             reset_at: 0,
+            cooling_scopes: Default::default(),
             inflight: 0,
             sticky_sessions: 0,
             month: Counters::default(),
@@ -811,6 +845,30 @@ mod tests {
     }
 
     #[test]
+    fn partially_cooled_accounts_are_not_reported_healthy() {
+        let mut account = MonitorAccount {
+            id: "a".into(), label: "alice".into(), backend: BackendId::Cline,
+            plan: None, status: AccountStatus::Healthy, reset_at: 0,
+            cooling_scopes: Default::default(), inflight: 0, sticky_sessions: 0,
+            month: Counters::default(), quota: None,
+        };
+        assert_eq!(scoped_status(&account, 1_000), None, "nothing cooling yet");
+
+        account.cooling_scopes.insert("credits".into(), 61_000);
+        account.cooling_scopes.insert("cline-pass".into(), 121_000);
+        account.cooling_scopes.insert("expired".into(), 500);
+        assert_eq!(
+            scoped_status(&account, 1_000).as_deref(),
+            Some("cooling credits 1m +1"),
+            "the earliest live deadline leads, expired surfaces are ignored, and the rest count"
+        );
+        assert_eq!(row_status_color(&account, 1_000), YELLOW);
+
+        account.cooling_scopes.clear();
+        assert_eq!(row_status_color(&account, 1_000), GREEN);
+    }
+
+    #[test]
     fn dashboard_renders_at_standard_and_small_sizes() {
         for (width, height) in [(120, 30), (80, 24), (40, 12)] {
             let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -821,7 +879,7 @@ mod tests {
                     accounts: vec![MonitorAccount {
                         id: "account".into(), label: "test account".into(),
                         backend: BackendId::Codex, plan: Some("plus".into()),
-                        status: AccountStatus::Healthy, reset_at: 0, inflight: 0,
+                        status: AccountStatus::Healthy, reset_at: 0, cooling_scopes: Default::default(), inflight: 0,
                         sticky_sessions: 0, month: Counters::default(), quota: None,
                     }],
                     month: Counters::default(),

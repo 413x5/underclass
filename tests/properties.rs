@@ -203,6 +203,7 @@ fn account(id: &str, backend: BackendId) -> Account {
         enterprise_url: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
+        scope_cooling: Default::default(),
         created_at: 0,
         updated_at: 0,
     }
@@ -217,10 +218,21 @@ fn build(backend_spread: usize, account_count: usize) -> Built {
     let store = Store::in_memory().unwrap();
     let mut core = PoolCore::new(&store);
     let models: Vec<String> = vec!["gpt-5.5".into(), "gpt-4.1".into()];
-    core.set_catalog(BackendId::Codex, models.clone());
+    let catalog: Vec<underclass::models::ModelInfo> = models
+        .iter()
+        .map(|id| underclass::models::ModelInfo {
+            id: id.clone(),
+            name: id.clone(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: String::new(),
+        })
+        .collect();
+    core.set_catalog(BackendId::Codex, &catalog);
     if backend_spread > 1 {
-        core.set_catalog(BackendId::Copilot, models.clone());
-        core.set_catalog(BackendId::Cline, models.clone());
+        core.set_catalog(BackendId::Copilot, &catalog);
+        core.set_catalog(BackendId::Cline, &catalog);
     }
     let mut accounts = Vec::new();
     for i in 0..account_count.max(1) {
@@ -681,6 +693,7 @@ fn test_cline_catalog_always_contains_subscription_models(tc: TestCase) {
             context: 0,
             input: 0,
             output: 0,
+            scope: String::new(),
         })
         .collect();
     let merged = underclass::cline::merge_catalog(fetched);
@@ -893,4 +906,80 @@ fn test_chat_stream_finish_is_idempotent(tc: TestCase) {
         frames.extend(tail);
     }
     assert_eq!(terminal_events(&frames).len(), 1);
+}
+
+/// Scoped quota cooling is a routing predicate over injected data, so it belongs in the pure-core
+/// property suite: cooling one billing surface must never make a differently scoped model
+/// unreachable, while account-wide cooling must block every scope.
+#[hegel::test]
+fn test_scoped_cooling_only_blocks_the_reported_surface(tc: TestCase) {
+    let scopes: Vec<String> = tc.draw(gs::vecs(gs::sampled_from(vec![
+        "credits".to_string(),
+        "cline-pass".to_string(),
+    ])).min_size(4).max_size(4));
+    // A zero-length deadline is already expired, so the generator starts at 1.
+    let cooldowns: Vec<i64> = tc.draw(gs::vecs(gs::integers::<i64>().min_value(1).max_value(10_000))
+        .min_size(4).max_size(4));
+    // A short vector would truncate the zip and silently skip every assertion below.
+    let account_wide: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(4).max_size(4));
+
+    let store = Store::in_memory().unwrap();
+    let mut core = PoolCore::new(&store);
+    let catalog: Vec<underclass::models::ModelInfo> = ["credits", "cline-pass"]
+        .iter()
+        .map(|scope| underclass::models::ModelInfo {
+            id: format!("cline/model-{scope}"),
+            name: scope.to_string(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: (*scope).to_string(),
+        })
+        .collect();
+    core.set_catalog(BackendId::Cline, &catalog);
+    core.insert_account(account("acct", BackendId::Cline));
+
+    let mut now: i64 = 1;
+    // The account-wide deadline outlives the report that set it; scoped deadlines are per surface.
+    let mut account_deadline: Option<i64> = None;
+    for ((scope, cooldown), wide) in scopes.iter().zip(cooldowns.iter()).zip(account_wide.iter().cycle()) {
+        now += 1;
+        let until = now.saturating_add(*cooldown);
+        let model = format!("cline/model-{scope}");
+        let outcome = Outcome::QuotaExhausted { until_ms: until };
+        let status_before = core.account("acct").unwrap().status;
+        let account_reset_before = core.account("acct").unwrap().reset_at;
+        if *wide {
+            core.report("acct", outcome);
+            account_deadline = Some(until);
+        } else {
+            core.report_for("acct", &model, outcome);
+            let account = core.account("acct").unwrap();
+            assert_eq!(
+                account.status, status_before,
+                "a scoped quota must never change the account-wide status"
+            );
+            assert_eq!(
+                account.reset_at, account_reset_before,
+                "a scoped quota must never write the account-wide deadline"
+            );
+        }
+        for other in ["credits", "cline-pass"] {
+            let blocked_by_account = account_deadline.is_some_and(|deadline| deadline > now);
+            let blocked_by_scope = core
+                .account("acct")
+                .unwrap()
+                .scope_cooling_until(Some(other))
+                .is_some_and(|deadline| deadline > now);
+            let selected = core.select(now, None, &format!("cline/model-{other}")).is_ok();
+            assert_eq!(
+                selected,
+                !(blocked_by_account || blocked_by_scope),
+                "selection for {other} must match its own cooling state (account-wide:                  {blocked_by_account}, scoped: {blocked_by_scope})"
+            );
+            if !*wide && other == scope.as_str() {
+                assert!(!selected, "{} must be blocked after its own quota error", scope);
+            }
+        }
+    }
 }
