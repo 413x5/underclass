@@ -10,8 +10,8 @@ Account identity in logs and the request ring buffer MUST use the account label 
 @cc [owner:ghuntley,label:architecture] pure-sync-core
 `src/pool.rs` and `src/health.rs` MUST remain pure and synchronous: no tokio, no I/O, no wall-clock access — time enters as an injected `now_ms` parameter. Property tests in `tests/properties.rs` depend on this.
 
-@cc [owner:ghuntley,label:proxy] pre-first-byte-failover
-Failover across pool accounts MUST happen only before the first upstream response byte. Once a response stream has started, upstream errors MUST pass through to the client and MUST NOT be retried on another account.
+@cc [owner:ghuntley,label:proxy] pre-output-failover
+Failover across pool accounts MUST happen only before any response byte has been sent to the client. A streamed 2xx response MAY be held back until its first model-output or terminal event (bounded in time and bytes) and retried on another account only when that terminal event is a capacity failure (`is_overload_code`) with no output before it. Once any byte has been sent to the client, upstream errors MUST pass through and MUST NOT be retried on another account.
 
 @cc [owner:ghuntley,label:architecture] backend-agnostic-core
 Pool routing, health classification, and stickiness MUST NOT special-case any backend by name; all backend differences MUST live behind `provider::Backend` implementations registered in the backend map.

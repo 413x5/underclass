@@ -98,6 +98,20 @@ pub fn error_code(error: &Value) -> Option<String> {
         .and_then(sanitize_code)
 }
 
+/// @cc [owner:ghuntley,label:accounting] stream-error-event-code
+/// For a Responses stream `error` event, `stream_error_code` MUST prefer a top-level `code`, then
+/// the nested `error` object's `code`/`type`, and MUST fall back to the event's own `type` only
+/// when neither carries one, so `{"type":"error","error":{"code":"server_is_overloaded"}}` is
+/// recorded as `server_is_overloaded`, not `error`.
+fn stream_error_code(event: &Value) -> Option<String> {
+    event
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(sanitize_code)
+        .or_else(|| event.get("error").and_then(error_code))
+        .or_else(|| error_code(event))
+}
+
 /// Whether an upstream error code means the model is out of serving capacity.
 pub fn is_overload_code(code: &str) -> bool {
     let code = code.to_ascii_lowercase();
@@ -268,9 +282,7 @@ impl UsageTap {
                     self.set_terminal(StreamOutcome::Incomplete, reason);
                 }
                 Some("error") => {
-                    let code = parsed.as_ref().and_then(|v| {
-                        error_code(v).or_else(|| v.get("error").and_then(error_code))
-                    });
+                    let code = parsed.as_ref().and_then(stream_error_code);
                     self.set_terminal(StreamOutcome::Failed, code);
                 }
                 Some(kind) if kind == "response.output_item.added" || kind.ends_with(".delta") => {
@@ -317,6 +329,22 @@ impl UsageTap {
             }
         };
         StreamReport { outcome, error_code, saw_output: self.saw_output }
+    }
+
+    /// Whether the body has shown model output or reached a terminal event.
+    pub fn decided(&self) -> bool {
+        self.saw_output || self.terminal.is_some()
+    }
+
+    /// @cc [owner:ghuntley,label:proxy] overload-before-output
+    /// `overload_before_output` MUST return the sanitized code only when the first terminal event
+    /// is `failed` with a capacity code (`is_overload_code`) and no output event preceded it;
+    /// otherwise, including for policy or quota codes, it MUST return `None`.
+    pub fn overload_before_output(&self) -> Option<&str> {
+        match &self.terminal {
+            Some((StreamOutcome::Failed, Some(code))) if !self.saw_output && is_overload_code(code) => Some(code),
+            _ => None,
+        }
     }
 
     pub fn counts(&self) -> Option<TokenCounts> {
@@ -385,6 +413,39 @@ mod tests {
                 saw_output: false
             }
         );
+    }
+
+    #[test]
+    fn stream_error_event_uses_nested_code() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n");
+        assert!(!tap.decided());
+        tap.feed(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity.\"}}\n\n");
+        assert!(tap.decided());
+        assert_eq!(tap.overload_before_output(), Some("server_is_overloaded"));
+        assert_eq!(tap.report(StreamEnd::Eof).error_code.as_deref(), Some("server_is_overloaded"));
+
+        let mut flat = UsageTap::new(true, false);
+        flat.feed(b"data: {\"type\":\"error\",\"code\":\"slow_down\"}\n\n");
+        assert_eq!(flat.report(StreamEnd::Eof).error_code.as_deref(), Some("slow_down"));
+
+        let mut bare = UsageTap::new(true, false);
+        bare.feed(b"data: {\"type\":\"error\",\"message\":\"x\"}\n\n");
+        assert_eq!(bare.report(StreamEnd::Eof).error_code.as_deref(), Some("error"));
+        assert_eq!(bare.overload_before_output(), None);
+    }
+
+    #[test]
+    fn overload_after_output_or_policy_is_not_retryable() {
+        let mut tap = UsageTap::new(true, false);
+        tap.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+        assert!(tap.decided());
+        tap.feed(b"data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\"}}\n\n");
+        assert_eq!(tap.overload_before_output(), None);
+
+        let mut policy = UsageTap::new(true, false);
+        policy.feed(b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"cyber_policy\"}}}\n\n");
+        assert_eq!(policy.overload_before_output(), None);
     }
 
     #[test]

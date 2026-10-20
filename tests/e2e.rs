@@ -91,6 +91,32 @@ async fn mock_responses(
             "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
         ).into_response();
     }
+    if bearer.starts_with("tok-ovl-") && wants_stream {
+        // The shape Codex upstream sends today: a 200 stream, a pause, then a stream `error` event
+        // whose code is nested under `error`.
+        let stream = futures::stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n")), 1)),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Some((Ok(axum::body::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}\n\n")), 2))
+                }
+                _ => None,
+            }
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        ).into_response();
+    }
+    if bearer.starts_with("tok-late-ovl-") && wants_stream {
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\"}}\n\n",
+        ).into_response();
+    }
     if serde_json::from_str::<serde_json::Value>(&body).ok()
         .and_then(|value| value.get("slow_abort").and_then(|flag| flag.as_bool())) == Some(true) {
         let stream = futures::stream::unfold(0, |step| async move {
@@ -655,4 +681,95 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     let cooling = store.get_account("acct-cooling").unwrap();
     assert_eq!(cooling.status, AccountStatus::Cooling);
     assert_eq!(cooling.reset_at, deadline, "enable must preserve an upstream quota deadline");
+}
+
+async fn wait_for_rows(store: &Store, count: usize) -> Vec<underclass::store::UsageRecord> {
+    for _ in 0..100 {
+        let rows = store.usage_records(&Default::default()).unwrap();
+        if rows.len() >= count {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    store.usage_records(&Default::default()).unwrap()
+}
+
+async fn post_stream(base: &str, key: &str) -> (u16, String) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": true, "prompt_cache_key": key}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_overload_before_output_fails_over_to_another_account() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    // `fo-a` sorts first, so a new sticky key binds to the overloaded account.
+    store.upsert_account(&codex_account("fo-a", "tok-ovl-fo-a"));
+    store.upsert_account(&codex_account("fo-b", "tok-fo-b"));
+    let (base, _logs) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_stream(&base, "failover-session").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("hello from tok-fo-b"), "served by the healthy account: {body}");
+    assert!(!body.contains("server_is_overloaded"), "the discarded attempt never reaches the client");
+
+    let rows = wait_for_rows(&store, 2).await;
+    let failed = rows.iter().find(|r| r.account_id == "fo-a").expect("overloaded attempt recorded");
+    assert_eq!(failed.stream_outcome.as_deref(), Some("failed"));
+    assert_eq!(failed.error_code.as_deref(), Some("server_is_overloaded"));
+    assert_eq!(failed.saw_output, Some(false));
+    let served = rows.iter().find(|r| r.account_id == "fo-b").expect("retry recorded");
+    assert_eq!(served.request_id, failed.request_id, "one client request, two attempts");
+
+    // The session was rebound, so the next turn goes straight to the healthy account.
+    let (_, body) = post_stream(&base, "failover-session").await;
+    assert!(body.contains("hello from tok-fo-b"));
+    assert_eq!(wait_for_rows(&store, 3).await.len(), 3, "no second overloaded attempt");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_overload_on_every_account_replays_upstream_error() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("all-a", "tok-ovl-all-a"));
+    store.upsert_account(&codex_account("all-b", "tok-ovl-all-b"));
+    let (base, _logs) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_stream(&base, "doomed-session").await;
+    assert_eq!(status, 200, "the upstream status is preserved");
+    assert!(body.contains("server_is_overloaded"), "the client sees the upstream error: {body}");
+    let rows = wait_for_rows(&store, 2).await;
+    let accounts: BTreeSet<_> = rows.iter().map(|r| r.account_id.as_str()).collect();
+    assert_eq!(accounts, BTreeSet::from(["all-a", "all-b"]), "each account tried once");
+    for account in ["all-a", "all-b"] {
+        let healthy = store.list_accounts().into_iter().find(|a| a.id == account).unwrap().status;
+        assert_eq!(healthy, AccountStatus::Healthy, "an overload must not cool the account");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_overload_after_output_passes_through() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("late-a", "tok-late-ovl-late-a"));
+    store.upsert_account(&codex_account("late-b", "tok-late-b"));
+    let (base, _logs) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_stream(&base, "late-session").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("partial") && body.contains("server_is_overloaded"), "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1, "output already reached the client, so no retry");
+    assert_eq!(rows[0].saw_output, Some(true));
 }

@@ -30,7 +30,7 @@ cargo run -- stats import-codex [--dry-run]  # backfill capacity/policy errors f
 
 - **Pure sync core, async at the edges.** `pool::PoolCore` and `health` are synchronous structs with an injected clock (`now_ms` passed in). No tokio, no I/O inside the core - property tests depend on this. Async code lives in axum handlers, reqwest calls, and device-flow pollers.
 - **Backends implement the `provider::Backend` trait** (`rewrite_url`, `inject_headers`, `classify`, `default_cooldown_ms`). Adding a provider = new trait impl + registration; never special-case a backend in the proxy path. Model-catalog eligibility and the flat pool are backend-agnostic.
-- **Failover is pre-first-byte only.** Once a response stream starts, errors pass through to the client.
+- **Failover happens before any byte reaches the client.** Streams are held until their first output or terminal event. An overload before output is retried on another account (ADR 0022). Once bytes reach the client, errors pass through.
 - **Write-through persistence.** Token rotations, health transitions, new bindings, and catalog edits are persisted to SQLite immediately (ADR 0005).
 
 ## Security invariants
@@ -52,7 +52,7 @@ Use the `code-contracts` skill for every code change and code review. Follow its
 
 - Every non-trivial architectural decision gets a MADR record in `docs/adr/NNNN-title.md` (Status / Context / Decision / Consequences).
 - Superseding a decision: mark the old ADR `Superseded by NNNN`, write the new one. Never delete ADRs.
-- Index: 0001 Rust/Axum - 0002 Hegel PBT, no mutation testing - 0003 prompt-cache-key stickiness - 0004 health state machine + fail-fast - 0005 SQLite store - 0006 tracing/correlation IDs - 0007 config-driven catalog - 0008 JSONC-safe merge - 0009 device-code onboarding - 0010 unprefixed routing, flat pool - 0011 GitHub Copilot backend - 0018 recoverable credential rejection - 0019 scheduled refresh token rotation - 0020 manual Codex reset redemption - 0021 stream outcome accounting + long-range capacity statistics.
+- Index: 0001 Rust/Axum - 0002 Hegel PBT, no mutation testing - 0003 prompt-cache-key stickiness - 0004 health state machine + fail-fast - 0005 SQLite store - 0006 tracing/correlation IDs - 0007 config-driven catalog - 0008 JSONC-safe merge - 0009 device-code onboarding - 0010 unprefixed routing, flat pool - 0011 GitHub Copilot backend - 0018 recoverable credential rejection - 0019 scheduled refresh token rotation - 0020 manual Codex reset redemption - 0021 stream outcome accounting + long-range capacity statistics - 0022 failover on overload before output.
 
 ## Config files agents may edit
 

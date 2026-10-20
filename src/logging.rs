@@ -100,6 +100,20 @@ pub fn log_stream_finished(
     }
 }
 
+/// An upstream stream failed with a capacity code before any output, so the request is retried on
+/// another account instead of being passed through.
+pub fn log_overload_failover(request_id: &str, model: &str, account_id: &str, label: &str, error_code: &str, held_ms: u64) {
+    tracing::warn!(
+        request_id = %request_id,
+        model = %model,
+        account = %label,
+        account_id = %truncate(account_id),
+        error_code = %error_code,
+        held_ms = held_ms,
+        "request.overload_failover"
+    );
+}
+
 /// `until_ms` is the absolute epoch-millisecond pool reset; `retry_after_ms` is the relative wait.
 pub fn log_saturated(request_id: &str, until_ms: i64, now_ms: i64) {
     tracing::warn!(

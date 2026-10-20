@@ -122,6 +122,21 @@ impl PoolCore {
     /// MUST fail with `Saturated { until_ms = min reset_at over eligible cooling accounts }` or,
     /// if none are cooling, `NoAccounts`. Requests without a sticky key MUST NOT create bindings.
     pub fn select(&mut self, now: i64, sticky: Option<&str>, model: &str) -> Result<Selection, SelectError> {
+        self.select_excluding(now, sticky, model, &HashSet::new())
+    }
+
+    /// @cc [owner:ghuntley,label:pool] select-excluding-skips-excluded
+    /// `select_excluding` MUST behave as `select` with every account in `exclude` treated as
+    /// ineligible: it MUST NOT return an excluded account, a sticky key bound to an excluded
+    /// account MUST rebind as if that account were unhealthy, and with an empty `exclude` it MUST
+    /// be identical to `select`.
+    pub fn select_excluding(
+        &mut self,
+        now: i64,
+        sticky: Option<&str>,
+        model: &str,
+        exclude: &HashSet<String>,
+    ) -> Result<Selection, SelectError> {
         self.sweep(now);
         let backends: HashSet<BackendId> = self.eligible_backends(model).into_iter().collect();
 
@@ -129,8 +144,9 @@ impl PoolCore {
             let mut candidates: Vec<(u32, &String)> = core
                 .accounts
                 .iter()
-                .filter(|(_, s)| {
-                    s.account.healthy()
+                .filter(|(id, s)| {
+                    !exclude.contains(*id)
+                        && s.account.healthy()
                         && backends.contains(&s.account.backend)
                         && backend_filter.is_none_or(|b| s.account.backend == b)
                 })
@@ -145,7 +161,10 @@ impl PoolCore {
             if let Some((bound_id, bound_at)) = bound {
                 if now - bound_at <= BINDING_TTL_MS {
                     if let Some(state) = self.accounts.get(&bound_id) {
-                        if state.account.healthy() && backends.contains(&state.account.backend) {
+                        if state.account.healthy()
+                            && backends.contains(&state.account.backend)
+                            && !exclude.contains(&bound_id)
+                        {
                             return Ok(Selection {
                                 account_id: bound_id.clone(),
                                 backend: state.account.backend,

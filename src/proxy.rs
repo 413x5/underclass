@@ -20,6 +20,11 @@ use tower_http::request_id::RequestId;
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const LOG_BUFFER: usize = 200;
+/// How long a streamed response is held back waiting for its first output or terminal event.
+/// Upstream capacity failures before output observed in practice arrive within 60s (265 of 266).
+const PRE_OUTPUT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+/// Upper bound on bytes buffered while holding a stream before its first output.
+const PRE_OUTPUT_HOLD_BYTES: usize = 1024 * 1024;
 
 pub struct AppState {
     pub store: Arc<Store>,
@@ -49,6 +54,9 @@ struct UsageFinish {
     record: UsageRecord,
     tap: UsageTap,
     ended: Option<StreamEnd>,
+    /// Where an upstream event surfaced: `stream`, or `stream_failover` when the attempt was
+    /// discarded and retried on another account.
+    detail: &'static str,
 }
 
 impl Drop for UsageFinish {
@@ -90,7 +98,7 @@ impl Drop for UsageFinish {
             _ => false,
         };
         if notable {
-            self.store.insert_upstream_event(&event_for(&self.record, kind, "stream", report.error_code.clone()));
+            self.store.insert_upstream_event(&event_for(&self.record, kind, self.detail, report.error_code.clone()));
         }
         // Written last: once the usage row is visible, the event and annotation already exist.
         persist_usage(&self.store, &self.record);
@@ -258,12 +266,17 @@ fn attach_request_id(mut resp: Response, request_id: &str) -> Response {
 enum Attempt {
     Respond(Response),
     Failover(Option<Response>),
+    /// The stream failed with a capacity code before any output; `replay` holds what upstream
+    /// sent, for the client if no other account succeeds.
+    Overloaded { account_id: String, replay: Response },
 }
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
 /// When selection returns `Saturated`, `infer` MUST first make one automatic Codex reset attempt
 /// for a live Codex-pool outage, then select again. If no account recovers, it MUST respond with
-/// 429 and `Retry-After` equal to the seconds until `until_ms`.
+/// 429 and `Retry-After` equal to the seconds until `until_ms`. Exception: once an account has
+/// been excluded for an overload before output, a failed selection MUST return that held upstream
+/// response instead, without a reset attempt.
 pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let started = Instant::now();
     let request_id = req
@@ -322,6 +335,8 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
     let mut reset_after_quota = false;
     let mut attempts = 0;
     let mut max_attempts = total_accounts;
+    // Accounts whose stream failed with a capacity code before output, skipped for this request.
+    let mut overloaded: std::collections::HashSet<String> = Default::default();
 
     while attempts < max_attempts {
         attempts += 1;
@@ -329,14 +344,22 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
             .pool
             .lock()
             .unwrap()
-            .select(now_ms(), sticky.as_deref(), &model);
+            .select_excluding(now_ms(), sticky.as_deref(), &model, &overloaded);
+
+        if selection.is_err()
+            && !overloaded.is_empty()
+            && let Some(replay) = last_upstream.take()
+        {
+            logging::log_request_completed(&request_id, replay.status().as_u16(), started.elapsed().as_millis() as u64);
+            return attach_request_id(replay, &request_id);
+        }
 
         if matches!(selection, Err(SelectError::Saturated { .. })) && !reset_after_quota {
             reset_after_quota = true;
             // Always select again: the reset attempt can wait on the shared reset lock and on
             // usage fetches, during which cooling deadlines may pass even if nothing was redeemed.
             state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
-            selection = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
+            selection = state.pool.lock().unwrap().select_excluding(now_ms(), sticky.as_deref(), &model, &overloaded);
         }
 
         let selection = match selection {
@@ -397,6 +420,10 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
                 logging::log_request_completed(&request_id, resp.status().as_u16(), started.elapsed().as_millis() as u64);
                 return resp;
             }
+            Attempt::Overloaded { account_id, replay } => {
+                overloaded.insert(account_id);
+                last_upstream = Some(replay);
+            }
             Attempt::Failover(passthrough) => {
                 last_upstream = passthrough.or(last_upstream);
                 if attempts == max_attempts && !reset_after_quota {
@@ -430,7 +457,9 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 /// @cc [owner:ghuntley,label:proxy] failover-bounded-by-accounts
 /// A request MUST make at most as many attempts as configured accounts, plus one additional attempt
 /// after a successful banked reset, and the first successful upstream response MUST be returned
-/// to the client; upstream error bodies MUST be preserved and
+/// to the client; a 2xx stream that fails with a capacity code before any output is not successful:
+/// the account MUST be excluded for the rest of the request (without changing its health) and
+/// the next account tried. Upstream error bodies MUST be preserved and
 /// returned when every attempt fails (or a 503 `pool_exhausted` error when no upstream response
 /// was ever received). An upstream 401 or 403 MUST trigger exactly one forced token refresh and one
 /// same-account retry per request; a second 401 or 403 (or a failed refresh) MUST classify the
@@ -643,24 +672,55 @@ async fn attempt_account(
             .cloned()
             .unwrap_or(http::HeaderValue::from_static("application/json"));
         let status_code = status;
-        let stream = response.bytes_stream();
-        let finish = UsageFinish {
+        let is_stream = usage_is_stream(&outbound_body, content_type.as_bytes());
+        let mut stream = response.bytes_stream();
+        let mut finish = UsageFinish {
             store: state.store.clone(),
             logs: state.logs.clone(),
             record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
-            tap: UsageTap::new(
-                usage_is_stream(&outbound_body, content_type.as_bytes()),
-                backend.usage_is_chat(path),
-            ),
+            tap: UsageTap::new(is_stream, backend.usage_is_chat(path)),
             ended: None,
+            detail: "stream",
         };
+        let mut held: VecDeque<axum::body::Bytes> = VecDeque::new();
+        if is_stream {
+            hold_until_output(&mut stream, &mut finish, &mut held).await;
+        }
+        if let Some(code) = finish.tap.overload_before_output().map(str::to_string) {
+            logging::log_overload_failover(request_id, model, &selection.account_id, &account.label, &code, started.elapsed().as_millis() as u64);
+            push_log(state, request_id, model, Some(selection.backend.as_str().to_string()), Some(selection.account_id.clone()), Some(account.label.clone()), sticky.unwrap_or("none"), status_code.as_u16(), started.elapsed().as_millis() as u64);
+            finish.ended.get_or_insert(StreamEnd::Eof);
+            finish.detail = "stream_failover";
+            // Dropping `finish` persists the failed attempt and its `overloaded` event.
+            drop(finish);
+            drop(guard);
+            let mut replay = Response::builder()
+                .status(status_code)
+                .body(Body::from(held.into_iter().flatten().collect::<Vec<u8>>()))
+                .expect("valid replay response");
+            replay.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
+            return Attempt::Overloaded { account_id: selection.account_id.clone(), replay };
+        }
         let body_stream = Body::from_stream(futures::stream::unfold(
-            (stream, Some(guard), finish),
-            |(mut stream, guard, mut finish)| async move {
+            (stream, Some(guard), finish, held),
+            |(mut stream, guard, mut finish, mut held)| async move {
+                if let Some(chunk) = held.pop_front() {
+                    return Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish, held)));
+                }
+                if finish.ended.is_some() {
+                    // The hold already reached EOF or an upstream error; do not poll again.
+                    return match finish.ended {
+                        Some(StreamEnd::UpstreamError) if guard.is_some() => Some((
+                            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "upstream stream error")),
+                            (stream, None, finish, held),
+                        )),
+                        _ => None,
+                    };
+                }
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         finish.tap.feed(&chunk);
-                        Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish)))
+                        Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish, held)))
                     },
                     Some(Err(_)) => {
                         finish.ended.get_or_insert(StreamEnd::UpstreamError);
@@ -669,7 +729,7 @@ async fn attempt_account(
                                 std::io::ErrorKind::Interrupted,
                                 "upstream stream error",
                             )),
-                            (stream, guard, finish),
+                            (stream, None, finish, held),
                         ))
                     }
                     None => {
@@ -696,6 +756,37 @@ async fn attempt_account(
             .expect("valid stream response");
         resp.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
         Attempt::Respond(resp)
+    }
+}
+
+/// @cc [owner:ghuntley,label:proxy] pre-output-hold-bounded
+/// `hold_until_output` MUST buffer upstream chunks (fed to the tap, in order) only until the tap
+/// sees model output or a terminal event, the stream ends or errors, `PRE_OUTPUT_HOLD` elapses,
+/// or `PRE_OUTPUT_HOLD_BYTES` are buffered, whichever comes first. It MUST NOT drop or reorder a
+/// chunk, and a stream end observed while holding MUST be recorded in `finish.ended`.
+async fn hold_until_output<S>(stream: &mut S, finish: &mut UsageFinish, held: &mut VecDeque<axum::body::Bytes>)
+where
+    S: futures::Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + PRE_OUTPUT_HOLD;
+    let mut bytes = 0usize;
+    while !finish.tap.decided() && bytes < PRE_OUTPUT_HOLD_BYTES {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                finish.tap.feed(&chunk);
+                bytes += chunk.len();
+                held.push_back(chunk);
+            }
+            Ok(Some(Err(_))) => {
+                finish.ended = Some(StreamEnd::UpstreamError);
+                return;
+            }
+            Ok(None) => {
+                finish.ended = Some(StreamEnd::Eof);
+                return;
+            }
+            Err(_) => return,
+        }
     }
 }
 

@@ -361,6 +361,35 @@ fn test_selection_never_returns_unhealthy(tc: TestCase) {
 }
 
 #[hegel::test]
+fn test_selection_excluding_never_returns_excluded(tc: TestCase) {
+    let account_count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    let mut built = build(2, account_count);
+    let mask: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(account_count).max_size(account_count));
+    let sticky: bool = tc.draw(gs::booleans());
+    let key = sticky.then_some("session");
+    let first = built.core.select(1, key, "gpt-5.5").expect("all accounts healthy").account_id;
+    let exclude: std::collections::HashSet<String> = built
+        .accounts
+        .iter()
+        .zip(&mask)
+        .filter(|(_, excluded)| **excluded)
+        .map(|(id, _)| id.clone())
+        .collect();
+    match built.core.select_excluding(2, key, "gpt-5.5", &exclude) {
+        Ok(sel) => {
+            assert!(!exclude.contains(&sel.account_id), "selected excluded account");
+            if sticky && !exclude.contains(&first) {
+                assert_eq!(sel.account_id, first, "sticky binding moved off a non-excluded account");
+            }
+        }
+        Err(_) => assert_eq!(exclude.len(), built.accounts.len(), "a healthy account was left"),
+    }
+    let unfiltered = built.core.select_excluding(3, key, "gpt-5.5", &Default::default());
+    let plain = built.core.select(3, key, "gpt-5.5");
+    assert_eq!(unfiltered.map(|s| s.account_id).ok(), plain.map(|s| s.account_id).ok());
+}
+
+#[hegel::test]
 fn test_saturation_reports_minimum_reset(tc: TestCase) {
     let account_count: usize = tc.draw(gs::integers::<usize>().min_value(2).max_value(8));
     let mut built = build(1, account_count);
