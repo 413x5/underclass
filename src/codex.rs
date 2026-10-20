@@ -279,6 +279,20 @@ pub struct CodexBackend {
     pub cooldown_ms: i64,
 }
 
+/// How long an account is benched after Codex refuses a model for its ChatGPT plan.
+const UNSUPPORTED_MODEL_COOLDOWN_MS: i64 = 60 * 60 * 1000;
+
+/// True for Codex's `{"detail":"The '<model>' model is not supported when using Codex with a
+/// ChatGPT account."}` refusal.
+fn is_unsupported_model_refusal(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|detail| {
+            detail.contains("model is not supported when using Codex with a ChatGPT account")
+        })
+}
+
 impl Backend for CodexBackend {
     fn usage_is_chat(&self, _path: &str) -> bool {
         false
@@ -299,8 +313,14 @@ impl Backend for CodexBackend {
     /// A Codex usage-limit error MUST cool the account until the later valid future deadline from
     /// `error.resets_at` (epoch seconds) and Retry-After. Without either, it MUST use the configured
     /// cooldown. Overload errors MUST remain transient. Legacy plain-text quota indicators MUST
-    /// remain recognized by this backend.
+    /// remain recognized by this backend. A "model is not supported when using Codex with a
+    /// ChatGPT account" refusal MUST cool the account for one hour.
     fn classify(&self, status: u16, body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
+        if is_unsupported_model_refusal(body) {
+            return Outcome::QuotaExhausted {
+                until_ms: now_ms.saturating_add(UNSUPPORTED_MODEL_COOLDOWN_MS),
+            };
+        }
         let error = serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|v| v.get("error").cloned());
@@ -498,6 +518,24 @@ mod tests {
         assert!(matches!(
             backend.classify(400, "FreeUsageLimitError oops", &headers, 1_000),
             Outcome::QuotaExhausted { until_ms: 31_000 }
+        ));
+    }
+
+    #[test]
+    fn unsupported_model_refusal_cools_account_for_an_hour() {
+        let backend = CodexBackend {
+            cooldown_ms: 30_000,
+        };
+        let body = r#"{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}"#;
+        assert!(matches!(
+            backend.classify(400, body, &HeaderMap::new(), 1_000),
+            Outcome::QuotaExhausted {
+                until_ms: 3_601_000
+            }
+        ));
+        assert!(matches!(
+            backend.classify(400, r#"{"detail":"Bad request"}"#, &HeaderMap::new(), 1_000),
+            Outcome::Ok
         ));
     }
 
