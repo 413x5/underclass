@@ -399,6 +399,210 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     );
 }
 
+/// Column widths are measured from the cells that will actually be drawn rather than fixed
+/// percentages: a percentage gives `ACCOUNT` and `QUOTA LEFT` the same share whether they hold four
+/// characters or forty, which squeezed `STATE` and clipped the cooling scope and deadline.
+///
+/// Each column is first sized to its content (`ACCOUNT`, `PLAN`, and `QUOTA LEFT` shrink to what
+/// they actually hold, so an empty `PLAN` costs two cells, not twelve). The leftover width is then
+/// shared out by [`WEIGHT`], so a wider terminal widens every column instead of leaving dead space
+/// on the right - `Table` defaults to `Flex::Start`, which would pad the right edge only.
+fn account_columns(
+    snapshot: &MonitorSnapshot,
+    compact: bool,
+) -> (Vec<&'static str>, Vec<u16>, &'static [u16]) {
+    let widest = |values: Vec<String>, header: &str, cap: usize| -> u16 {
+        values
+            .into_iter()
+            .map(|value| display_width(&value))
+            .max()
+            .unwrap_or(0)
+            .max(display_width(header))
+            .min(cap) as u16
+    };
+
+    let label_width = widest(
+        snapshot.accounts.iter().map(|a| display_text(&a.label)).collect(),
+        "ACCOUNT",
+        MAX_LABEL_WIDTH,
+    );
+    let plan_width = widest(
+        snapshot.accounts.iter().map(plan_text).collect(),
+        "PLAN",
+        MAX_PLAN_WIDTH,
+    );
+    let status_width = widest(
+        snapshot
+            .accounts
+            .iter()
+            .map(|a| status_text(a, snapshot.now_ms))
+            .collect(),
+        "STATE",
+        MAX_STATUS_WIDTH,
+    );
+    let quota_width = widest(
+        snapshot
+            .accounts
+            .iter()
+            .map(|a| quota(a, snapshot.now_ms))
+            .collect(),
+        "QUOTA LEFT",
+        MAX_QUOTA_WIDTH,
+    );
+
+    if compact {
+        return (
+            vec!["ACCOUNT", "PLAN", "STATE", "LIVE", "SESS", "QUOTA LEFT"],
+            vec![
+                label_width,
+                plan_width,
+                status_width,
+                display_width("LIVE") as u16,
+                display_width("SESS") as u16,
+                quota_width.max(10),
+            ],
+            // A narrower table cannot spare growth; give it all to `STATE`.
+            &COMPACT_WEIGHT,
+        );
+    }
+    (
+        vec![
+            "ACCOUNT",
+            "PLAN",
+            "BACKEND",
+            "STATE",
+            "LIVE",
+            "SESS",
+            "QUOTA LEFT",
+            "RESETS",
+            "MONTH ATT · IN/OUT",
+        ],
+        vec![
+            label_width,
+            plan_width,
+            display_width("BACKEND") as u16,
+            status_width,
+            display_width("LIVE") as u16,
+            display_width("SESS") as u16,
+            quota_width,
+            display_width("RESETS") as u16,
+            display_width("MONTH ATT · IN/OUT") as u16,
+        ],
+        &WEIGHT,
+    )
+}
+
+/// Relative share of leftover width per column, in the wide and compact layouts. The fixed-count
+/// columns (`LIVE`, `SESS`) are passed separately so their width is not scaled.
+/// `"\u{25b6} "` is two cells and ratatui reserves it when a row is selected.
+const HIGHLIGHT_WIDTH: u16 = 2;
+
+/// A column never shrinks below this when the panel is too narrow for the full layout.
+const MIN_COLUMN_WIDTH: u16 = 4;
+
+const WEIGHT: [u16; 9] = [3, 2, 2, 5, 0, 0, 3, 2, 6];
+const COMPACT_WEIGHT: [u16; 6] = [3, 2, 6, 0, 0, 3];
+
+/// Grow `widths` by the leftover space, proportionally to `weights`, and return the final widths.
+/// Integer division leaves at most `len - 1` cells unassigned; they go to the widest columns so the
+/// table still fills the panel exactly.
+fn grow_to_fit(widths: Vec<u16>, weights: &[u16], area_width: u16) -> Vec<Constraint> {
+    // Ratatui also reserves one cell between columns and the highlight-symbol column, which the
+    // caller's `area_width` still includes.
+    let spacing = (widths.len() as u16).saturating_sub(1) + HIGHLIGHT_WIDTH;
+    let used = widths.iter().sum::<u16>() + spacing;
+    if used > area_width {
+        // The content is wider than the panel: take the shortfall from the weighted columns,
+        // largest weight first, instead of letting the table overflow off the right edge.
+        let mut widths = widths;
+        let mut deficit = used - area_width;
+        // Shrink the narrowest columns first so the widest value keeps its room; `STATE` and
+        // `MONTH ATT` are last to give up cells because truncating them loses information.
+        let mut order: Vec<usize> = (0..weights.len()).collect();
+        order.sort_by_key(|i| (weights[*i], std::cmp::Reverse(widths[*i])));
+        for i in order {
+            if deficit == 0 {
+                break;
+            }
+            let take = widths[i].saturating_sub(MIN_COLUMN_WIDTH).min(deficit);
+            widths[i] -= take;
+            deficit -= take;
+        }
+        // A pathologically narrow panel can defeat each column's floor. Keep taking cells in the
+        // same order until the widths fit, otherwise the table overflows the right edge, which is
+        // the exact failure this branch exists to prevent.
+        while deficit > 0 {
+            let Some((i, _)) = widths
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| **w > 1)
+                // Narrowest first, and among equals the lightest column: `STATE` and `MONTH ATT`
+                // carry the most weight and must be the last to lose a cell.
+                .min_by_key(|(i, w)| (*w, weights[*i]))
+            else {
+                break;
+            };
+            widths[i] -= 1;
+            deficit -= 1;
+        }
+        return widths.into_iter().map(Constraint::Length).collect();
+    }
+    let available = area_width.saturating_sub(used);
+    if available == 0 || weights.iter().all(|w| *w == 0) {
+        return widths.into_iter().map(Constraint::Length).collect();
+    }
+    let total: u32 = weights.iter().map(|w| u32::from(*w)).sum();
+    let mut final_widths = widths.clone();
+    for (width, weight) in final_widths.iter_mut().zip(weights) {
+        let extra = u32::from(available) * u32::from(*weight) / total;
+        *width = width.saturating_add(extra as u16);
+    }
+    // Hand the rounding remainder to the columns with the largest weight, keeping the total exact.
+    let mut leftover = available - (final_widths.iter().zip(&widths).map(|(new, old)| new - old).sum::<u16>());
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(weights[*i]));
+    for i in order {
+        if leftover == 0 {
+            break;
+        }
+        final_widths[i] = final_widths[i].saturating_add(1);
+        leftover -= 1;
+    }
+    final_widths.into_iter().map(Constraint::Length).collect()
+}
+
+/// Terminal cells a string occupies. `chars().count()` undercounts double-width glyphs (CJK,
+/// emoji), which would size a column too small and clip the value it was measured from.
+fn display_width(value: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(value)
+}
+
+fn plan_text(account: &MonitorAccount) -> String {
+    display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex {
+        "unknown"
+    } else {
+        "\u{2014}"
+    }))
+}
+
+fn status_text(account: &MonitorAccount, now: i64) -> String {
+    match account.status {
+        AccountStatus::Healthy => {
+            scoped_status(account, now).unwrap_or_else(|| "healthy".to_string())
+        }
+        AccountStatus::Cooling => format!("cooling {}", time_until(account.reset_at, now)),
+        AccountStatus::AuthError => "auth error".to_string(),
+        AccountStatus::Disabled => "disabled".to_string(),
+    }
+}
+
+/// Caps that stop one unusually long value from squeezing every other column. `STATE` allows for
+/// `cooling <scope> <deadline> +N`, the longest string this table renders.
+const MAX_LABEL_WIDTH: usize = 20;
+const MAX_PLAN_WIDTH: usize = 12;
+const MAX_STATUS_WIDTH: usize = 34;
+const MAX_QUOTA_WIDTH: usize = 30;
+
 fn draw_accounts(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -412,21 +616,11 @@ fn draw_accounts(
         .iter()
         .enumerate()
         .map(|(index, account)| {
-            let status = match account.status {
-                AccountStatus::Healthy => match scoped_status(account, snapshot.now_ms) {
-                    Some(scoped) => scoped,
-                    None => "healthy".to_string(),
-                },
-                AccountStatus::Cooling => {
-                    format!("cooling {}", time_until(account.reset_at, snapshot.now_ms))
-                }
-                AccountStatus::AuthError => "auth error".to_string(),
-                AccountStatus::Disabled => "disabled".to_string(),
-            };
+            let status = status_text(account, snapshot.now_ms);
             let cells = if compact {
                 vec![
                     Cell::from(display_text(&account.label)),
-                    Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
+                    Cell::from(plan_text(account)),
                     Cell::from(status).style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
@@ -437,7 +631,7 @@ fn draw_accounts(
             } else {
                 vec![
                     Cell::from(display_text(&account.label)),
-                    Cell::from(display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex { "unknown" } else { "—" }))),
+                    Cell::from(plan_text(account)),
                     Cell::from(account.backend.as_str()),
                     Cell::from(status).style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
@@ -459,7 +653,7 @@ fn draw_accounts(
                         ),
                     ),
                     Cell::from(format!(
-                        "{} · {} / {}",
+                        "{} \u{00b7} {} / {}",
                         account.month.attempts,
                         number(account.month.input_tokens),
                         number(account.month.output_tokens)
@@ -474,53 +668,19 @@ fn draw_accounts(
             }))
         })
         .collect();
-    let (headers, widths): (Vec<&str>, Vec<Constraint>) = if compact {
-        (
-            vec!["ACCOUNT", "PLAN", "STATE", "LIVE", "SESS", "QUOTA LEFT"],
-            vec![
-                Constraint::Percentage(25),
-                Constraint::Length(12),
-                Constraint::Percentage(22),
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Min(16),
-            ],
-        )
-    } else {
-        (
-            vec![
-                "ACCOUNT",
-                "PLAN",
-                "BACKEND",
-                "STATE",
-                "LIVE",
-                "SESS",
-                "QUOTA LEFT",
-                "RESETS",
-                "MONTH ATT · IN/OUT",
-            ],
-            vec![
-                Constraint::Percentage(20),
-                Constraint::Length(12),
-                Constraint::Length(9),
-                Constraint::Percentage(16),
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Percentage(25),
-                Constraint::Length(7),
-                Constraint::Min(15),
-            ],
-        )
-    };
+    let (headers, widths, weights) = account_columns(snapshot, compact);
+    // The table sits inside `panel()`, whose borders take a cell on each side. Sizing against the
+    // outer rect would over-subscribe the inner one by two and clip the last column.
+    let widths = grow_to_fit(widths, weights, panel().inner(area).width);
     let table = Table::new(rows, widths)
         .header(Row::new(headers).style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)))
-        .block(panel().title(format!(" accounts · {} ", snapshot.accounts.len())))
+        .block(panel().title(format!(" accounts \u{00b7} {} ", snapshot.accounts.len())))
         .row_highlight_style(
             Style::default()
                 .bg(Color::Rgb(48, 61, 84))
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("\u{25b6} ");
     let mut state = TableState::default();
     if !snapshot.accounts.is_empty() {
         state.select(Some(app.selected));
@@ -583,6 +743,62 @@ fn account_detail(account: &MonitorAccount, now_ms: i64) -> String {
     parts.join("  ·  ")
 }
 
+/// Recent-outcomes widths. This table has no header row, so every column is measured from the
+/// values it will draw: `MODEL` is the widest in practice (`cline/cline-pass/deepseek-v4.1-flash`
+/// is 41 cells) and takes the largest share, while the fixed-shape columns (`HH:MM:SS`, the status
+/// code, `<n> ms`) are sized so they never truncate. The total is clamped to the panel's inner
+/// width, so a narrow pane shrinks `MODEL`/`ACCOUNT` instead of spilling past the border.
+fn recent_columns(area_width: u16, snapshot: &MonitorSnapshot) -> Vec<Constraint> {
+    let inner = area_width.saturating_sub(2); // the panel's borders
+    let spacing = 5u16; // five gaps between six columns
+    let available = inner.saturating_sub(spacing);
+
+    let widest = |values: Vec<String>, fallback: u16, cap: u16| -> u16 {
+        values
+            .into_iter()
+            .map(|value| display_width(&value))
+            .max()
+            .unwrap_or(0)
+            .max(usize::from(fallback))
+            .min(usize::from(cap)) as u16
+    };
+    let time = widest(snapshot.recent.iter().map(|_| "00:00:00".to_string()).collect(), 8, 8);
+    let status = widest(snapshot.recent.iter().map(|r| r.status.to_string()).collect(), 3, 3);
+    let duration = widest(
+        snapshot.recent.iter().map(|r| format!("{} ms", r.duration_ms)).collect(),
+        7,
+        10,
+    );
+    let backend = widest(
+        snapshot.recent.iter().filter_map(|r| r.backend.clone()).collect(),
+        5,
+        10,
+    );
+
+    let rest = available.saturating_sub(time + status + duration + backend);
+    // MODEL gets the lion's share; ACCOUNT takes what is left.
+    let model = (rest * 7 / 10).max(1);
+    let account = rest.saturating_sub(model).max(1);
+    let mut widths = vec![time, model, backend, account, status, duration];
+
+    // A narrow panel can still exceed the inner width; take it out of the widest columns first so
+    // the fixed-shape ones keep their exact value.
+    let mut total: u16 = widths.iter().sum();
+    while total > available {
+        let Some((i, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 1)
+            .max_by_key(|(_, w)| **w)
+        else {
+            break;
+        };
+        widths[i] -= 1;
+        total -= 1;
+    }
+    widths.into_iter().map(Constraint::Length).collect()
+}
+
 fn draw_recent(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -632,14 +848,7 @@ fn draw_recent(
         .collect();
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(9),
-            Constraint::Percentage(26),
-            Constraint::Length(9),
-            Constraint::Percentage(30),
-            Constraint::Length(6),
-            Constraint::Min(8),
-        ],
+        recent_columns(area.width, snapshot),
     )
     .block(panel().title(" recent outcomes "));
     frame.render_widget(table, area);
@@ -902,5 +1111,246 @@ mod tests {
     #[test]
     fn control_characters_are_removed_from_display() {
         assert_eq!(display_text("alice\x1b[31m\n"), "alice [31m ");
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+    use crate::monitor::{Counters, MonitorAccount, MonitorSnapshot};
+    use ratatui::backend::TestBackend;
+
+    fn snap(scopes: &[(&str, i64)]) -> MonitorSnapshot {
+        MonitorSnapshot {
+            now_ms: 1_000_000,
+            month_start_ms: 0,
+            accounts: vec![
+                MonitorAccount {
+                    id: "a".into(),
+                    label: "alex4ndrus".into(),
+                    backend: BackendId::Cline,
+                    plan: None,
+                    status: AccountStatus::Healthy,
+                    reset_at: 0,
+                    cooling_scopes: scopes
+                        .iter()
+                        .map(|(s, d)| ((*s).to_string(), *d))
+                        .collect(),
+                    inflight: 0,
+                    sticky_sessions: 0,
+                    month: Counters::default(),
+                    quota: None,
+                },
+                MonitorAccount {
+                    id: "b".into(),
+                    label: "413x5".into(),
+                    backend: BackendId::Cline,
+                    plan: None,
+                    status: AccountStatus::Healthy,
+                    reset_at: 0,
+                    cooling_scopes: [("credits".to_string(), 1_725_000)].into_iter().collect(),
+                    inflight: 1,
+                    sticky_sessions: 0,
+                    month: Counters::default(),
+                    quota: None,
+                },
+            ],
+            month: Counters::default(),
+            last_minute: Counters::default(),
+            minute_bins: vec![0; 60],
+            recent: vec![],
+        }
+    }
+
+    fn render(width: u16) -> String {
+        let mut app = App {
+            snapshot: Some(snap(&[("credits", 1_725_000), ("cline-pass", 1_800_000)]),),
+            ..Default::default()
+        };
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn scoped_cooling_is_fully_visible_at_wide_widths() {
+        let screen = render(160);
+        assert!(
+            screen.contains("cooling credits 12m +1"),
+            "STATE must render the scope and deadline without clipping:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn status_still_has_room_at_a_narrow_width() {
+        let screen = render(110);
+        assert!(
+            screen.contains("cooling credits"),
+            "STATE must keep the scope name at 110 columns:\n{screen}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+    use crate::monitor::{Counters, MonitorAccount, MonitorSnapshot};
+
+    fn snapshot() -> MonitorSnapshot {
+        let account = |label: &str, scopes: &[(&str, i64)]| MonitorAccount {
+            id: label.into(),
+            label: label.into(),
+            backend: BackendId::Cline,
+            plan: None,
+            status: AccountStatus::Healthy,
+            reset_at: 0,
+            cooling_scopes: scopes.iter().map(|(s, d)| ((*s).into(), *d)).collect(),
+            inflight: 0,
+            sticky_sessions: 0,
+            month: Counters::default(),
+            quota: None,
+        };
+        MonitorSnapshot {
+            now_ms: 1_000_000,
+            month_start_ms: 0,
+            accounts: vec![
+                account("alex4ndrus", &[("credits", 1_725_000), ("cline-pass", 1_800_000)]),
+                account("413x5", &[("credits", 1_725_000)]),
+            ],
+            month: Counters::default(),
+            last_minute: Counters::default(),
+            minute_bins: vec![0; 60],
+            recent: vec![],
+        }
+    }
+
+    /// `area_width` is the outer rect; `panel()` borders take one cell per side.
+    fn widths_at(area_width: u16, compact: bool) -> Vec<u16> {
+        let snap = snapshot();
+        let (_, widths, weights) = account_columns(&snap, compact);
+        grow_to_fit(widths, weights, area_width.saturating_sub(2))
+            .into_iter()
+            .map(|c| match c {
+                Constraint::Length(n) => n,
+                other => panic!("expected Length, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn widths_consume_exactly_the_available_area() {
+        // column_spacing = 1 between every pair, plus the highlight symbol column.
+        for area in [80u16, 100, 120, 140, 160, 200] {
+            let w = widths_at(area, false);
+            let spacing = (w.len() as u16 - 1) + HIGHLIGHT_WIDTH;
+            assert_eq!(
+                w.iter().sum::<u16>() + spacing,
+                area - 2,
+                "widths {w:?} must fill the block's inner width exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn every_growable_column_widens_as_the_terminal_grows() {
+        let narrow = widths_at(120, false);
+        let wide = widths_at(200, false);
+        for (i, (n, w)) in narrow.iter().zip(&wide).enumerate() {
+            if WEIGHT[i] == 0 {
+                assert_eq!(w, n, "column {i} is fixed-count and must keep its width");
+            } else {
+                assert!(w > n, "column {i} did not grow: {n} at 120 -> {w} at 200");
+            }
+        }
+    }
+
+    #[test]
+    fn recent_table_fits_every_panel_width() {
+        const COLUMNS: u16 = 6;
+        let snap = snapshot();
+        // 41 is the smallest panel that can hold six one-cell columns plus separators.
+        for area in [41u16, 50, 60, 80, 94, 100, 120, 160, 200] {
+            let widths: Vec<u16> = recent_columns(area, &snap)
+                .into_iter()
+                .map(|c| match c {
+                    Constraint::Length(n) => n,
+                    other => panic!("expected Length, got {other:?}"),
+                })
+                .collect();
+            let total: u16 = widths.iter().sum::<u16>() + (COLUMNS - 1);
+            assert!(
+                total <= area - 2,
+                "recent {widths:?} total {total} must fit the {}-cell inner area",
+                area - 2
+            );
+            // The model column must dominate: it is the widest value in the table.
+            assert!(
+                widths[1] >= widths[3],
+                "MODEL ({}) should be at least as wide as ACCOUNT ({}) at {area}",
+                widths[1],
+                widths[3]
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_overflows_even_when_the_panel_is_too_narrow_for_the_floors() {
+        // Nine columns need at least one cell each plus eight separators and the highlight column,
+        // so below 19 cells no layout can fit. Every panel a real terminal can present is above
+        // that; this pins the behaviour from there up.
+        // Nine one-cell columns plus eight separators and the highlight column need 19 inner
+        // cells, and `panel()` borders add two more, so the smallest sane outer area is 21.
+        const MIN_INNER: u16 = 9 + 8 + HIGHLIGHT_WIDTH;
+        const MINIMUM: u16 = MIN_INNER + 2;
+        for area in [MINIMUM, 25, 30, 40, 50] {
+            let w = widths_at(area, false);
+            let spacing = (w.len() as u16 - 1) + HIGHLIGHT_WIDTH;
+            let total = w.iter().sum::<u16>() + spacing;
+            assert!(
+                total <= area - 2,
+                "widths {w:?} total {total} must fit the {}-cell inner area",
+                area - 2
+            );
+        }
+    }
+
+    #[test]
+    fn widths_are_measured_in_terminal_cells() {
+        // Double-width glyphs need two cells each; counting code points would clip them.
+        assert_eq!(display_width("413x5"), 5);
+        assert_eq!(display_width("\u{4f60}\u{597d}"), 4, "CJK glyphs are two cells each");
+        assert_eq!(display_width("\u{1f600}"), 2, "emoji is two cells");
+        assert_eq!(display_width("MONTH ATT \u{00b7} IN/OUT"), 18);
+    }
+
+    #[test]
+    fn columns_start_at_their_content_width() {
+        let snap = snapshot();
+        let (_, widths, _) = account_columns(&snap, false);
+        // Every account is Cline with no plan, so PLAN is sized by its header, not a fixed 12.
+        assert_eq!(widths[1], display_width("PLAN") as u16, "PLAN starts at its header width");
+        // RESETS is the same for every account here.
+        assert_eq!(widths[7], display_width("RESETS") as u16, "RESETS starts at its header width");
+        // ACCOUNT starts at the longest label, not a percentage of the panel.
+        assert_eq!(widths[0], display_width("alex4ndrus") as u16);
+    }
+
+    #[test]
+    fn state_keeps_the_full_scoped_status_at_every_width_in_test() {
+        for area in [100u16, 120, 160, 200] {
+            let w = widths_at(area, false);
+            assert!(
+                w[3] >= "cooling credits 12m +1".chars().count() as u16,
+                "STATE is {} cells at {area}, needs {}",
+                w[3],
+                "cooling credits 12m +1".len()
+            );
+        }
     }
 }
