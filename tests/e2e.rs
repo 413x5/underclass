@@ -122,6 +122,20 @@ async fn mock_responses(
     let model_scoped_refusal = bearer.starts_with("claude-model-quota-")
         && uri.path().ends_with("/messages")
         && requested_model == "claude-opus-5-5";
+    // Codex refuses a model the account's plan cannot use, naming the model and nothing else.
+    if bearer.starts_with("tok-unsupported-") && requested_model == "gpt-6-astra" {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            format!(
+                r#"{{"detail":"The '{requested_model}' model is not supported when using Codex with a ChatGPT account."}}"#
+            ),
+        )
+            .into_response();
+    }
     let failing = state.lock().unwrap().failing.contains(&bearer)
         || (bearer.starts_with("claude-quota-") && uri.path().ends_with("/messages"))
         || model_scoped_refusal;
@@ -1229,15 +1243,101 @@ async fn wait_for_rows(store: &Store, count: usize) -> Vec<underclass::store::Us
 }
 
 async fn post_stream(base: &str, key: &str) -> (u16, String) {
+    post_model_stream(base, "gpt-5.5", key).await
+}
+
+async fn post_model_stream(base: &str, model: &str, key: &str) -> (u16, String) {
     let response = reqwest::Client::new()
         .post(format!("{base}/v1/responses"))
         .header("Authorization", "Bearer test-key")
-        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": true, "prompt_cache_key": key}))
+        .json(&serde_json::json!({"model": model, "input": "hi", "stream": true, "prompt_cache_key": key}))
         .send()
         .await
         .unwrap();
     let status = response.status().as_u16();
     (status, response.text().await.unwrap())
+}
+
+/// Codex refuses a model the account's plan cannot use, naming only that model. The refusal must
+/// fail over to another account without cooling the refusing account: that subscription still
+/// serves its other models, and an account-wide cooldown would also re-enter the reset manager's
+/// cool/re-admit loop, which fetches usage every cycle and re-admits the account on the same
+/// refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_unsupported_model_cools_the_model_not_the_account() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-6-astra"), model("gpt-5.5")]);
+    // `au-a` sorts first, so a new sticky key binds to the account whose plan refuses the model.
+    store.upsert_account(&codex_account("au-a", "tok-unsupported-1"));
+    store.upsert_account(&codex_account("au-b", "tok-ok-1"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_model_stream(&base, "gpt-6-astra", "unsupported-session").await;
+    assert_eq!(status, 200, "the refusal fails over: {body}");
+    assert!(
+        body.contains("hello from tok-ok-1"),
+        "served by the account whose plan supports the model: {body}"
+    );
+    assert!(
+        !body.contains("is not supported when using Codex"),
+        "the discarded refusal never reaches the client: {body}"
+    );
+
+    let cooled = pool
+        .lock()
+        .unwrap()
+        .model_cooling_until("au-a", "gpt-6-astra");
+    assert!(
+        cooled.is_some_and(|until| until > underclass::models::now_ms()),
+        "the refused model is cooling on that account"
+    );
+    assert_eq!(
+        pool.lock()
+            .unwrap()
+            .model_cooling_until("au-b", "gpt-6-astra"),
+        None,
+        "the serving account is not cooled for the model"
+    );
+
+    // The refusing subscription is untouched and keeps serving its other models.
+    let refusing = store.get_account("au-a").expect("account");
+    assert_eq!(
+        refusing.status,
+        AccountStatus::Healthy,
+        "a model-scoped refusal must not cool the account"
+    );
+    let (status, body) = post_model_stream(&base, "gpt-5.5", "same-account-session").await;
+    assert_eq!(status, 200, "the other model still serves: {body}");
+    assert!(
+        body.contains("hello from tok-unsupported-1"),
+        "served by the subscription whose plan refused gpt-6-astra: {body}"
+    );
+}
+
+/// With no account whose plan supports the model, the refusal is not replayed: the pool reports
+/// saturation for that model until the cooldown expires, so a client does not re-hit a permanent
+/// plan refusal on every retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_unsupported_model_without_an_alternative_fails_fast() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-6-astra")]);
+    store.upsert_account(&codex_account("solo", "tok-unsupported-solo"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_model_stream(&base, "gpt-6-astra", "solo-session").await;
+    assert_eq!(status, 429, "no eligible account left: {body}");
+    assert!(
+        body.contains("quota_exhausted"),
+        "reported as an exhausted model: {body}"
+    );
+    let account = store.get_account("solo").expect("account");
+    assert_eq!(
+        account.status,
+        AccountStatus::Healthy,
+        "the only subscription must stay in rotation for the models its plan supports"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -66,3 +66,13 @@ silently dropped one dimension - the failure mode this record exists to prevent.
   only the shared five-hour and seven-day window statuses and the weekly other-models window, and
   the request-scoped body phrases are checked before any header. ADR 0023 is left unedited
   (append-only); this paragraph is the record of the divergence.
+- **Divergence from upstream's Codex plan refusal.** Upstream classifies Codex's
+  `{"detail":"The '<model>' model is not supported when using Codex with a ChatGPT account."}` as
+  `QuotaExhausted`, which benches the whole subscription for an hour. The refusal names one model
+  and the account's plan still serves the rest, so the fork returns `ModelQuotaExhausted` instead.
+  The account-wide form also interacts badly with automatic resets: `codex_pool_blocked` is true
+  whenever no Codex account is `Healthy`, so a cooled account re-enters `maybe_reset`, whose
+  usage fetch reports `allowed: true` (the plan limit is not a spent window) and re-admits it via
+  `recovered_without_credit`. That is a cool/re-admit flap at the check interval, each cycle
+  spending a usage fetch on the same permanent refusal. A model cooldown leaves `status` alone, so
+  none of that machinery engages. Upstream is left unedited; this paragraph is the record.
