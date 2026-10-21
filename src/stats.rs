@@ -129,7 +129,12 @@ pub fn bucket_count(from: i64, to: i64, bucket_ms: i64) -> usize {
 /// For each bucket `[from + i*bucket_ms, min(from + (i+1)*bucket_ms, to))`, `concurrency` MUST
 /// report the maximum number of half-open intervals covering any instant in the bucket and the
 /// time-weighted mean coverage times 1000 (floored); intervals outside the bucket MUST NOT count.
-pub fn concurrency(intervals: &[(i64, i64)], from: i64, to: i64, bucket_ms: i64) -> Vec<(i64, i64)> {
+pub fn concurrency(
+    intervals: &[(i64, i64)],
+    from: i64,
+    to: i64,
+    bucket_ms: i64,
+) -> Vec<(i64, i64)> {
     let count = bucket_count(from, to, bucket_ms);
     let mut points: Vec<(i64, i64)> = Vec::with_capacity(intervals.len() * 2);
     for &(start, end) in intervals {
@@ -184,7 +189,15 @@ pub fn assemble(
     let count = bucket_count(from, to, bucket_ms);
     let mut series: BTreeMap<String, Series> = BTreeMap::new();
     for row in counts {
-        if let Some(totals) = bucket_mut(&mut series, count, from, bucket_ms, &row.key, &row.label, row.bucket) {
+        if let Some(totals) = bucket_mut(
+            &mut series,
+            count,
+            from,
+            bucket_ms,
+            &row.key,
+            &row.label,
+            row.bucket,
+        ) {
             totals.requests += row.requests;
             totals.attempts += row.attempts;
             totals.sessions += row.sessions;
@@ -194,22 +207,47 @@ pub fn assemble(
         }
     }
     for row in outcomes {
-        if let Some(totals) = bucket_mut(&mut series, count, from, bucket_ms, &row.key, &row.label, row.bucket) {
+        if let Some(totals) = bucket_mut(
+            &mut series,
+            count,
+            from,
+            bucket_ms,
+            &row.key,
+            &row.label,
+            row.bucket,
+        ) {
             *totals.outcomes.entry(row.name.clone()).or_default() += row.count;
         }
     }
     for row in events {
-        if let Some(totals) = bucket_mut(&mut series, count, from, bucket_ms, &row.key, &row.label, row.bucket) {
+        if let Some(totals) = bucket_mut(
+            &mut series,
+            count,
+            from,
+            bucket_ms,
+            &row.key,
+            &row.label,
+            row.bucket,
+        ) {
             *totals.events.entry(row.name.clone()).or_default() += row.count;
         }
     }
     let mut by_key: BTreeMap<&str, Vec<(i64, i64)>> = BTreeMap::new();
     for interval in intervals {
-        by_key.entry(interval.key.as_str()).or_default().push((interval.start, interval.end));
+        by_key
+            .entry(interval.key.as_str())
+            .or_default()
+            .push((interval.start, interval.end));
     }
     for (key, spans) in by_key {
-        let Some(series) = series.get_mut(key) else { continue };
-        for (bucket, (peak, mean)) in series.buckets.iter_mut().zip(concurrency(&spans, from, to, bucket_ms)) {
+        let Some(series) = series.get_mut(key) else {
+            continue;
+        };
+        for (bucket, (peak, mean)) in series
+            .buckets
+            .iter_mut()
+            .zip(concurrency(&spans, from, to, bucket_ms))
+        {
             bucket.totals.peak_concurrency = peak;
             bucket.totals.mean_concurrency_milli = mean;
         }
@@ -231,7 +269,10 @@ fn bucket_mut<'a>(
         key: key.to_string(),
         label: label.to_string(),
         buckets: (0..count)
-            .map(|i| Bucket { start_ms: from + i as i64 * bucket_ms, totals: Totals::default() })
+            .map(|i| Bucket {
+                start_ms: from + i as i64 * bucket_ms,
+                totals: Totals::default(),
+            })
             .collect(),
     });
     if series.label.is_empty() || series.label == series.key {
@@ -311,10 +352,27 @@ mod tests {
 
     #[test]
     fn combine_weights_mean_by_span() {
-        let a = Totals { mean_concurrency_milli: 1000, peak_concurrency: 2, attempts: 1, ..Default::default() };
-        let b = Totals { mean_concurrency_milli: 4000, peak_concurrency: 5, attempts: 2, ..Default::default() };
+        let a = Totals {
+            mean_concurrency_milli: 1000,
+            peak_concurrency: 2,
+            attempts: 1,
+            ..Default::default()
+        };
+        let b = Totals {
+            mean_concurrency_milli: 4000,
+            peak_concurrency: 5,
+            attempts: 2,
+            ..Default::default()
+        };
         let out = combine(&[(&a, 3), (&b, 1)]);
-        assert_eq!((out.attempts, out.peak_concurrency, out.mean_concurrency_milli), (3, 5, 1750));
+        assert_eq!(
+            (
+                out.attempts,
+                out.peak_concurrency,
+                out.mean_concurrency_milli
+            ),
+            (3, 5, 1750)
+        );
     }
 
     #[test]

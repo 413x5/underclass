@@ -1,4 +1,4 @@
-use crate::models::{now_ms, Account, AccountStatus, BackendId, ModelInfo};
+use crate::models::{Account, AccountStatus, BackendId, ModelInfo, now_ms};
 use crate::provider::Backend;
 use crate::store::Store;
 use http::HeaderMap;
@@ -8,7 +8,11 @@ use std::sync::Mutex;
 
 pub const DEFAULT_API_BASE: &str = "https://api.cline.bot";
 pub const MODEL_PREFIX: &str = "cline/";
-pub const USER_AGENT: &str = concat!("opencode/", env!("CARGO_PKG_VERSION"), " (underclass-pool-proxy)");
+pub const USER_AGENT: &str = concat!(
+    "opencode/",
+    env!("CARGO_PKG_VERSION"),
+    " (underclass-pool-proxy)"
+);
 
 pub fn api_base() -> String {
     std::env::var("UNDERCLASS_CLINE_UPSTREAM")
@@ -128,7 +132,10 @@ pub fn default_catalog() -> Vec<ModelInfo> {
         ("cline-pass/mimo-v2.5", "MiMo-V2.5"),
         ("cline-pass/mimo-v2.5-pro", "MiMo-V2.5 Pro"),
         ("cline-pass/minimax-m3", "MiniMax M3"),
-        ("cline-pass/muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor"),
+        (
+            "cline-pass/muse-spark-1.3-contributor",
+            "Muse Spark 1.3 Contributor",
+        ),
         ("cline-pass/qwen3.8-max", "Qwen3.8 Max"),
         ("cline-pass/qwen3.7-max", "Qwen3.7 Max"),
         ("cline-pass/qwen3.7-plus", "Qwen3.7 Plus"),
@@ -268,12 +275,14 @@ pub async fn add_account(
     if api_key.is_empty() {
         return Err(AuthError::Failed);
     }
-    let identity = fetch_user(client, api_key).await.map_err(|error| match error {
-        // A key the upstream rejected must never reach the store. A transient 429/5xx says nothing
-        // about the key, so it must not be reported as a rejection that prompts a key rotation.
-        AuthError::Status(401 | 403) => AuthError::Failed,
-        other => other,
-    })?;
+    let identity = fetch_user(client, api_key)
+        .await
+        .map_err(|error| match error {
+            // A key the upstream rejected must never reach the store. A transient 429/5xx says nothing
+            // about the key, so it must not be reported as a rejection that prompts a key rotation.
+            AuthError::Status(401 | 403) => AuthError::Failed,
+            other => other,
+        })?;
     let identity = parse_user(&identity);
     // An explicit `""` from the admin API is not a label; treat it like an absent one so a blank
     // identity never reaches the store, the account row, or a log line.
@@ -333,6 +342,10 @@ impl Backend for ClineBackend {
         BackendId::Cline
     }
 
+    fn surfaces(&self) -> &'static [crate::models::Surface] {
+        &[crate::models::Surface::OpenAI]
+    }
+
     fn default_cooldown_ms(&self) -> i64 {
         self.cooldown_ms
     }
@@ -361,7 +374,13 @@ impl Backend for ClineBackend {
     /// `403` MUST NOT mark the account auth-failed: Cline uses it for per-resource access (for
     /// example a model outside the account's plan), and a valid key must stay in rotation for the
     /// models it can serve.
-    fn classify(&self, status: u16, _body: &str, headers: &HeaderMap, now_ms: i64) -> crate::models::Outcome {
+    fn classify(
+        &self,
+        status: u16,
+        _body: &str,
+        headers: &HeaderMap,
+        now_ms: i64,
+    ) -> crate::models::Outcome {
         if status == 402 {
             return crate::models::Outcome::QuotaExhausted {
                 until_ms: now_ms.saturating_add(self.cooldown_ms),
@@ -434,6 +453,7 @@ impl Backend for ClineBackend {
         token: &str,
         _sticky: Option<&str>,
         _body: &Value,
+        _client: &HeaderMap,
         headers: &mut HeaderMap,
     ) {
         headers.insert(
@@ -483,7 +503,7 @@ mod tests {
             input: 120_000,
             output: 8_000,
             scope: String::new(),
-}];
+        }];
         let mut fetched = parse_models_response(&json!({"data": [{"id": "openai/gpt-5.4"}]}));
         assert_eq!(fetched[0].context, 0, "the listing reports no limits");
         carry_forward_limits(&mut fetched, &stored);
@@ -540,8 +560,16 @@ mod tests {
     fn merge_keeps_subscription_models_absent_upstream() {
         let fetched = parse_models_response(&json!({"data": [{"id": "openai/gpt-5.4"}]}));
         let merged = merge_catalog(fetched);
-        assert!(merged.iter().any(|model| model.id == "cline/openai/gpt-5.4"));
-        assert!(merged.iter().any(|model| model.id == "cline/cline-pass/kimi-k3"));
+        assert!(
+            merged
+                .iter()
+                .any(|model| model.id == "cline/openai/gpt-5.4")
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|model| model.id == "cline/cline-pass/kimi-k3")
+        );
     }
 
     #[test]
@@ -569,11 +597,20 @@ mod tests {
         assert!(backfill_scopes(&mut stored));
         assert_eq!(stored[0].scope, SCOPE_CREDITS);
         assert_eq!(stored[1].scope, SCOPE_CLINE_PASS);
-        assert_eq!(stored[0].context, 128_000, "operator limits survive the backfill");
-        assert!(!backfill_scopes(&mut stored), "an already-scoped catalog is a no-op");
+        assert_eq!(
+            stored[0].context, 128_000,
+            "operator limits survive the backfill"
+        );
+        assert!(
+            !backfill_scopes(&mut stored),
+            "an already-scoped catalog is a no-op"
+        );
 
         stored[0].scope = "operator-surface".into();
-        assert!(!backfill_scopes(&mut stored), "an explicit scope is never overwritten");
+        assert!(
+            !backfill_scopes(&mut stored),
+            "an explicit scope is never overwritten"
+        );
         assert_eq!(stored[0].scope, "operator-surface");
     }
 
@@ -625,7 +662,10 @@ mod tests {
 
     #[test]
     fn model_ids_round_trip_through_the_namespace() {
-        assert_eq!(upstream_model_id("cline/anthropic/claude-sonnet-4-6"), "anthropic/claude-sonnet-4-6");
+        assert_eq!(
+            upstream_model_id("cline/anthropic/claude-sonnet-4-6"),
+            "anthropic/claude-sonnet-4-6"
+        );
         assert_eq!(upstream_model_id("gpt-5.5"), "gpt-5.5");
         assert_eq!(
             pool_model_id("cline-pass/kimi-k3"),
@@ -650,14 +690,22 @@ mod tests {
 
     #[test]
     fn payment_required_cools_and_forbidden_stays_healthy() {
-        let backend = ClineBackend { cooldown_ms: 30_000 };
+        let backend = ClineBackend {
+            cooldown_ms: 30_000,
+        };
         let headers = HeaderMap::new();
         assert!(matches!(
             backend.classify(402, "", &headers, 1_000),
             crate::models::Outcome::QuotaExhausted { until_ms: 31_000 }
         ));
-        assert_eq!(backend.classify(403, "", &headers, 1_000), crate::models::Outcome::Ok);
-        assert_eq!(backend.classify(401, "", &headers, 1_000), crate::models::Outcome::AuthFailed);
+        assert_eq!(
+            backend.classify(403, "", &headers, 1_000),
+            crate::models::Outcome::Ok
+        );
+        assert_eq!(
+            backend.classify(401, "", &headers, 1_000),
+            crate::models::Outcome::AuthFailed
+        );
     }
 
     #[test]
@@ -678,10 +726,7 @@ mod tests {
             parse_user(&json!({"email": "a@example.test", "name": "A"})),
             Some("a@example.test".into())
         );
-        assert_eq!(
-            parse_user(&json!({"name": "A"})),
-            Some("A".into())
-        );
+        assert_eq!(parse_user(&json!({"name": "A"})), Some("A".into()));
         assert_eq!(parse_user(&json!({})), None);
     }
 
@@ -701,8 +746,16 @@ mod tests {
     #[test]
     fn default_catalog_covers_clinepass() {
         let catalog = default_catalog();
-        assert!(catalog.iter().any(|model| model.id == "cline/cline-pass/glm-5.3"));
-        assert!(catalog.iter().all(|model| model.id.starts_with(MODEL_PREFIX)));
+        assert!(
+            catalog
+                .iter()
+                .any(|model| model.id == "cline/cline-pass/glm-5.3")
+        );
+        assert!(
+            catalog
+                .iter()
+                .all(|model| model.id.starts_with(MODEL_PREFIX))
+        );
     }
 
     #[test]
@@ -727,7 +780,11 @@ mod tests {
         );
         // An explicit label still wins.
         assert_eq!(
-            resolve_relabel("work", Some("renamed".into()), Some("me@example.com".into())),
+            resolve_relabel(
+                "work",
+                Some("renamed".into()),
+                Some("me@example.com".into())
+            ),
             "renamed"
         );
         // A blank stored label is not an operator label; identity, then `cline`, fill it.

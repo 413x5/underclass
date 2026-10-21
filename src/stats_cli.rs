@@ -13,13 +13,20 @@ pub struct StatsArgs {
     pub command: Option<StatsCommand>,
     #[arg(long, default_value = "24h", help = "window, e.g. 6h, 7d, 90d, 2y")]
     pub since: String,
-    #[arg(long, help = "minute, hour, or day (default: hour up to 2 days, else day)")]
+    #[arg(
+        long,
+        help = "minute, hour, or day (default: hour up to 2 days, else day)"
+    )]
     pub bucket: Option<String>,
     #[arg(long, default_value = "total", help = "total, model, or account")]
     pub by: String,
     #[arg(long, help = "print the raw JSON response")]
     pub json: bool,
-    #[arg(long, global = true, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
+    #[arg(
+        long,
+        global = true,
+        help = "server URL (requires UNDERCLASS_UI_TOKEN)"
+    )]
     pub url: Option<String>,
 }
 
@@ -31,7 +38,10 @@ pub enum StatsCommand {
 
 #[derive(Args, Debug)]
 pub struct ImportCodexArgs {
-    #[arg(long, help = "rollout directory (repeatable; default: $CODEX_HOME/sessions and archived_sessions)")]
+    #[arg(
+        long,
+        help = "rollout directory (repeatable; default: $CODEX_HOME/sessions and archived_sessions)"
+    )]
     pub dir: Vec<PathBuf>,
     #[arg(long, help = "parse and summarize without sending anything")]
     pub dry_run: bool,
@@ -65,15 +75,22 @@ pub fn run(args: &StatsArgs) -> Result<(), String> {
 
 fn show(args: &StatsArgs) -> Result<(), String> {
     let span = stats::parse_since(&args.since).ok_or("--since must look like 24h, 90d, or 2y")?;
-    let bucket = args
-        .bucket
-        .clone()
-        .unwrap_or_else(|| if span <= 2 * DAY_MS { "hour".into() } else { "day".into() });
+    let bucket = args.bucket.clone().unwrap_or_else(|| {
+        if span <= 2 * DAY_MS {
+            "hour".into()
+        } else {
+            "day".into()
+        }
+    });
     let config = crate::config::Config::load();
     let (url, token) = crate::top::admin_http_target(&config, args.url.clone())?;
     let endpoint = reqwest::Url::parse_with_params(
         &format!("{url}/admin/api/stats"),
-        [("since", args.since.as_str()), ("bucket", bucket.as_str()), ("by", args.by.as_str())],
+        [
+            ("since", args.since.as_str()),
+            ("bucket", bucket.as_str()),
+            ("by", args.by.as_str()),
+        ],
     )
     .map_err(|e| format!("stats url: {e}"))?;
     let response = client()?
@@ -84,9 +101,14 @@ fn show(args: &StatsArgs) -> Result<(), String> {
     if !response.status().is_success() {
         return Err(error_message(response));
     }
-    let body: Value = response.json().map_err(|e| format!("stats response: {e}"))?;
+    let body: Value = response
+        .json()
+        .map_err(|e| format!("stats response: {e}"))?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
     } else {
         print!("{}", render(&body));
     }
@@ -108,8 +130,19 @@ fn count(map: &Value, key: &str) -> i64 {
 }
 
 const HEADER: [&str; 13] = [
-    "", "requests", "sessions", "tok in", "tok out", "peak", "mean", "failed", "overload", "policy", "quota",
-    "cooling", "saturated",
+    "",
+    "requests",
+    "sessions",
+    "tok in",
+    "tok out",
+    "peak",
+    "mean",
+    "failed",
+    "overload",
+    "policy",
+    "quota",
+    "cooling",
+    "saturated",
 ];
 
 fn row(name: String, t: &Value) -> Vec<String> {
@@ -123,7 +156,8 @@ fn row(name: String, t: &Value) -> Vec<String> {
         human(count(t, "output_tokens")),
         count(t, "peak_concurrency").to_string(),
         format!("{:.1}", count(t, "mean_concurrency_milli") as f64 / 1000.0),
-        (count(outcomes, "failed") + count(outcomes, "incomplete") + count(outcomes, "truncated")).to_string(),
+        (count(outcomes, "failed") + count(outcomes, "incomplete") + count(outcomes, "truncated"))
+            .to_string(),
         count(events, "overloaded").to_string(),
         count(events, "policy_blocked").to_string(),
         count(events, "quota_exhausted").to_string(),
@@ -134,13 +168,25 @@ fn row(name: String, t: &Value) -> Vec<String> {
 
 fn table(rows: &[Vec<String>]) -> String {
     let widths: Vec<usize> = (0..HEADER.len())
-        .map(|i| rows.iter().map(|r| r[i].len()).chain([HEADER[i].len()]).max().unwrap_or(0))
+        .map(|i| {
+            rows.iter()
+                .map(|r| r[i].len())
+                .chain([HEADER[i].len()])
+                .max()
+                .unwrap_or(0)
+        })
         .collect();
     let line = |cells: Vec<&str>| {
         cells
             .iter()
             .enumerate()
-            .map(|(i, c)| if i == 0 { format!("{c:<w$}", w = widths[i]) } else { format!("{c:>w$}", w = widths[i]) })
+            .map(|(i, c)| {
+                if i == 0 {
+                    format!("{c:<w$}", w = widths[i])
+                } else {
+                    format!("{c:>w$}", w = widths[i])
+                }
+            })
             .collect::<Vec<_>>()
             .join("  ")
             .trim_end()
@@ -154,7 +200,9 @@ fn table(rows: &[Vec<String>]) -> String {
 }
 
 fn label_time(ms: i64, bucket: &str) -> String {
-    let Some(t) = chrono::DateTime::from_timestamp_millis(ms) else { return ms.to_string() };
+    let Some(t) = chrono::DateTime::from_timestamp_millis(ms) else {
+        return ms.to_string();
+    };
     match bucket {
         "day" => t.format("%Y-%m-%d").to_string(),
         _ => t.format("%Y-%m-%d %H:%M").to_string(),
@@ -214,7 +262,10 @@ fn codex_error_kind(info: &Value) -> Option<(&'static str, String)> {
         Value::String(name) => (name.as_str(), None),
         Value::Object(map) if map.len() == 1 => {
             let (name, inner) = map.iter().next()?;
-            (name.as_str(), inner.get("http_status_code").and_then(Value::as_i64))
+            (
+                name.as_str(),
+                inner.get("http_status_code").and_then(Value::as_i64),
+            )
         }
         _ => return None,
     };
@@ -222,7 +273,10 @@ fn codex_error_kind(info: &Value) -> Option<(&'static str, String)> {
         "server_overloaded" => "overloaded",
         "usage_limit_exceeded" => "quota_exhausted",
         "response_too_many_failed_attempts" => "retries_exhausted",
-        "http_connection_failed" | "response_stream_disconnected" | "internal_server_error" | "other" => "upstream_failed",
+        "http_connection_failed"
+        | "response_stream_disconnected"
+        | "internal_server_error"
+        | "other" => "upstream_failed",
         name if name.contains("policy") => "policy_blocked",
         _ => return None,
     };
@@ -242,10 +296,15 @@ pub fn codex_events_from_rollout(text: &str, fallback_session: &str) -> Vec<Impo
     let mut model: Option<String> = None;
     let mut out = Vec::new();
     for (line_no, line) in text.lines().enumerate() {
-        if !(line.contains("session_meta") || line.contains("turn_context") || line.contains("codex_error_info")) {
+        if !(line.contains("session_meta")
+            || line.contains("turn_context")
+            || line.contains("codex_error_info"))
+        {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         let payload = &record["payload"];
         match record["type"].as_str() {
             Some("session_meta") => {
@@ -256,11 +315,15 @@ pub fn codex_events_from_rollout(text: &str, fallback_session: &str) -> Vec<Impo
             Some("turn_context") => {
                 model = payload["model"].as_str().map(str::to_string);
             }
-            Some("event_msg") if matches!(payload["type"].as_str(), Some("task_complete" | "error")) => {
+            Some("event_msg")
+                if matches!(payload["type"].as_str(), Some("task_complete" | "error")) =>
+            {
                 let info = payload["error"]
                     .get("codex_error_info")
                     .or_else(|| payload.get("codex_error_info"));
-                let Some((kind, code)) = info.and_then(codex_error_kind) else { continue };
+                let Some((kind, code)) = info.and_then(codex_error_kind) else {
+                    continue;
+                };
                 let Some(ts) = record["timestamp"]
                     .as_str()
                     .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
@@ -284,15 +347,22 @@ pub fn codex_events_from_rollout(text: &str, fallback_session: &str) -> Vec<Impo
 }
 
 fn rollout_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         if kind.is_dir() {
             rollout_files(&path, out);
         } else if kind.is_file()
             && path.extension().is_some_and(|e| e == "jsonl")
-            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rollout-"))
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-"))
         {
             out.push(path);
         }
@@ -316,14 +386,22 @@ fn import_codex(args: &ImportCodexArgs, url: Option<String>) -> Result<(), Strin
     files.sort();
     let mut events = Vec::new();
     for file in &files {
-        let Ok(text) = std::fs::read_to_string(file) else { continue };
-        let fallback = file.file_stem().and_then(|s| s.to_str()).unwrap_or("rollout");
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let fallback = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rollout");
         events.extend(codex_events_from_rollout(&text, fallback));
     }
     let mut by_kind: BTreeMap<(String, String), i64> = BTreeMap::new();
     for event in &events {
         *by_kind
-            .entry((event.kind.clone(), event.error_code.clone().unwrap_or_default()))
+            .entry((
+                event.kind.clone(),
+                event.error_code.clone().unwrap_or_default(),
+            ))
             .or_default() += 1;
     }
     let first = events.iter().map(|e| e.ts).min();
@@ -333,7 +411,8 @@ fn import_codex(args: &ImportCodexArgs, url: Option<String>) -> Result<(), Strin
         files.len(),
         events.len(),
         match (first, last) {
-            (Some(a), Some(b)) => format!(" from {} to {}", label_time(a, "day"), label_time(b, "day")),
+            (Some(a), Some(b)) =>
+                format!(" from {} to {}", label_time(a, "day"), label_time(b, "day")),
             _ => String::new(),
         }
     );
@@ -351,16 +430,23 @@ fn import_codex(args: &ImportCodexArgs, url: Option<String>) -> Result<(), Strin
         let response = client
             .post(format!("{url}/admin/api/events/import"))
             .bearer_auth(&token)
-            .json(&ImportBody { events: chunk.to_vec() })
+            .json(&ImportBody {
+                events: chunk.to_vec(),
+            })
             .send()
             .map_err(|e| format!("cannot reach {url}: {e}"))?;
         if !response.status().is_success() {
             return Err(error_message(response));
         }
-        let body: Value = response.json().map_err(|e| format!("import response: {e}"))?;
+        let body: Value = response
+            .json()
+            .map_err(|e| format!("import response: {e}"))?;
         inserted += body["inserted"].as_i64().unwrap_or(0);
     }
-    println!("imported {inserted} new events ({} already present)", events.len() as i64 - inserted);
+    println!(
+        "imported {inserted} new events ({} already present)",
+        events.len() as i64 - inserted
+    );
     Ok(())
 }
 
@@ -383,14 +469,36 @@ mod tests {
         let events = codex_events_from_rollout(&text, "fallback");
         let summary: Vec<(&str, Option<&str>, Option<&str>, &str)> = events
             .iter()
-            .map(|e| (e.kind.as_str(), e.error_code.as_deref(), e.model.as_deref(), e.dedupe_key.as_str()))
+            .map(|e| {
+                (
+                    e.kind.as_str(),
+                    e.error_code.as_deref(),
+                    e.model.as_deref(),
+                    e.dedupe_key.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             summary,
             vec![
-                ("overloaded", Some("server_overloaded"), Some("gpt-6-astra"), "sess-1:23"),
-                ("policy_blocked", Some("cyber_policy"), Some("gpt-6-astra"), "sess-1:24"),
-                ("retries_exhausted", Some("response_too_many_failed_attempts.http_429"), Some("gpt-6-astra"), "sess-1:25"),
+                (
+                    "overloaded",
+                    Some("server_overloaded"),
+                    Some("gpt-6-astra"),
+                    "sess-1:23"
+                ),
+                (
+                    "policy_blocked",
+                    Some("cyber_policy"),
+                    Some("gpt-6-astra"),
+                    "sess-1:24"
+                ),
+                (
+                    "retries_exhausted",
+                    Some("response_too_many_failed_attempts.http_429"),
+                    Some("gpt-6-astra"),
+                    "sess-1:25"
+                ),
             ]
         );
         assert_eq!(events[0].ts, 1_792_043_371_503);
@@ -414,6 +522,12 @@ mod tests {
         assert!(text.contains("12.5k"), "{text}");
         assert!(text.contains("events: overloaded=1"), "{text}");
         let total = text.lines().find(|l| l.starts_with("total")).unwrap();
-        assert!(total.split_whitespace().collect::<Vec<_>>().starts_with(&["total", "3", "1", "12.5k", "40", "2", "1.5", "1", "1"]), "{total}");
+        assert!(
+            total
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .starts_with(&["total", "3", "1", "12.5k", "40", "2", "1.5", "1", "1"]),
+            "{total}"
+        );
     }
 }

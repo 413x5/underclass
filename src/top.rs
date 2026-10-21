@@ -98,7 +98,9 @@ pub fn admin_http_target(
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err("server URL must be an HTTP(S) origin without credentials, path, or query".into());
+        return Err(
+            "server URL must be an HTTP(S) origin without credentials, path, or query".into(),
+        );
     }
     let token = if url_override.is_some() {
         std::env::var("UNDERCLASS_UI_TOKEN")
@@ -306,7 +308,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             .iter()
             .filter(|a| {
                 a.status == AccountStatus::Healthy
-                    && a.cooling_scopes.values().all(|until| *until <= snapshot.now_ms)
+                    && a.cooling_scopes
+                        .values()
+                        .all(|until| *until <= snapshot.now_ms)
             })
             .count();
         let summary = vec![
@@ -422,7 +426,11 @@ fn account_columns(
     };
 
     let label_width = widest(
-        snapshot.accounts.iter().map(|a| display_text(&a.label)).collect(),
+        snapshot
+            .accounts
+            .iter()
+            .map(|a| display_text(&a.label))
+            .collect(),
         "ACCOUNT",
         MAX_LABEL_WIDTH,
     );
@@ -558,7 +566,12 @@ fn grow_to_fit(widths: Vec<u16>, weights: &[u16], area_width: u16) -> Vec<Constr
         *width = width.saturating_add(extra as u16);
     }
     // Hand the rounding remainder to the columns with the largest weight, keeping the total exact.
-    let mut leftover = available - (final_widths.iter().zip(&widths).map(|(new, old)| new - old).sum::<u16>());
+    let mut leftover = available
+        - (final_widths
+            .iter()
+            .zip(&widths)
+            .map(|(new, old)| new - old)
+            .sum::<u16>());
     let mut order: Vec<usize> = (0..weights.len()).collect();
     order.sort_by_key(|i| std::cmp::Reverse(weights[*i]));
     for i in order {
@@ -578,11 +591,16 @@ fn display_width(value: &str) -> usize {
 }
 
 fn plan_text(account: &MonitorAccount) -> String {
-    display_text(account.plan.as_deref().unwrap_or(if account.backend == BackendId::Codex {
-        "unknown"
-    } else {
-        "\u{2014}"
-    }))
+    display_text(
+        account
+            .plan
+            .as_deref()
+            .unwrap_or(if account.backend == BackendId::Codex {
+                "unknown"
+            } else {
+                "\u{2014}"
+            }),
+    )
 }
 
 fn status_text(account: &MonitorAccount, now: i64) -> String {
@@ -621,7 +639,8 @@ fn draw_accounts(
                 vec![
                     Cell::from(display_text(&account.label)),
                     Cell::from(plan_text(account)),
-                    Cell::from(status).style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
+                    Cell::from(status)
+                        .style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
                         .style(Style::default().fg(PURPLE)),
@@ -633,7 +652,8 @@ fn draw_accounts(
                     Cell::from(display_text(&account.label)),
                     Cell::from(plan_text(account)),
                     Cell::from(account.backend.as_str()),
-                    Cell::from(status).style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
+                    Cell::from(status)
+                        .style(Style::default().fg(row_status_color(account, snapshot.now_ms))),
                     Cell::from(account.inflight.to_string()).style(Style::default().fg(CYAN)),
                     Cell::from(account.sticky_sessions.to_string())
                         .style(Style::default().fg(PURPLE)),
@@ -762,15 +782,39 @@ fn recent_columns(area_width: u16, snapshot: &MonitorSnapshot) -> Vec<Constraint
             .max(usize::from(fallback))
             .min(usize::from(cap)) as u16
     };
-    let time = widest(snapshot.recent.iter().map(|_| "00:00:00".to_string()).collect(), 8, 8);
-    let status = widest(snapshot.recent.iter().map(|r| r.status.to_string()).collect(), 3, 3);
+    let time = widest(
+        snapshot
+            .recent
+            .iter()
+            .map(|_| "00:00:00".to_string())
+            .collect(),
+        8,
+        8,
+    );
+    let status = widest(
+        snapshot
+            .recent
+            .iter()
+            .map(|r| r.status.to_string())
+            .collect(),
+        3,
+        3,
+    );
     let duration = widest(
-        snapshot.recent.iter().map(|r| format!("{} ms", r.duration_ms)).collect(),
+        snapshot
+            .recent
+            .iter()
+            .map(|r| format!("{} ms", r.duration_ms))
+            .collect(),
         7,
         10,
     );
     let backend = widest(
-        snapshot.recent.iter().filter_map(|r| r.backend.clone()).collect(),
+        snapshot
+            .recent
+            .iter()
+            .filter_map(|r| r.backend.clone())
+            .collect(),
         5,
         10,
     );
@@ -846,15 +890,15 @@ fn draw_recent(
             }))
         })
         .collect();
-    let table = Table::new(
-        rows,
-        recent_columns(area.width, snapshot),
-    )
-    .block(panel().title(" recent outcomes "));
+    let table = Table::new(rows, recent_columns(area.width, snapshot))
+        .block(panel().title(" recent outcomes "));
     frame.render_widget(table, area);
 }
 
 fn quota(account: &MonitorAccount, now_ms: i64) -> String {
+    if account.backend == BackendId::Claude {
+        return claude_quota(account);
+    }
     if account.backend != BackendId::Codex {
         return "unknown".into();
     }
@@ -890,17 +934,91 @@ fn quota(account: &MonitorAccount, now_ms: i64) -> String {
     }
 }
 
+/// The Claude Code subscription windows, as the account's own usage API last reported them.
+fn claude_quota(account: &MonitorAccount) -> String {
+    let Some(observation) = &account.observation else {
+        return "waiting…".into();
+    };
+    let window = |name: &str| {
+        observation
+            .get(name)
+            .and_then(|w| w.get("utilization"))
+            .and_then(|u| u.as_f64())
+            .map(|utilization| (100.0 - utilization * 100.0).clamp(0.0, 100.0))
+    };
+    let mut windows = Vec::new();
+    if let Some(left) = window("five_hour") {
+        windows.push(format!("5h {left:.0}%"));
+    }
+    if let Some(left) = window("seven_day") {
+        windows.push(format!("7d {left:.0}%"));
+    }
+    if windows.is_empty() {
+        return "unavailable".into();
+    }
+    windows.join(" · ")
+}
+
 fn credits(account: &MonitorAccount) -> String {
+    if account.backend == BackendId::Claude {
+        return account
+            .observation
+            .as_ref()
+            .and_then(|o| o.get("reset_credits"))
+            .and_then(|c| c.as_i64())
+            .map_or("—".into(), |count| count.to_string());
+    }
     account
         .quota
         .as_ref()
         .map_or("—".into(), |q| q.available_resets.to_string())
 }
 
+/// The Claude Code windows use the same severity bands as the Codex quota.
+fn claude_quota_color(account: &MonitorAccount, now_ms: i64) -> Color {
+    let Some(observation) = &account.observation else {
+        return MUTED;
+    };
+    // A stale observation must not read as a live quota: the poll is what refreshes it, and a
+    // percentage from days ago still looks green or red with full confidence.
+    let observed_at = observation
+        .get("observed_at_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if now_ms.saturating_sub(observed_at) > 180_000 {
+        return MUTED;
+    }
+    let windows: Vec<f64> = ["five_hour", "seven_day"]
+        .into_iter()
+        .filter_map(|name| {
+            observation
+                .get(name)
+                .and_then(|w| w.get("utilization"))
+                .and_then(|u| u.as_f64())
+                .map(|utilization| (100.0 - utilization * 100.0).clamp(0.0, 100.0))
+        })
+        .collect();
+    // Nothing to grade: an observation carrying only the plan or reset credits must read as
+    // unknown, not as 100% remaining.
+    let Some(remaining) = windows.into_iter().reduce(f64::min) else {
+        return MUTED;
+    };
+    if remaining <= 10.0 {
+        RED
+    } else if remaining <= 30.0 {
+        YELLOW
+    } else {
+        GREEN
+    }
+}
+
 /// @cc [owner:ghuntley,label:cli] quota-color-severity
 /// Fresh Codex quota MUST use the least remaining window: green above 30%, amber above 10% through
 /// 30%, red at 10% or less or when exhausted. Missing or stale quota MUST use a muted color.
 fn quota_color(account: &MonitorAccount, now_ms: i64) -> Color {
+    if account.backend == BackendId::Claude {
+        return claude_quota_color(account, now_ms);
+    }
     if account.backend != BackendId::Codex {
         return MUTED;
     }
@@ -960,7 +1078,11 @@ fn scoped_status(account: &MonitorAccount, now: i64) -> Option<String> {
     live.sort_by_key(|(_, until)| *until);
     let (first_scope, first_until) = live.first()?;
     let extra = live.len() - 1;
-    let suffix = if extra > 0 { format!(" +{extra}") } else { String::new() };
+    let suffix = if extra > 0 {
+        format!(" +{extra}")
+    } else {
+        String::new()
+    };
     Some(format!(
         "cooling {first_scope} {}{suffix}",
         time_until(*first_until, now)
@@ -1003,6 +1125,41 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn claude_quota_column_reports_the_subscription_windows() {
+        let account = MonitorAccount {
+            id: "c".into(),
+            label: "claude@example.test".into(),
+            backend: BackendId::Claude,
+            plan: Some("max".into()),
+            status: AccountStatus::Healthy,
+            reset_at: 0,
+            cooling_scopes: Default::default(),
+            inflight: 0,
+            sticky_sessions: 0,
+            month: Counters::default(),
+            observation: Some(serde_json::json!({
+                "plan": "max",
+                "five_hour": {"utilization": 0.07},
+                "seven_day": {"utilization": 0.42},
+                "reset_credits": 2,
+            })),
+            quota: None,
+        };
+        assert_eq!(quota(&account, 1_000), "5h 93% · 7d 58%");
+        assert_eq!(credits(&account), "2");
+        assert_eq!(quota_color(&account, 1_000), GREEN);
+
+        let exhausted = MonitorAccount {
+            observation: Some(serde_json::json!({
+                "five_hour": {"utilization": 1.0},
+                "seven_day": {"utilization": 0.1},
+            })),
+            ..account
+        };
+        assert_eq!(quota_color(&exhausted, 1_000), RED);
+    }
+
+    #[test]
     fn quota_palette_tracks_lowest_window_and_staleness() {
         let mut account = MonitorAccount {
             id: "a".into(),
@@ -1015,6 +1172,7 @@ mod tests {
             inflight: 0,
             sticky_sessions: 0,
             month: Counters::default(),
+            observation: None,
             quota: Some(UsageSnapshot {
                 rate_limit: Some(RateLimit {
                     allowed: Some(true),
@@ -1056,10 +1214,18 @@ mod tests {
     #[test]
     fn partially_cooled_accounts_are_not_reported_healthy() {
         let mut account = MonitorAccount {
-            id: "a".into(), label: "alice".into(), backend: BackendId::Cline,
-            plan: None, status: AccountStatus::Healthy, reset_at: 0,
-            cooling_scopes: Default::default(), inflight: 0, sticky_sessions: 0,
-            month: Counters::default(), quota: None,
+            id: "a".into(),
+            label: "alice".into(),
+            backend: BackendId::Cline,
+            plan: None,
+            status: AccountStatus::Healthy,
+            reset_at: 0,
+            cooling_scopes: Default::default(),
+            inflight: 0,
+            sticky_sessions: 0,
+            month: Counters::default(),
+            quota: None,
+            observation: None,
         };
         assert_eq!(scoped_status(&account, 1_000), None, "nothing cooling yet");
 
@@ -1086,10 +1252,18 @@ mod tests {
                     now_ms: 120_000,
                     month_start_ms: 0,
                     accounts: vec![MonitorAccount {
-                        id: "account".into(), label: "test account".into(),
-                        backend: BackendId::Codex, plan: Some("plus".into()),
-                        status: AccountStatus::Healthy, reset_at: 0, cooling_scopes: Default::default(), inflight: 0,
-                        sticky_sessions: 0, month: Counters::default(), quota: None,
+                        id: "account".into(),
+                        label: "test account".into(),
+                        backend: BackendId::Codex,
+                        plan: Some("plus".into()),
+                        status: AccountStatus::Healthy,
+                        reset_at: 0,
+                        cooling_scopes: Default::default(),
+                        inflight: 0,
+                        sticky_sessions: 0,
+                        month: Counters::default(),
+                        observation: None,
+                        quota: None,
                     }],
                     month: Counters::default(),
                     last_minute: Counters::default(),
@@ -1100,8 +1274,13 @@ mod tests {
             };
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             if width >= 80 {
-                let screen = terminal.backend().buffer().content().iter()
-                    .map(|cell| cell.symbol()).collect::<String>();
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
                 assert!(screen.contains("PLAN"));
                 assert!(screen.contains("plus"));
             }
@@ -1132,14 +1311,12 @@ mod width_tests {
                     plan: None,
                     status: AccountStatus::Healthy,
                     reset_at: 0,
-                    cooling_scopes: scopes
-                        .iter()
-                        .map(|(s, d)| ((*s).to_string(), *d))
-                        .collect(),
+                    cooling_scopes: scopes.iter().map(|(s, d)| ((*s).to_string(), *d)).collect(),
                     inflight: 0,
                     sticky_sessions: 0,
                     month: Counters::default(),
                     quota: None,
+                    observation: None,
                 },
                 MonitorAccount {
                     id: "b".into(),
@@ -1151,6 +1328,7 @@ mod width_tests {
                     cooling_scopes: [("credits".to_string(), 1_725_000)].into_iter().collect(),
                     inflight: 1,
                     sticky_sessions: 0,
+                    observation: None,
                     month: Counters::default(),
                     quota: None,
                 },
@@ -1164,7 +1342,7 @@ mod width_tests {
 
     fn render(width: u16) -> String {
         let mut app = App {
-            snapshot: Some(snap(&[("credits", 1_725_000), ("cline-pass", 1_800_000)]),),
+            snapshot: Some(snap(&[("credits", 1_725_000), ("cline-pass", 1_800_000)])),
             ..Default::default()
         };
         let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 30)).unwrap();
@@ -1215,12 +1393,16 @@ mod fit_tests {
             sticky_sessions: 0,
             month: Counters::default(),
             quota: None,
+            observation: None,
         };
         MonitorSnapshot {
             now_ms: 1_000_000,
             month_start_ms: 0,
             accounts: vec![
-                account("alex4ndrus", &[("credits", 1_725_000), ("cline-pass", 1_800_000)]),
+                account(
+                    "alex4ndrus",
+                    &[("credits", 1_725_000), ("cline-pass", 1_800_000)],
+                ),
                 account("413x5", &[("credits", 1_725_000)]),
             ],
             month: Counters::default(),
@@ -1324,7 +1506,11 @@ mod fit_tests {
     fn widths_are_measured_in_terminal_cells() {
         // Double-width glyphs need two cells each; counting code points would clip them.
         assert_eq!(display_width("413x5"), 5);
-        assert_eq!(display_width("\u{4f60}\u{597d}"), 4, "CJK glyphs are two cells each");
+        assert_eq!(
+            display_width("\u{4f60}\u{597d}"),
+            4,
+            "CJK glyphs are two cells each"
+        );
         assert_eq!(display_width("\u{1f600}"), 2, "emoji is two cells");
         assert_eq!(display_width("MONTH ATT \u{00b7} IN/OUT"), 18);
     }
@@ -1334,9 +1520,17 @@ mod fit_tests {
         let snap = snapshot();
         let (_, widths, _) = account_columns(&snap, false);
         // Every account is Cline with no plan, so PLAN is sized by its header, not a fixed 12.
-        assert_eq!(widths[1], display_width("PLAN") as u16, "PLAN starts at its header width");
+        assert_eq!(
+            widths[1],
+            display_width("PLAN") as u16,
+            "PLAN starts at its header width"
+        );
         // RESETS is the same for every account here.
-        assert_eq!(widths[7], display_width("RESETS") as u16, "RESETS starts at its header width");
+        assert_eq!(
+            widths[7],
+            display_width("RESETS") as u16,
+            "RESETS starts at its header width"
+        );
         // ACCOUNT starts at the longest label, not a percentage of the panel.
         assert_eq!(widths[0], display_width("alex4ndrus") as u16);
     }

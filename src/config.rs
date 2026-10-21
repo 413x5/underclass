@@ -10,6 +10,8 @@ pub struct FileConfig {
     pub copilot_cooldown_secs: Option<u64>,
     pub cline_cooldown_secs: Option<u64>,
     pub cline_cooldown_ms: Option<u64>,
+    pub claude_cooldown_secs: Option<u64>,
+    pub claude_cooldown_ms: Option<u64>,
     pub copilot_cooldown_ms: Option<u64>,
     pub codex_cooldown_ms: Option<u64>,
     pub auto_codex_resets: Option<bool>,
@@ -25,6 +27,7 @@ pub struct Config {
     pub auto_codex_resets: bool,
     pub copilot_cooldown_ms: i64,
     pub cline_cooldown_ms: i64,
+    pub claude_cooldown_ms: i64,
     pub stats_retention_days: i64,
     pub data_dir: PathBuf,
     #[allow(dead_code)]
@@ -77,7 +80,9 @@ impl Config {
         let proxy_key = std::env::var("UNDERCLASS_PROXY_KEY")
             .ok()
             .or(file_cfg.proxy_key);
-        let ui_token = std::env::var("UNDERCLASS_UI_TOKEN").ok().or(file_cfg.ui_token);
+        let ui_token = std::env::var("UNDERCLASS_UI_TOKEN")
+            .ok()
+            .or(file_cfg.ui_token);
         let codex_cooldown_ms = file_cfg
             .codex_cooldown_ms
             .or(file_cfg.codex_cooldown_secs.map(|s| s * 1000))
@@ -92,6 +97,10 @@ impl Config {
             .map(|value| value.saturating_mul(1000))
             .or(file_cfg.cline_cooldown_ms)
             .or(file_cfg.cline_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
+        let claude_cooldown_ms = file_cfg
+            .claude_cooldown_ms
+            .or(file_cfg.claude_cooldown_secs.map(|s| s * 1000))
             .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
 
         let auto_codex_resets = std::env::var("UNDERCLASS_AUTO_CODEX_RESETS")
@@ -115,6 +124,7 @@ impl Config {
             auto_codex_resets,
             copilot_cooldown_ms,
             cline_cooldown_ms,
+            claude_cooldown_ms,
             stats_retention_days,
             data_dir,
             config_dir,

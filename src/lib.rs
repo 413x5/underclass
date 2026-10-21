@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod cli;
 pub mod cline;
 pub mod codex;

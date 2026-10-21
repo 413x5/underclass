@@ -1,5 +1,5 @@
 use crate::flows::{FlowRegistry, FlowState};
-use crate::models::{now_ms, Account, BackendId, ModelInfo};
+use crate::models::{Account, BackendId, ModelInfo, Surface, now_ms};
 use crate::provider::Backend;
 use crate::store::Store;
 use http::HeaderMap;
@@ -11,7 +11,11 @@ use std::sync::Arc;
 pub const CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
 pub const API_VERSION: &str = "2026-06-01";
 pub const DEFAULT_API_BASE: &str = "https://api.githubcopilot.com";
-pub const USER_AGENT: &str = concat!("opencode/", env!("CARGO_PKG_VERSION"), " (underclass-pool-proxy)");
+pub const USER_AGENT: &str = concat!(
+    "opencode/",
+    env!("CARGO_PKG_VERSION"),
+    " (underclass-pool-proxy)"
+);
 
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeInit {
@@ -101,8 +105,12 @@ async fn poll_access_token(
     }
     let poll: DeviceCodePoll = resp.json().await?;
     match poll.error.as_deref() {
-        Some("authorization_pending") => Err(AuthError::Pending { interval: poll.interval }),
-        Some("slow_down") => Err(AuthError::SlowDown { interval: poll.interval }),
+        Some("authorization_pending") => Err(AuthError::Pending {
+            interval: poll.interval,
+        }),
+        Some("slow_down") => Err(AuthError::SlowDown {
+            interval: poll.interval,
+        }),
         Some(other) => Err(AuthError::Failed(other.to_string())),
         None => {
             if poll.access_token.is_some() {
@@ -114,7 +122,11 @@ async fn poll_access_token(
     }
 }
 
-pub async fn fetch_catalog(client: &Client, account: &Account, token: &str) -> Result<Vec<ModelInfo>, AuthError> {
+pub async fn fetch_catalog(
+    client: &Client,
+    account: &Account,
+    token: &str,
+) -> Result<Vec<ModelInfo>, AuthError> {
     let url = format!("{}/models", api_base(account));
     let resp = client
         .get(&url)
@@ -154,9 +166,7 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
         {
             continue;
         }
-        let limits = item
-            .get("capabilities")
-            .and_then(|c| c.get("limits"));
+        let limits = item.get("capabilities").and_then(|c| c.get("limits"));
         let Some(limits) = limits else { continue };
         let max_output = limits.get("max_output_tokens").and_then(|v| v.as_i64());
         let max_prompt = limits.get("max_prompt_tokens").and_then(|v| v.as_i64());
@@ -197,11 +207,7 @@ pub fn parse_github_user(body: &Value) -> Option<String> {
     body.get("login")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .or_else(|| {
-            body.get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
+        .or_else(|| body.get("name").and_then(|v| v.as_str()).map(String::from))
         .filter(|s| !s.is_empty())
 }
 
@@ -250,7 +256,10 @@ pub async fn start_flow(
     tokio::spawn(async move {
         let mut current_interval = interval;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(current_interval * 1000 + 3000)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                current_interval * 1000 + 3000,
+            ))
+            .await;
             match poll_access_token(&client, &domain, &init).await {
                 Err(AuthError::Pending { interval }) => {
                     current_interval = interval.unwrap_or(current_interval);
@@ -261,7 +270,12 @@ pub async fn start_flow(
                     continue;
                 }
                 Err(e) => {
-                    flows.set_state(&flow_id, FlowState::Failed { message: e.to_string() });
+                    flows.set_state(
+                        &flow_id,
+                        FlowState::Failed {
+                            message: e.to_string(),
+                        },
+                    );
                     return;
                 }
                 Ok(poll) => {
@@ -277,9 +291,12 @@ pub async fn start_flow(
                                 store.upsert_account(&account);
                                 account
                             } else {
-                                flows.set_state(&flow_id, FlowState::Failed {
-                                    message: "account being replaced no longer exists".into(),
-                                });
+                                flows.set_state(
+                                    &flow_id,
+                                    FlowState::Failed {
+                                        message: "account being replaced no longer exists".into(),
+                                    },
+                                );
                                 return;
                             }
                         }
@@ -302,9 +319,12 @@ pub async fn start_flow(
                             store.set_catalog(BackendId::Copilot, &catalog);
                         }
                     }
-                    flows.set_state(&flow_id, FlowState::Authorized {
-                        account_id: account.id,
-                    });
+                    flows.set_state(
+                        &flow_id,
+                        FlowState::Authorized {
+                            account_id: account.id,
+                        },
+                    );
                     return;
                 }
             }
@@ -345,20 +365,37 @@ impl Backend for CopilotBackend {
     /// For streamed chat completions, request final usage only when the client has not supplied
     /// `stream_options.include_usage`; explicit client settings MUST be preserved.
     fn auto_stream_usage(&self, path: &str, body: &mut Value) -> bool {
-        if !path.ends_with("/chat/completions") || body.get("stream").and_then(Value::as_bool) != Some(true) { return false; }
-        let Some(obj) = body.as_object_mut() else { return false; };
+        if !path.ends_with("/chat/completions")
+            || body.get("stream").and_then(Value::as_bool) != Some(true)
+        {
+            return false;
+        }
+        let Some(obj) = body.as_object_mut() else {
+            return false;
+        };
         if let Some(options) = obj.get_mut("stream_options") {
-            let Some(options) = options.as_object_mut() else { return false; };
-            if options.contains_key("include_usage") { return false; }
+            let Some(options) = options.as_object_mut() else {
+                return false;
+            };
+            if options.contains_key("include_usage") {
+                return false;
+            }
             options.insert("include_usage".into(), Value::Bool(true));
         } else {
-            obj.insert("stream_options".into(), serde_json::json!({"include_usage": true}));
+            obj.insert(
+                "stream_options".into(),
+                serde_json::json!({"include_usage": true}),
+            );
         }
         true
     }
 
     fn id(&self) -> BackendId {
         BackendId::Copilot
+    }
+
+    fn surfaces(&self) -> &'static [Surface] {
+        &[Surface::OpenAI]
     }
 
     fn default_cooldown_ms(&self) -> i64 {
@@ -379,13 +416,17 @@ impl Backend for CopilotBackend {
         token: &str,
         sticky: Option<&str>,
         body: &Value,
+        _client: &HeaderMap,
         headers: &mut HeaderMap,
     ) {
         headers.insert(
             http::header::AUTHORIZATION,
             http::HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
         );
-        headers.insert("X-GitHub-Api-Version", http::HeaderValue::from_static(API_VERSION));
+        headers.insert(
+            "X-GitHub-Api-Version",
+            http::HeaderValue::from_static(API_VERSION),
+        );
         if let Ok(v) = http::HeaderValue::from_str(USER_AGENT) {
             headers.insert(http::header::USER_AGENT, v);
         }
@@ -438,9 +479,13 @@ mod tests {
     #[test]
     fn stream_usage_preserves_explicit_client_choice() {
         let backend = CopilotBackend { cooldown_ms: 1000 };
-        let mut body = json!({"stream": true, "stream_options": {"include_usage": false, "other": 1}});
+        let mut body =
+            json!({"stream": true, "stream_options": {"include_usage": false, "other": 1}});
         assert!(!backend.auto_stream_usage("/v1/chat/completions", &mut body));
-        assert_eq!(body["stream_options"], json!({"include_usage": false, "other": 1}));
+        assert_eq!(
+            body["stream_options"],
+            json!({"include_usage": false, "other": 1})
+        );
         let mut responses = json!({"stream": true});
         assert!(!backend.auto_stream_usage("/v1/responses", &mut responses));
         assert!(responses.get("stream_options").is_none());
@@ -530,7 +575,8 @@ mod tests {
         assert!(body_has_image(&responses));
         let plain = json!({"messages": [{"role": "user", "content": "just text"}]});
         assert!(!body_has_image(&plain));
-        let text_only = json!({"messages": [{"role": "user", "content": "the string image_url here"}]});
+        let text_only =
+            json!({"messages": [{"role": "user", "content": "the string image_url here"}]});
         assert!(!body_has_image(&text_only));
     }
 }

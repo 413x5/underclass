@@ -1,11 +1,11 @@
 use crate::logging;
-use crate::models::{now_ms, BackendId, Outcome, RequestLogEntry};
+use crate::models::{AccountStatus, BackendId, Outcome, RequestLogEntry, Surface, now_ms};
 use crate::pool::{Decision, PoolCore, SelectError, Selection};
 use crate::provider::BackendMap;
 use crate::store::Store;
 use crate::store::{UpstreamEvent, UsageRecord};
-use crate::usage::{StreamEnd, StreamOutcome, UsageTap, usage_from_json};
 use crate::tokens::TokenManager;
+use crate::usage::{StreamEnd, StreamOutcome, UsageTap, usage_from_dialect};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -20,6 +20,35 @@ use tower_http::request_id::RequestId;
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const LOG_BUFFER: usize = 200;
+/// How long a streamed response is held back waiting for its first output or terminal event.
+/// Upstream capacity failures before output observed in practice arrive within 60s (265 of 266).
+const PRE_OUTPUT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+/// Upper bound on bytes buffered while holding a stream before its first output.
+const PRE_OUTPUT_HOLD_BYTES: usize = 1024 * 1024;
+
+/// Client headers that never travel upstream: credentials and transport-level headers. The
+/// proxy injects the selected account's credential itself (CONTRACTS
+/// `outbound-credential-stripping`), and the transport headers belong to the client's hop.
+const STRIPPED_CLIENT_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "cookie",
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "accept-encoding",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-request-id",
+];
 
 pub struct AppState {
     pub store: Arc<Store>,
@@ -33,6 +62,9 @@ pub struct AppState {
     pub ui_token: String,
     pub resets: Arc<crate::resets::ResetManager>,
     pub stream_usage_unsupported: Mutex<std::collections::HashSet<BackendId>>,
+    /// Per-account observations a backend reported about its last upstream response, keyed by
+    /// account id. Backends decide what to report; the proxy only stores it.
+    pub observations: Mutex<std::collections::HashMap<String, Value>>,
     /// How long usage rows, upstream events, and daily rollups are kept.
     pub stats_retention_days: i64,
 }
@@ -49,6 +81,9 @@ struct UsageFinish {
     record: UsageRecord,
     tap: UsageTap,
     ended: Option<StreamEnd>,
+    /// Where an upstream event surfaced: `stream`, or `stream_failover` when the attempt was
+    /// discarded and retried on another account.
+    detail: &'static str,
 }
 
 impl Drop for UsageFinish {
@@ -72,14 +107,10 @@ impl Drop for UsageFinish {
             report.saw_output,
             duration_ms,
         );
-        if let Some(entry) = self
-            .logs
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.request_id == self.record.request_id && entry.account.as_deref() == Some(self.record.account_id.as_str()))
-        {
+        if let Some(entry) = self.logs.lock().unwrap().iter_mut().rev().find(|entry| {
+            entry.request_id == self.record.request_id
+                && entry.account.as_deref() == Some(self.record.account_id.as_str())
+        }) {
             entry.stream_outcome = self.record.stream_outcome.clone();
             entry.error_code = self.record.error_code.clone();
         }
@@ -90,14 +121,24 @@ impl Drop for UsageFinish {
             _ => false,
         };
         if notable {
-            self.store.insert_upstream_event(&event_for(&self.record, kind, "stream", report.error_code.clone()));
+            self.store.insert_upstream_event(&event_for(
+                &self.record,
+                kind,
+                self.detail,
+                report.error_code.clone(),
+            ));
         }
         // Written last: once the usage row is visible, the event and annotation already exist.
         persist_usage(&self.store, &self.record);
     }
 }
 
-fn event_for(record: &UsageRecord, kind: &str, detail: &str, error_code: Option<String>) -> UpstreamEvent {
+fn event_for(
+    record: &UsageRecord,
+    kind: &str,
+    detail: &str,
+    error_code: Option<String>,
+) -> UpstreamEvent {
     UpstreamEvent {
         ts: now_ms(),
         source: "proxy".into(),
@@ -144,9 +185,29 @@ fn persist_usage(store: &Store, record: &UsageRecord) {
 
 /// `started_ms` is when the attempt began, so `ts .. ts + duration_ms` is the attempt's lifetime.
 #[allow(clippy::too_many_arguments)]
-fn usage_record(request_id: &str, path: &str, model: &str, sticky: Option<&str>, selection: &Selection, account: &crate::models::Account, status: u16, started_ms: i64) -> UsageRecord {
+fn usage_record(
+    request_id: &str,
+    path: &str,
+    model: &str,
+    sticky: Option<&str>,
+    selection: &Selection,
+    account: &crate::models::Account,
+    status: u16,
+    started_ms: i64,
+) -> UsageRecord {
     UsageRecord {
-        id: 0, request_id: request_id.to_string(), ts: started_ms, endpoint: path.to_string(), backend: selection.backend.as_str().to_string(), model: model.to_string(), account_id: selection.account_id.clone(), account_label: account.label.clone(), cache_key: sticky.map(str::to_string), status, input_tokens: None, output_tokens: None,
+        id: 0,
+        request_id: request_id.to_string(),
+        ts: started_ms,
+        endpoint: path.to_string(),
+        backend: selection.backend.as_str().to_string(),
+        model: model.to_string(),
+        account_id: selection.account_id.clone(),
+        account_label: account.label.clone(),
+        cache_key: sticky.map(str::to_string),
+        status,
+        input_tokens: None,
+        output_tokens: None,
         ..Default::default()
     }
 }
@@ -176,23 +237,30 @@ fn usage_is_stream(body: &Value, content_type: &[u8]) -> bool {
 
 /// @cc [owner:ghuntley,label:security] proxy-key-gate
 /// When a proxy key is configured, requests to `/v1/*` MUST be rejected with 401 unless the
-/// `Authorization` header carries exactly `Bearer <proxy_key>`. When no key is configured
-/// (localhost-only mode) requests pass.
+/// `Authorization` header carries exactly `Bearer <proxy_key>`, or the `x-api-key` header
+/// carries exactly `<proxy_key>`. When no key is configured (localhost-only mode) requests pass.
 pub async fn require_proxy_key(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
     if let Some(expected) = &state.proxy_key {
-        let provided = req
+        // Either header may carry the key. Testing them independently matters for the Claude Code
+        // client, which sends its own `Authorization` when the operator supplied the key through
+        // `ANTHROPIC_API_KEY` (`x-api-key`); preferring `Authorization` would reject that request.
+        let bearer = req
             .headers()
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_string);
-        match provided {
-            Some(key) if key == *expected => {}
-            _ => {
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+        let authorized = [bearer, api_key]
+            .into_iter()
+            .flatten()
+            .any(|key| key == expected.as_str());
+        match authorized {
+            true => {}
+            false => {
                 return (
                     StatusCode::UNAUTHORIZED,
                     axum::Json(serde_json::json!({
@@ -233,9 +301,7 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
 fn upstream_error_response(status: StatusCode, content_type: &str, body: String) -> Response {
     (
         status,
-        [
-            (http::header::CONTENT_TYPE, content_type.to_string()),
-        ],
+        [(http::header::CONTENT_TYPE, content_type.to_string())],
         body,
     )
         .into_response()
@@ -267,13 +333,56 @@ fn attach_request_id(mut resp: Response, request_id: &str) -> Response {
 enum Attempt {
     Respond(Response),
     Failover(Option<Response>),
+    /// The stream failed with a capacity code before any output; `replay` holds what upstream
+    /// sent, for the client if no other account succeeds.
+    Overloaded {
+        account_id: String,
+        replay: Response,
+    },
+    /// This account cannot serve the request and has no upstream response worth keeping (a
+    /// transient credential failure); skip it for the rest of the request rather than re-selecting
+    /// it, which a sticky binding would otherwise guarantee.
+    Excluded(String),
 }
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
 /// When selection returns `Saturated`, `infer` MUST first make one automatic Codex reset attempt
 /// for a live Codex-pool outage, then select again. If no account recovers, it MUST respond with
-/// 429 and `Retry-After` equal to the seconds until `until_ms`.
+/// 429 and `Retry-After` equal to the seconds until `until_ms`. Exception: once an account has
+/// been excluded for an overload before output, a failed selection MUST return that held upstream
+/// response instead, without a reset attempt.
 pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    run(state, req, Surface::OpenAI).await
+}
+
+/// The Anthropic Messages API surface. Only official Claude Code clients are admitted.
+pub async fn messages(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    run(state, req, Surface::Anthropic).await
+}
+
+/// @cc [owner:ghuntley,label:proxy] surface-client-admission
+/// A request MUST be rejected with 403 before any pooled credential is used when no backend
+/// serving the requested surface admits it as a client.
+fn surface_accepts_client(
+    state: &AppState,
+    surface: Surface,
+    headers: &HeaderMap,
+    body: &Value,
+) -> bool {
+    let serving: Vec<_> = state
+        .backends
+        .values()
+        .filter(|backend| backend.surfaces().contains(&surface))
+        .collect();
+    if serving.is_empty() {
+        return true;
+    }
+    serving
+        .iter()
+        .any(|backend| backend.accepts_client(headers, body))
+}
+
+async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
     let started = Instant::now();
     let request_id = req
         .extensions()
@@ -282,8 +391,24 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         .unwrap_or("unknown")
         .to_string();
     let path = req.uri().path().to_string();
-    let session_header = req
-        .headers()
+    // The routes are nested under `/v1`, so the router hands the handler a path without that
+    // prefix. The upstream URL is built from it; the usage record keeps the client's route.
+    let endpoint = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path().to_string())
+        .unwrap_or_else(|| path.clone());
+    // The Anthropic API is called with the client's own query string (`?beta=true`).
+    let target = match surface {
+        Surface::Anthropic => req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| path.clone()),
+        Surface::OpenAI => path.clone(),
+    };
+    let client_headers = req.headers().clone();
+    let session_header = client_headers
         .get("session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
@@ -316,36 +441,126 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         }
     };
 
-    let model = body
+    if !surface_accepts_client(&state, surface, &client_headers, &body) {
+        return attach_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "this endpoint only accepts official Claude Code clients",
+                "client_not_allowed",
+            ),
+            &request_id,
+        );
+    }
+
+    // The Anthropic catalog is lowercase and clients vary the case, so that surface keeps its
+    // case-insensitive canonical form. Every other surface matches the id against an
+    // operator-editable catalog verbatim.
+    let raw_model = body
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let sticky = extract_sticky_key(&body, session_header.as_deref());
+        .unwrap_or_default();
+    let model = match surface {
+        Surface::Anthropic => crate::claude::canonical_model(raw_model),
+        Surface::OpenAI => crate::models::normalize_model_name(raw_model),
+    };
+    let sticky = match surface {
+        Surface::Anthropic => crate::claude::sticky_key(&client_headers, &body),
+        Surface::OpenAI => extract_sticky_key(&body, session_header.as_deref()),
+    };
 
-    state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
+    // A banked ChatGPT reset is spent from the operator's own subscription, so it is only ever
+    // redeemed for a request that could actually be served by a Codex account. An Anthropic
+    // request never is, and spending a credit on its behalf would be a silent cost.
+    let codex_resets = surface == Surface::OpenAI;
+    if codex_resets {
+        state
+            .resets
+            .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+            .await;
+    }
 
-    let total_accounts = state.pool.lock().unwrap().accounts.len().max(1);
+    // Only accounts that can actually serve this request's surface are selectable, so the budget
+    // must count those: a pool with one Codex and ten Claude accounts would otherwise retry the
+    // single Codex account eleven times on an OpenAI request.
+    let total_accounts = {
+        let pool = state.pool.lock().unwrap();
+        pool.accounts
+            .values()
+            .filter(|s| pool.serves_surface(s.account.backend, surface))
+            .count()
+            .max(1)
+    };
     let mut last_upstream: Option<Response> = None;
     let mut refreshed: std::collections::HashSet<String> = Default::default();
     let mut reset_after_quota = false;
     let mut attempts = 0;
     let mut max_attempts = total_accounts;
+    // Accounts whose stream failed with a capacity code before output, skipped for this request.
+    let mut overloaded: std::collections::HashSet<String> = Default::default();
+    // Accounts skipped because a token refresh was merely deferred. Kept apart from `overloaded`
+    // because such an account is still healthy: a rebind it causes must not outlive the request.
+    // Shared with `AffinityGuard`, which is built before the loop runs and must observe the
+    // exclusions recorded inside it.
+    let deferred: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Default::default();
 
-    while attempts < max_attempts {
-        attempts += 1;
-        let mut selection = state
+    // The session's binding before any rebind this request causes, so a deferral-induced rebind
+    // can be undone instead of quietly moving the session off its account.
+    let original_binding = sticky.as_deref().and_then(|key| {
+        state
             .pool
             .lock()
             .unwrap()
-            .select(now_ms(), sticky.as_deref(), &model);
+            .binding(key)
+            .map(|(account_id, bound_at)| (key.to_string(), account_id, bound_at))
+    });
 
-        if matches!(selection, Err(SelectError::Saturated { .. })) && !reset_after_quota {
+    // Restores the session's affinity on every exit from this request, however it ends.
+    let _affinity = AffinityGuard {
+        state: state.clone(),
+        original: original_binding.clone(),
+        deferred: deferred.clone(),
+    };
+
+    while attempts < max_attempts {
+        attempts += 1;
+        let mut selection = state.pool.lock().unwrap().select_excluding(
+            now_ms(),
+            sticky.as_deref(),
+            &model,
+            surface,
+            &overloaded,
+        );
+
+        if selection.is_err()
+            && !overloaded.is_empty()
+            && let Some(replay) = last_upstream.take()
+        {
+            logging::log_request_completed(
+                &request_id,
+                replay.status().as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
+            return attach_request_id(replay, &request_id);
+        }
+
+        if codex_resets
+            && matches!(selection, Err(SelectError::Saturated { .. }))
+            && !reset_after_quota
+        {
             reset_after_quota = true;
             // Always select again: the reset attempt can wait on the shared reset lock and on
             // usage fetches, during which cooling deadlines may pass even if nothing was redeemed.
-            state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
-            selection = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
+            state
+                .resets
+                .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+                .await;
+            selection = state.pool.lock().unwrap().select_excluding(
+                now_ms(),
+                sticky.as_deref(),
+                &model,
+                surface,
+                &overloaded,
+            );
         }
 
         let selection = match selection {
@@ -377,9 +592,18 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
             account_label(&state, &selection.account_id).as_deref(),
         );
 
-        if selection.decision == Decision::NewBinding || selection.decision == Decision::StickyRebind {
+        if selection.decision == Decision::NewBinding
+            || selection.decision == Decision::StickyRebind
+        {
             if let Some(key) = &sticky {
-                if let Some(binding) = state.pool.lock().unwrap().bindings().into_iter().find(|b| b.cache_key == *key) {
+                if let Some(binding) = state
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .bindings()
+                    .into_iter()
+                    .find(|b| b.cache_key == *key)
+                {
                     state.store.upsert_binding(&binding);
                     state.store.prune_bindings(
                         now_ms(),
@@ -393,24 +617,42 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         match attempt_account(
             &state,
             &request_id,
-            &path,
+            &endpoint,
+            &target,
             &model,
             sticky.as_deref(),
             &selection,
             body_bytes.clone(),
+            &client_headers,
             &mut refreshed,
         )
         .await
         {
             Attempt::Respond(resp) => {
-                logging::log_request_completed(&request_id, resp.status().as_u16(), started.elapsed().as_millis() as u64);
+                logging::log_request_completed(
+                    &request_id,
+                    resp.status().as_u16(),
+                    started.elapsed().as_millis() as u64,
+                );
                 return resp;
+            }
+            Attempt::Overloaded { account_id, replay } => {
+                overloaded.insert(account_id);
+                last_upstream = Some(replay);
+            }
+            Attempt::Excluded(account_id) => {
+                deferred.lock().unwrap().insert(account_id.clone());
+                overloaded.insert(account_id);
             }
             Attempt::Failover(passthrough) => {
                 last_upstream = passthrough.or(last_upstream);
-                if attempts == max_attempts && !reset_after_quota {
+                if codex_resets && attempts == max_attempts && !reset_after_quota {
                     reset_after_quota = true;
-                    if state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await {
+                    if state
+                        .resets
+                        .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+                        .await
+                    {
                         max_attempts += 1;
                     }
                 }
@@ -418,7 +660,11 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         }
     }
 
-    let saturated = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
+    let saturated = state
+        .pool
+        .lock()
+        .unwrap()
+        .select(now_ms(), sticky.as_deref(), &model, surface);
     if let Err(SelectError::Saturated { until_ms }) = saturated {
         record_saturated(&state, &request_id, &model, until_ms);
         return attach_request_id(saturated_response(until_ms), &request_id);
@@ -436,10 +682,51 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
     )
 }
 
+/// @cc [owner:ghuntley,label:proxy] affinity-restored-after-deferral
+/// When selection skipped the account bound to a sticky key because a token refresh was merely
+/// deferred, the resulting rebind MUST be undone when the request ends, however it ends: the
+/// account was never unhealthy, and leaving the session elsewhere would lose its prompt-cache
+/// affinity long after the transient condition cleared. An exclusion caused by anything else MUST
+/// be left in place.
+struct AffinityGuard {
+    state: Arc<AppState>,
+    original: Option<(String, String, i64)>,
+    deferred: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Drop for AffinityGuard {
+    fn drop(&mut self) {
+        let Some((key, account_id, bound_at)) = &self.original else {
+            return;
+        };
+        // Only a deferral on the account that held the session justifies moving it back; an
+        // overload on that account is a real reason to have rebound.
+        if !self.deferred.lock().unwrap().contains(account_id) {
+            return;
+        }
+        let mut pool = self.state.pool.lock().unwrap();
+        if pool.binding(key).map(|(id, _)| id).as_deref() == Some(account_id.as_str()) {
+            return;
+        }
+        let Some(backend) = pool.account(account_id).map(|a| a.backend) else {
+            return;
+        };
+        pool.restore_binding(key, account_id, *bound_at);
+        self.state.store.upsert_binding(&crate::models::Binding {
+            cache_key: key.clone(),
+            account_id: account_id.clone(),
+            backend,
+            bound_at: *bound_at,
+        });
+    }
+}
+
 /// @cc [owner:ghuntley,label:proxy] failover-bounded-by-accounts
 /// A request MUST make at most as many attempts as configured accounts, plus one additional attempt
 /// after a successful banked reset, and the first successful upstream response MUST be returned
-/// to the client; upstream error bodies MUST be preserved and
+/// to the client; a 2xx stream that fails with a capacity code before any output is not successful:
+/// the account MUST be excluded for the rest of the request (without changing its health) and
+/// the next account tried. Upstream error bodies MUST be preserved and
 /// returned when every attempt fails (or a 503 `pool_exhausted` error when no upstream response
 /// was ever received). An upstream 401 or 403 MUST trigger exactly one forced token refresh and one
 /// same-account retry per request; a second 401 or 403 (or a failed refresh) MUST classify the
@@ -447,11 +734,13 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 async fn attempt_account(
     state: &Arc<AppState>,
     request_id: &str,
-    path: &str,
+    endpoint: &str,
+    target: &str,
     model: &str,
     sticky: Option<&str>,
     selection: &Selection,
     body_bytes: axum::body::Bytes,
+    client_headers: &HeaderMap,
     refreshed: &mut std::collections::HashSet<String>,
 ) -> Attempt {
     let started = Instant::now();
@@ -459,7 +748,12 @@ async fn attempt_account(
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
         return Attempt::Failover(None);
     };
-    let account = state.pool.lock().unwrap().account(&selection.account_id).cloned();
+    let account = state
+        .pool
+        .lock()
+        .unwrap()
+        .account(&selection.account_id)
+        .cloned();
     let Some(account) = account else {
         return Attempt::Failover(None);
     };
@@ -476,37 +770,95 @@ async fn attempt_account(
 
     let token = match state.tokens.access_token(&account).await {
         Ok(token) => token,
+        // A refresh the issuer merely deferred is transient: cooling the account instead of
+        // marking it auth_error keeps a valid credential in rotation.
+        Err(e @ crate::tokens::TokenError::Transient(_)) => {
+            tracing::warn!(request_id = %request_id, error = %e, "token.transient");
+            report_outcome(state, &selection.account_id, Outcome::Transient);
+            drop(guard);
+            // Exclude the account for the rest of the request. A sticky binding still points at
+            // it, so without this the next iteration would re-select it and re-post the exact
+            // refresh the issuer just deferred - and the token endpoint rate-limits independently.
+            return Attempt::Excluded(selection.account_id.clone());
+        }
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, "token.unavailable");
             report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-            logging::log_account_state(&selection.account_id, label, "auth_error", "missing or unusable credential");
+            logging::log_account_state(
+                &selection.account_id,
+                label,
+                "auth_error",
+                "missing or unusable credential",
+            );
             drop(guard);
             return Attempt::Failover(None);
         }
     };
 
-    let url = backend.rewrite_url(path, &account);
+    let url = backend.rewrite_url(target, &account);
     let mut headers = HeaderMap::new();
+    if backend.forward_client_headers() {
+        for (name, value) in client_headers.iter() {
+            if STRIPPED_CLIENT_HEADERS.contains(&name.as_str()) {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
+        }
+    }
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
-    headers.insert(
-        http::header::ACCEPT,
-        http::HeaderValue::from_static("text/event-stream, application/json"),
-    );
+    if !headers.contains_key(http::header::ACCEPT) {
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("text/event-stream, application/json"),
+        );
+    }
     let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
-    let responses_path = path.ends_with("/responses");
+    let responses_path = endpoint.ends_with("/responses");
     let translate_responses = responses_path && backend.responses_via_chat();
+    // The dialect the *upstream* speaks: a translated request is Chat Completions even though the
+    // client's path is `/v1/responses`, so this must not be derived from the client path alone.
+    // Used by every body parse - error bodies as much as successful ones.
+    let upstream_dialect = if translate_responses {
+        crate::usage::UsageDialect::Chat
+    } else {
+        backend.usage_dialect(endpoint)
+    };
     if translate_responses {
         outbound_body = crate::responses::request_to_chat(&outbound_body);
     }
-    backend.inject_headers(&account, &token, sticky, &outbound_body, &mut headers);
-    backend.prepare_body(&mut outbound_body);
-    let fallback_body = outbound_body.clone();
-    let auto_usage = !state.stream_usage_unsupported.lock().unwrap().contains(&selection.backend)
-        && backend.auto_stream_usage(path, &mut outbound_body);
-    let outbound_bytes = serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec());
+    backend.inject_headers(
+        &account,
+        &token,
+        sticky,
+        &outbound_body,
+        client_headers,
+        &mut headers,
+    );
+    let mut fallback_body = outbound_body.clone();
+    let auto_usage = !state
+        .stream_usage_unsupported
+        .lock()
+        .unwrap()
+        .contains(&selection.backend)
+        && backend.auto_stream_usage(endpoint, &mut outbound_body);
+    let outbound_bytes = if backend.forward_body_verbatim() {
+        // The upstream validates the client's own body, so it travels byte for byte.
+        body_bytes.to_vec()
+    } else {
+        backend.prepare_body(&mut outbound_body);
+        serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec())
+    };
+    if !backend.forward_body_verbatim() {
+        // The retry after a rejected `stream_options` must be the *prepared* body or upstream
+        // refuses it again (Cline, for one, would still see its `cline/` prefix), but it must also
+        // drop the option that was just rejected. Prepare the fallback the same way, unsupported.
+        let mut fallback = fallback_body.clone();
+        backend.prepare_body(&mut fallback);
+        fallback_body = fallback;
+    }
 
     let mut response = match state
         .client
@@ -519,7 +871,9 @@ async fn attempt_account(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, backend = %selection.backend.as_str(), "upstream.network_error");
-            let record = usage_record(request_id, path, model, sticky, selection, &account, 0, started_ms);
+            let record = usage_record(
+                request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
+            );
             persist_usage(&state.store, &record);
             report_outcome(state, &selection.account_id, Outcome::Transient);
             drop(guard);
@@ -531,39 +885,110 @@ async fn attempt_account(
         let status = response.status();
         let rejection = response.text().await.unwrap_or_default();
         if rejection.contains("stream_options") || rejection.contains("include_usage") {
-            let rejected = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+            let rejected = usage_record(
+                request_id,
+                endpoint,
+                model,
+                sticky,
+                selection,
+                &account,
+                status.as_u16(),
+                started_ms,
+            );
             persist_usage(&state.store, &rejected);
-            state.stream_usage_unsupported.lock().unwrap().insert(selection.backend);
+            state
+                .stream_usage_unsupported
+                .lock()
+                .unwrap()
+                .insert(selection.backend);
             tracing::warn!(request_id = %request_id, backend = %selection.backend.as_str(), "usage.stream_option_unsupported");
-            let retry_bytes = serde_json::to_vec(&fallback_body).unwrap_or_else(|_| body_bytes.to_vec());
-            response = match state.client.post(&url).headers(headers).body(retry_bytes).send().await {
+            let retry_bytes =
+                serde_json::to_vec(&fallback_body).unwrap_or_else(|_| body_bytes.to_vec());
+            response = match state
+                .client
+                .post(&url)
+                .headers(headers)
+                .body(retry_bytes)
+                .send()
+                .await
+            {
                 Ok(resp) => resp,
                 Err(error) => {
                     tracing::warn!(request_id = %request_id, error = %error, "upstream.network_error");
-                    let record = usage_record(request_id, path, model, sticky, selection, &account, 0, started_ms);
+                    let record = usage_record(
+                        request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
+                    );
                     persist_usage(&state.store, &record);
                     drop(guard);
                     return Attempt::Failover(None);
                 }
             };
         } else {
-            let record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+            let record = usage_record(
+                request_id,
+                endpoint,
+                model,
+                sticky,
+                selection,
+                &account,
+                status.as_u16(),
+                started_ms,
+            );
             persist_usage(&state.store, &record);
-            push_log(state, request_id, model, Some(selection.backend.as_str().to_string()), Some(selection.account_id.clone()), Some(account.label.clone()), sticky.unwrap_or("none"), status.as_u16(), started.elapsed().as_millis() as u64);
+            push_log(
+                state,
+                request_id,
+                model,
+                Some(selection.backend.as_str().to_string()),
+                Some(selection.account_id.clone()),
+                Some(account.label.clone()),
+                sticky.unwrap_or("none"),
+                status.as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
             drop(guard);
-            return Attempt::Failover(Some(upstream_error_response(status, "application/json", rejection)));
+            return Attempt::Failover(Some(upstream_error_response(
+                status,
+                "application/json",
+                rejection,
+            )));
         }
     }
 
+    let response_headers = response.headers().clone();
     let status = response.status();
+    observe_response(
+        state,
+        &*backend,
+        &account,
+        &selection.account_id,
+        &response_headers,
+    );
 
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        && refreshed.insert(selection.account_id.clone())
-    {
+    // A 401 always means the credential may be stale. Copilot also redeems 403 by refreshing (its
+    // redemption-triggered rejection is cleared by a token refresh), but for Claude a 403 is a
+    // per-resource permission error: rotating the refresh token for it would burn a real rotation
+    // - the token endpoint rate-limits independently - and then retry a request that is refused
+    // again for the same reason.
+    let refresh_on = |status: StatusCode| match selection.backend {
+        BackendId::Claude => status == StatusCode::UNAUTHORIZED,
+        _ => matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+    };
+    if refresh_on(status) && refreshed.insert(selection.account_id.clone()) {
         let body_text = response.text().await.unwrap_or_default();
-        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+        let mut record = usage_record(
+            request_id,
+            endpoint,
+            model,
+            sticky,
+            selection,
+            &account,
+            status.as_u16(),
+            started_ms,
+        );
         if let Ok(value) = serde_json::from_str::<Value>(&body_text)
-            && let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+            && let Some(counts) = usage_from_dialect(&value, upstream_dialect)
+        {
             record.input_tokens = Some(counts.input_tokens);
             record.output_tokens = Some(counts.output_tokens);
         }
@@ -574,10 +999,23 @@ async fn attempt_account(
                 drop(guard);
                 return Attempt::Failover(None);
             }
+            // A refresh the issuer merely deferred says nothing about the credential: marking the
+            // account auth_error would strand a valid subscription until an operator re-logged in.
+            Err(e @ crate::tokens::TokenError::Transient(_)) => {
+                tracing::warn!(request_id = %request_id, error = %e, "token.transient");
+                report_outcome(state, &selection.account_id, Outcome::Transient);
+                drop(guard);
+                return Attempt::Excluded(selection.account_id.clone());
+            }
             Err(e) => {
                 tracing::warn!(request_id = %request_id, error = %e, "token.refresh_failed");
                 report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-                logging::log_account_state(&selection.account_id, label, "auth_error", "refresh rejected");
+                logging::log_account_state(
+                    &selection.account_id,
+                    label,
+                    "auth_error",
+                    "refresh rejected",
+                );
                 drop(guard);
                 return Attempt::Failover(None);
             }
@@ -587,9 +1025,18 @@ async fn attempt_account(
     if !status.is_success() {
         let resp_headers = response.headers().clone();
         let body_text = response.text().await.unwrap_or_default();
-        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms);
+        let mut record = usage_record(
+            request_id,
+            endpoint,
+            model,
+            sticky,
+            selection,
+            &account,
+            status.as_u16(),
+            started_ms,
+        );
         if let Ok(value) = serde_json::from_str::<Value>(&body_text) {
-            if let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+            if let Some(counts) = usage_from_dialect(&value, upstream_dialect) {
                 record.input_tokens = Some(counts.input_tokens);
                 record.output_tokens = Some(counts.output_tokens);
             }
@@ -601,7 +1048,12 @@ async fn attempt_account(
         persist_usage(&state.store, &record);
         let kind = crate::usage::event_kind(record.error_code.as_deref());
         if record.error_code.is_some() && matches!(kind, "overloaded" | "policy_blocked") {
-            state.store.insert_upstream_event(&event_for(&record, kind, "http", record.error_code.clone()));
+            state.store.insert_upstream_event(&event_for(
+                &record,
+                kind,
+                "http",
+                record.error_code.clone(),
+            ));
         }
         let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
         let body_text = if translate_responses {
@@ -610,30 +1062,42 @@ async fn attempt_account(
             body_text
         };
         // The transition, the snapshot, and the write share one critical section: a second lock
-        // acquisition would let a concurrent scope transition interleave, and because this write
+        // acquisition would let a concurrent transition interleave, and because the account write
         // covers the whole `scope_cooling` map it would persist a snapshot missing the other scope.
         let transition = {
             let mut pool = state.pool.lock().unwrap();
-            let transition = pool.report_for(&selection.account_id, model, outcome.clone());
-            transition.and_then(|transition| {
-                let updated = pool.account(&selection.account_id).cloned();
-                if let Some(updated) = &updated {
-                    state.store.update_account_health(updated);
+            match &outcome {
+                // A model-scoped rejection is in-memory only: the account keeps serving its other
+                // models, so there is no account row to persist.
+                Outcome::ModelQuotaExhausted { until_ms } => {
+                    pool.report_model_quota(&selection.account_id, model, *until_ms);
+                    None
                 }
-                updated.map(|updated| (transition, updated))
-            })
+                _ => {
+                    let transition = pool.report_for(&selection.account_id, model, outcome.clone());
+                    transition.and_then(|transition| {
+                        let updated = pool.account(&selection.account_id).cloned();
+                        if let Some(updated) = &updated {
+                            state.store.update_account_health(updated);
+                        }
+                        updated.map(|updated| (transition, updated))
+                    })
+                }
+            }
         };
         if let Some((transition, updated)) = transition {
             // The pool keeps the later of an existing and a newly reported deadline, so the event
             // and its log line must carry the effective deadline the routing decision uses rather
             // than this response's own value.
-            let effective_until = Some(match &transition {
-                crate::pool::HealthTransition::Scope(scope) => updated.scope_cooling.get(scope).copied(),
+            let effective_until = match &transition {
+                crate::pool::HealthTransition::Scope(scope) => {
+                    updated.scope_cooling.get(scope).copied()
+                }
                 crate::pool::HealthTransition::Account(_) => Some(updated.reset_at),
-            });
+            };
             match &outcome {
                 Outcome::QuotaExhausted { until_ms } => {
-                    let until_ms = effective_until.flatten().unwrap_or(*until_ms);
+                    let until_ms = effective_until.unwrap_or(*until_ms);
                     let scope = match &transition {
                         crate::pool::HealthTransition::Scope(scope) => Some(scope.as_str()),
                         crate::pool::HealthTransition::Account(_) => None,
@@ -644,16 +1108,43 @@ async fn attempt_account(
                         "cooling",
                         &format!("until {until_ms} scope {}", scope.unwrap_or("account")),
                     );
-                    let mut event = event_for(&record, "quota_cooling", "http", record.error_code.clone());
+                    let mut event =
+                        event_for(&record, "quota_cooling", "http", record.error_code.clone());
                     event.until_ms = Some(until_ms);
                     event.detail = Some(scope.unwrap_or("account").to_string());
                     state.store.insert_upstream_event(&event);
                 }
                 Outcome::AuthFailed => {
-                    logging::log_account_state(&selection.account_id, label, "auth_error", "upstream rejected credentials");
+                    logging::log_account_state(
+                        &selection.account_id,
+                        label,
+                        "auth_error",
+                        "upstream rejected credentials",
+                    );
                 }
                 _ => {}
             }
+        }
+        if let Outcome::ModelQuotaExhausted { until_ms } = outcome {
+            // The pool keeps the later of an existing and a newly reported deadline, so the event
+            // and its log line must carry the effective deadline rather than this response's own
+            // value - otherwise a shorter second 429 would understate how long routing is blocked.
+            let effective = state
+                .pool
+                .lock()
+                .unwrap()
+                .model_cooling_until(&selection.account_id, model)
+                .unwrap_or(until_ms);
+            let mut event = event_for(&record, "quota_cooling", "http", record.error_code.clone());
+            event.until_ms = Some(effective);
+            event.detail = Some(model.to_string());
+            state.store.insert_upstream_event(&event);
+            logging::log_account_state(
+                &selection.account_id,
+                label,
+                "model_cooling",
+                &format!("{model} until {effective}"),
+            );
         }
         report_outcome(state, &selection.account_id, Outcome::Ok);
         drop(guard);
@@ -722,10 +1213,20 @@ async fn attempt_account(
                         let mut finish = UsageFinish {
                             store: state.store.clone(),
                             logs: state.logs.clone(),
-                            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
-                            tap: UsageTap::new(false, backend.usage_is_chat(path)),
+                            record: usage_record(
+                                request_id,
+                                endpoint,
+                                model,
+                                sticky,
+                                selection,
+                                &account,
+                                status.as_u16(),
+                                started_ms,
+                            ),
+                            tap: UsageTap::new(false, upstream_dialect),
                             // The body arrived and ended; it just was not convertible.
                             ended: Some(StreamEnd::UpstreamError),
+                            detail: "buffered",
                         };
                         finish.tap.feed(&body);
                         push_log(
@@ -781,9 +1282,19 @@ async fn attempt_account(
             let mut finish = UsageFinish {
                 store: state.store.clone(),
                 logs: state.logs.clone(),
-                record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
-                tap: UsageTap::new(false, backend.usage_is_chat(path)),
+                record: usage_record(
+                    request_id,
+                    endpoint,
+                    model,
+                    sticky,
+                    selection,
+                    &account,
+                    status.as_u16(),
+                    started_ms,
+                ),
+                tap: UsageTap::new(false, upstream_dialect),
                 ended: None,
+                detail: "buffered",
             };
             finish.tap.feed(&body);
             finish.ended = Some(StreamEnd::Eof);
@@ -793,17 +1304,28 @@ async fn attempt_account(
                 .status(status_code)
                 .body(Body::from(bytes))
                 .expect("valid response");
-            resp.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
+            resp.headers_mut()
+                .insert(http::header::CONTENT_TYPE, content_type);
             return Attempt::Respond(resp);
         }
 
-        let stream = response.bytes_stream();
-        let finish = UsageFinish {
+        let mut stream = response.bytes_stream();
+        let mut finish = UsageFinish {
             store: state.store.clone(),
             logs: state.logs.clone(),
-            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16(), started_ms),
-            tap: UsageTap::new(streaming, backend.usage_is_chat(path)),
+            record: usage_record(
+                request_id,
+                endpoint,
+                model,
+                sticky,
+                selection,
+                &account,
+                status.as_u16(),
+                started_ms,
+            ),
+            tap: UsageTap::new(streaming, upstream_dialect),
             ended: None,
+            detail: "stream",
         };
         let translator = translate_stream.then(|| {
             std::sync::Arc::new(std::sync::Mutex::new(
@@ -814,10 +1336,112 @@ async fn attempt_account(
                 ),
             ))
         });
+        // A translated stream must be held before the client sees anything for the same reason an
+        // untranslated one is: the first chunk may be a terminal overload the failover path owns.
+        let mut held: VecDeque<axum::body::Bytes> = VecDeque::new();
+        if streaming {
+            hold_until_output(&mut stream, &mut finish, &mut held).await;
+        }
+        if let Some(code) = finish.tap.overload_before_output().map(str::to_string) {
+            logging::log_overload_failover(
+                request_id,
+                model,
+                &selection.account_id,
+                &account.label,
+                &code,
+                started.elapsed().as_millis() as u64,
+            );
+            push_log(
+                state,
+                request_id,
+                model,
+                Some(selection.backend.as_str().to_string()),
+                Some(selection.account_id.clone()),
+                Some(account.label.clone()),
+                sticky.unwrap_or("none"),
+                status_code.as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
+            finish.ended.get_or_insert(StreamEnd::Eof);
+            finish.detail = "stream_failover";
+            // Dropping `finish` persists the failed attempt and its `overloaded` event.
+            drop(finish);
+            drop(guard);
+            // The replay is handed back to the client when every account overloads, so it must
+            // already be in the client's protocol: a translated stream's held chunks are chat
+            // completions SSE, not Responses events.
+            let replay_body: Vec<u8> = match &translator {
+                Some(translator) => {
+                    let mut translator = translator.lock().unwrap();
+                    let mut out: Vec<u8> = held
+                        .iter()
+                        .flat_map(|chunk| translator.feed(chunk))
+                        .collect();
+                    out.extend(translator.finish_on_eof());
+                    out
+                }
+                None => held.into_iter().flatten().collect(),
+            };
+            let mut replay = Response::builder()
+                .status(status_code)
+                .body(Body::from(replay_body))
+                .expect("valid replay response");
+            replay
+                .headers_mut()
+                .insert(http::header::CONTENT_TYPE, content_type);
+            return Attempt::Overloaded {
+                account_id: selection.account_id.clone(),
+                replay,
+            };
+        }
         let body_stream = Body::from_stream(futures::stream::unfold(
-            (stream, Some(guard), finish, translator),
-            |state| async move {
-                let (mut stream, guard, mut finish, translator) = state;
+            (stream, Some(guard), finish, translator, held),
+            |(mut stream, guard, mut finish, translator, mut held)| async move {
+                // Anything the hold buffered is released first, in order, and translated on the way
+                // out exactly as the live stream would have been.
+                if let Some(chunk) = held.pop_front() {
+                    let out = match &translator {
+                        Some(translator) => translator.lock().unwrap().feed(&chunk),
+                        None => chunk.to_vec(),
+                    };
+                    return Some((
+                        Ok::<_, std::io::Error>(out),
+                        (stream, guard, finish, translator, held),
+                    ));
+                }
+                if finish.ended.is_some() {
+                    // The hold already reached EOF or an upstream error; do not poll again. A
+                    // translated stream must still close with exactly one terminal event, so the
+                    // translator tail is emitted first - otherwise the client gets a 200 stream
+                    // that simply stops.
+                    if let Some(tail) = translator
+                        .as_ref()
+                        .map(|translator| translator.lock().unwrap().finish_on_eof())
+                        .filter(|tail| !tail.is_empty())
+                    {
+                        let abort = matches!(finish.ended, Some(StreamEnd::UpstreamError));
+                        return Some((
+                            Ok::<_, std::io::Error>(tail.clone()),
+                            (
+                                stream,
+                                if abort { None } else { guard },
+                                finish,
+                                translator,
+                                held,
+                            ),
+                        ));
+                    }
+                    return match finish.ended {
+                        Some(StreamEnd::UpstreamError) if guard.is_some() => Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "upstream stream error",
+                            )),
+                            (stream, None, finish, translator, held),
+                        )),
+                        _ => None,
+                    };
+                }
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         finish.tap.feed(&chunk);
@@ -825,25 +1449,35 @@ async fn attempt_account(
                             Some(translator) => translator.lock().unwrap().feed(&chunk),
                             None => chunk.to_vec(),
                         };
-                        Some((Ok::<_, std::io::Error>(out), (stream, guard, finish, translator)))
-                    },
+                        Some((
+                            Ok::<_, std::io::Error>(out),
+                            (stream, guard, finish, translator, held),
+                        ))
+                    }
                     Some(Err(_)) => {
                         finish.ended.get_or_insert(StreamEnd::UpstreamError);
                         // A translated stream must close with exactly one terminal event. If the
                         // translator already emitted it (e.g. after `[DONE]`), end the body cleanly
                         // rather than aborting a completed response.
-                        match translator.as_ref().map(|t| t.lock().unwrap().finish_on_eof()) {
+                        match translator
+                            .as_ref()
+                            .map(|t| t.lock().unwrap().finish_on_eof())
+                        {
                             None => Some((
                                 Err(std::io::Error::new(
                                     std::io::ErrorKind::Interrupted,
                                     "upstream stream error",
                                 )),
-                                (stream, guard, finish, translator),
+                                (stream, None, finish, translator, held),
                             )),
                             Some(tail) if tail.is_empty() => None,
-                            Some(tail) => {
-                                Some((Ok::<_, std::io::Error>(tail), (stream, guard, finish, translator)))
-                            }
+                            // Release the guard with the tail: the next iteration sees
+                            // `finish.ended` set and an empty translator tail, and holding the
+                            // guard there would abort the body *after* the terminal event.
+                            Some(tail) => Some((
+                                Ok::<_, std::io::Error>(tail),
+                                (stream, None, finish, translator, held),
+                            )),
                         }
                     }
                     None => {
@@ -857,7 +1491,7 @@ async fn attempt_account(
                         } else {
                             Some((
                                 Ok::<_, std::io::Error>(tail),
-                                (stream, guard, finish, translator),
+                                (stream, guard, finish, translator, held),
                             ))
                         }
                     }
@@ -882,7 +1516,8 @@ async fn attempt_account(
             .status(status_code)
             .body(body_stream)
             .expect("valid stream response");
-        resp.headers_mut().insert(http::header::CONTENT_TYPE, content_type);
+        resp.headers_mut()
+            .insert(http::header::CONTENT_TYPE, content_type);
         Attempt::Respond(resp)
     }
 }
@@ -905,6 +1540,40 @@ fn unwrap_envelope(body: &[u8], envelope: Option<&str>) -> Vec<u8> {
     }
 }
 
+/// @cc [owner:ghuntley,label:proxy] pre-output-hold-bounded
+/// `hold_until_output` MUST buffer upstream chunks (fed to the tap, in order) only until the tap
+/// sees model output or a terminal event, the stream ends or errors, `PRE_OUTPUT_HOLD` elapses,
+/// or `PRE_OUTPUT_HOLD_BYTES` are buffered, whichever comes first. It MUST NOT drop or reorder a
+/// chunk, and a stream end observed while holding MUST be recorded in `finish.ended`.
+async fn hold_until_output<S>(
+    stream: &mut S,
+    finish: &mut UsageFinish,
+    held: &mut VecDeque<axum::body::Bytes>,
+) where
+    S: futures::Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + PRE_OUTPUT_HOLD;
+    let mut bytes = 0usize;
+    while !finish.tap.decided() && bytes < PRE_OUTPUT_HOLD_BYTES {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                finish.tap.feed(&chunk);
+                bytes += chunk.len();
+                held.push_back(chunk);
+            }
+            Ok(Some(Err(_))) => {
+                finish.ended = Some(StreamEnd::UpstreamError);
+                return;
+            }
+            Ok(None) => {
+                finish.ended = Some(StreamEnd::Eof);
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn account_label(state: &AppState, account_id: &str) -> Option<String> {
     state
         .pool
@@ -912,6 +1581,58 @@ fn account_label(state: &AppState, account_id: &str) -> Option<String> {
         .unwrap()
         .account(account_id)
         .map(|a| a.label.clone())
+}
+
+/// Records what the backend observed about an upstream response, and cools the account when the
+/// upstream reports a window it cannot serve.
+fn observe_response(
+    state: &Arc<AppState>,
+    backend: &dyn crate::provider::Backend,
+    account: &crate::models::Account,
+    account_id: &str,
+    headers: &HeaderMap,
+) {
+    let now = now_ms();
+    if let Some(observation) = backend.observe_response(account, headers, now) {
+        state
+            .observations
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), observation);
+    }
+    let Some(until) = backend.exhausted_until_ms(headers) else {
+        return;
+    };
+    if until <= now {
+        return;
+    }
+    // Decide and write under one lock, and never overwrite operator state: a response that lands
+    // after an operator disabled the account (or after it went auth_error) must not resurrect it
+    // to `Cooling`, because `sweep` would then readmit it to `Healthy` and the block would vanish.
+    // A second lock acquisition would also let a concurrent longer deadline be shortened.
+    {
+        let mut pool = state.pool.lock().unwrap();
+        let Some(live) = pool.account(account_id).cloned() else {
+            return;
+        };
+        // `Cooling` participates so a later window can extend an existing deadline;
+        // `AuthError`/`Disabled` never do, or `sweep` would readmit them as `Healthy`.
+        if !matches!(live.status, AccountStatus::Healthy | AccountStatus::Cooling)
+            || until <= live.reset_at
+        {
+            return;
+        }
+        pool.set_status(account_id, AccountStatus::Cooling, until);
+        state
+            .store
+            .update_account_status(account_id, AccountStatus::Cooling, until);
+    }
+    logging::log_account_state(
+        account_id,
+        Some(&account.label),
+        "cooling",
+        &format!("upstream window exhausted until {until}"),
+    );
 }
 
 fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {
@@ -922,7 +1643,9 @@ fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {
     if let Some(new_status) = pool.report(account_id, outcome)
         && let Some(account) = pool.account(account_id)
     {
-        state.store.update_account_status(account_id, new_status, account.reset_at);
+        state
+            .store
+            .update_account_status(account_id, new_status, account.reset_at);
     }
 }
 
@@ -1004,7 +1727,10 @@ mod tests {
     #[test]
     fn sticky_key_falls_back_to_session_header() {
         let body = json!({"model": "gpt-5.5"});
-        assert_eq!(extract_sticky_key(&body, Some("sess-3")).as_deref(), Some("sess-3"));
+        assert_eq!(
+            extract_sticky_key(&body, Some("sess-3")).as_deref(),
+            Some("sess-3")
+        );
     }
 
     #[test]
@@ -1040,7 +1766,7 @@ mod tests {
         assert_eq!(backend.response_envelope(), Some("data"));
     }
 
-        #[test]
+    #[test]
     fn json_body_answered_to_a_streaming_request_is_not_parsed_as_sse() {
         // Cline can answer a `stream: true` request with a single JSON document. Consuming that as
         // SSE yields no frames, so a translated client gets a synthetic `stream_truncated` failure
@@ -1057,7 +1783,11 @@ mod tests {
         // translation, or a chat client receives `{"data":…,"success":true}` unmodified.
         let buffered = |translate: bool, envelope: Option<&str>, ct: &[u8]| {
             let needs_buffering = translate || envelope.is_some();
-            if needs_buffering { !upstream_is_sse(ct) } else { usage_is_stream(&json!({"stream": true}), ct) }
+            if needs_buffering {
+                !upstream_is_sse(ct)
+            } else {
+                usage_is_stream(&json!({"stream": true}), ct)
+            }
         };
         // A plain chat-completions backend keeps its upstream framing untouched.
         assert!(buffered(false, None, b"application/json"));
@@ -1074,7 +1804,10 @@ mod tests {
     fn stream_request_overrides_incorrect_json_content_type() {
         let body = json!({"stream": true});
         assert!(usage_is_stream(&body, b"application/json"));
-        assert!(usage_is_stream(&json!({}), b"text/event-stream; charset=utf-8"));
+        assert!(usage_is_stream(
+            &json!({}),
+            b"text/event-stream; charset=utf-8"
+        ));
         assert!(!usage_is_stream(&json!({}), b"application/json"));
     }
 }
