@@ -2,11 +2,11 @@
 use crate::models::now_ms;
 use crate::proxy::AppState;
 use crate::stats::{self, Bucket, Dim, Series, Totals};
-use crate::store::{Store, UpstreamEvent, EVENT_KINDS};
+use crate::store::{EVENT_KINDS, Store, UpstreamEvent};
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -54,7 +54,13 @@ pub struct StatsResponse {
 /// and the retention period plus one day for day buckets; buckets MUST align to their size (day
 /// buckets to UTC midnight), and day buckets MUST read stored rollups only for finished days, computing unfinished days from raw rows.
 /// Window totals MUST use exact distinct request and session counts.
-pub fn query(store: &Store, params: &StatsParams, now: i64, live_inflight: i64, retention_days: i64) -> Result<StatsResponse, String> {
+pub fn query(
+    store: &Store,
+    params: &StatsParams,
+    now: i64,
+    live_inflight: i64,
+    retention_days: i64,
+) -> Result<StatsResponse, String> {
     let bucket = params.bucket.as_deref().unwrap_or("hour");
     let (bucket_ms, max_window) = match bucket {
         "minute" => (stats::MINUTE_MS, 2 * stats::DAY_MS),
@@ -70,7 +76,8 @@ pub fn query(store: &Store, params: &StatsParams, now: i64, live_inflight: i64, 
     let mut from = match (params.from_ms, params.since.as_deref()) {
         (Some(from), _) => from,
         (None, since) => {
-            let span = stats::parse_since(since.unwrap_or("24h")).ok_or("since must look like 24h, 90d, or 2y")?;
+            let span = stats::parse_since(since.unwrap_or("24h"))
+                .ok_or("since must look like 24h, 90d, or 2y")?;
             to.saturating_sub(span)
         }
     };
@@ -86,7 +93,8 @@ pub fn query(store: &Store, params: &StatsParams, now: i64, live_inflight: i64, 
         ));
     }
     let total = series(store, from, to, bucket_ms, Dim::Total, now).map_err(|e| e.to_string())?;
-    let mut totals_out = window_totals(store, from, to, bucket_ms, Dim::Total, &total).map_err(|e| e.to_string())?;
+    let mut totals_out =
+        window_totals(store, from, to, bucket_ms, Dim::Total, &total).map_err(|e| e.to_string())?;
     let (totals, buckets) = match totals_out.pop() {
         Some(series) => (series.totals, series.buckets),
         None => (Totals::default(), empty_buckets(from, to, bucket_ms)),
@@ -113,11 +121,21 @@ pub fn query(store: &Store, params: &StatsParams, now: i64, live_inflight: i64, 
 
 fn empty_buckets(from: i64, to: i64, bucket_ms: i64) -> Vec<Bucket> {
     (0..stats::bucket_count(from, to, bucket_ms))
-        .map(|i| Bucket { start_ms: from + i as i64 * bucket_ms, totals: Totals::default() })
+        .map(|i| Bucket {
+            start_ms: from + i as i64 * bucket_ms,
+            totals: Totals::default(),
+        })
         .collect()
 }
 
-fn window_totals(store: &Store, from: i64, to: i64, bucket_ms: i64, dim: Dim, series: &[Series]) -> rusqlite::Result<Vec<SeriesOut>> {
+fn window_totals(
+    store: &Store,
+    from: i64,
+    to: i64,
+    bucket_ms: i64,
+    dim: Dim,
+    series: &[Series],
+) -> rusqlite::Result<Vec<SeriesOut>> {
     let distinct: HashMap<String, (i64, i64)> = store
         .stats_distinct(from, to, dim)?
         .into_iter()
@@ -135,7 +153,12 @@ fn window_totals(store: &Store, from: i64, to: i64, bucket_ms: i64, dim: Dim, se
             let (requests, sessions) = distinct.get(&s.key).copied().unwrap_or((0, 0));
             totals.requests = requests;
             totals.sessions = sessions;
-            SeriesOut { key: s.key.clone(), label: s.label.clone(), totals, buckets: s.buckets.clone() }
+            SeriesOut {
+                key: s.key.clone(),
+                label: s.label.clone(),
+                totals,
+                buckets: s.buckets.clone(),
+            }
         })
         .collect())
 }
@@ -145,7 +168,14 @@ fn final_day_end(now: i64) -> i64 {
     (now - stats::MAX_ATTEMPT_MS).div_euclid(stats::DAY_MS)
 }
 
-fn series(store: &Store, from: i64, to: i64, bucket_ms: i64, dim: Dim, now: i64) -> rusqlite::Result<Vec<Series>> {
+fn series(
+    store: &Store,
+    from: i64,
+    to: i64,
+    bucket_ms: i64,
+    dim: Dim,
+    now: i64,
+) -> rusqlite::Result<Vec<Series>> {
     if bucket_ms != stats::DAY_MS {
         return store.stats_series(from, to, bucket_ms, dim);
     }
@@ -204,7 +234,10 @@ pub fn maintain(store: &Store, now: i64, retention_days: i64) -> rusqlite::Resul
     }
     let rolled = store.stats_rolled_days(first_day, end)?;
     let mut done = 0;
-    for day in (first_day..end).filter(|d| !rolled.contains(d)).take(MAX_ROLLUPS_PER_PASS) {
+    for day in (first_day..end)
+        .filter(|d| !rolled.contains(d))
+        .take(MAX_ROLLUPS_PER_PASS)
+    {
         store.rollup_stats_day(day, now)?;
         done += 1;
     }
@@ -212,20 +245,36 @@ pub fn maintain(store: &Store, now: i64, retention_days: i64) -> rusqlite::Resul
 }
 
 fn live_inflight(state: &AppState) -> i64 {
-    state.pool.lock().unwrap().accounts.values().map(|a| i64::from(a.inflight)).sum()
+    state
+        .pool
+        .lock()
+        .unwrap()
+        .accounts
+        .values()
+        .map(|a| i64::from(a.inflight))
+        .sum()
 }
 
 /// @cc [owner:ghuntley,label:security] stats-admin-only
 /// Statistics and event import MUST be served only under the admin token gate, and responses
 /// MUST NOT include prompt-cache keys, request bodies, or credentials.
-pub async fn stats_handler(State(state): State<Arc<AppState>>, Query(params): Query<StatsParams>) -> Response {
+pub async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<StatsParams>,
+) -> Response {
     let inflight = live_inflight(&state);
     let retention = state.stats_retention_days;
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || query(&store, &params, now_ms(), inflight, retention)).await;
+    let result =
+        tokio::task::spawn_blocking(move || query(&store, &params, now_ms(), inflight, retention))
+            .await;
     match result {
         Ok(Ok(response)) => Json(response).into_response(),
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message": message})),
+        )
+            .into_response(),
         Err(error) => {
             tracing::error!(error = %error, "stats.query_failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "stats query failed").into_response()
@@ -251,7 +300,11 @@ pub struct ImportBody {
 /// The import endpoint MUST accept at most 1000 events per call, MUST reject unknown kinds, empty
 /// or oversized dedupe keys, and timestamps outside the retention window, MUST sanitize codes and
 /// model names, and MUST store every accepted event with `source = codex_import`.
-pub fn validate_import(body: ImportBody, now: i64, retention_days: i64) -> Result<Vec<UpstreamEvent>, String> {
+pub fn validate_import(
+    body: ImportBody,
+    now: i64,
+    retention_days: i64,
+) -> Result<Vec<UpstreamEvent>, String> {
     if body.events.len() > MAX_IMPORT_BATCH {
         return Err(format!("at most {MAX_IMPORT_BATCH} events per import"));
     }
@@ -273,7 +326,10 @@ pub fn validate_import(body: ImportBody, now: i64, retention_days: i64) -> Resul
                 source: "codex_import".into(),
                 kind: event.kind,
                 detail: Some("codex_log".into()),
-                error_code: event.error_code.as_deref().and_then(crate::usage::sanitize_code),
+                error_code: event
+                    .error_code
+                    .as_deref()
+                    .and_then(crate::usage::sanitize_code),
                 model: event.model.as_deref().and_then(crate::usage::sanitize_code),
                 dedupe_key: Some(format!("codex:{}", event.dedupe_key)),
                 ..Default::default()
@@ -282,11 +338,20 @@ pub fn validate_import(body: ImportBody, now: i64, retention_days: i64) -> Resul
         .collect()
 }
 
-pub async fn import_handler(State(state): State<Arc<AppState>>, Json(body): Json<ImportBody>) -> Response {
+pub async fn import_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ImportBody>,
+) -> Response {
     let received = body.events.len();
     let events = match validate_import(body, now_ms(), state.stats_retention_days) {
         Ok(events) => events,
-        Err(message) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response(),
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": message})),
+            )
+                .into_response();
+        }
     };
     let store = state.store.clone();
     match tokio::task::spawn_blocking(move || store.insert_upstream_events(&events)).await {
@@ -303,12 +368,28 @@ mod tests {
     use super::*;
     use crate::store::UsageRecord;
 
-    fn row(request: &str, ts: i64, duration: i64, model: &str, outcome: Option<&str>) -> UsageRecord {
+    fn row(
+        request: &str,
+        ts: i64,
+        duration: i64,
+        model: &str,
+        outcome: Option<&str>,
+    ) -> UsageRecord {
         UsageRecord {
-            request_id: request.into(), ts, endpoint: "/v1/responses".into(), backend: "codex".into(),
-            model: model.into(), account_id: "acc-1".into(), account_label: "alice".into(),
-            cache_key: Some(format!("session-{request}")), status: 200, input_tokens: Some(10), output_tokens: Some(2),
-            duration_ms: Some(duration), stream_outcome: outcome.map(str::to_string), ..Default::default()
+            request_id: request.into(),
+            ts,
+            endpoint: "/v1/responses".into(),
+            backend: "codex".into(),
+            model: model.into(),
+            account_id: "acc-1".into(),
+            account_label: "alice".into(),
+            cache_key: Some(format!("session-{request}")),
+            status: 200,
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            duration_ms: Some(duration),
+            stream_outcome: outcome.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -316,12 +397,29 @@ mod tests {
     fn day_query_mixes_rollups_and_live_days() {
         let store = Store::in_memory().unwrap();
         let day = stats::DAY_MS;
-        store.insert_usage(&row("a", day + 1000, 5000, "m1", Some("completed"))).unwrap();
-        store.insert_usage(&row("b", day + 2000, 5000, "m2", Some("failed"))).unwrap();
-        store.insert_usage(&row("c", 3 * day + 10, 10, "m1", Some("completed"))).unwrap();
-        store.insert_upstream_event(&UpstreamEvent { ts: day + 2500, source: "proxy".into(), kind: "overloaded".into(), model: Some("m2".into()), ..Default::default() });
+        store
+            .insert_usage(&row("a", day + 1000, 5000, "m1", Some("completed")))
+            .unwrap();
+        store
+            .insert_usage(&row("b", day + 2000, 5000, "m2", Some("failed")))
+            .unwrap();
+        store
+            .insert_usage(&row("c", 3 * day + 10, 10, "m1", Some("completed")))
+            .unwrap();
+        store.insert_upstream_event(&UpstreamEvent {
+            ts: day + 2500,
+            source: "proxy".into(),
+            kind: "overloaded".into(),
+            model: Some("m2".into()),
+            ..Default::default()
+        });
         let now = 3 * day + 100;
-        let params = StatsParams { since: Some("3d".into()), bucket: Some("day".into()), by: Some("model".into()), ..Default::default() };
+        let params = StatsParams {
+            since: Some("3d".into()),
+            bucket: Some("day".into()),
+            by: Some("model".into()),
+            ..Default::default()
+        };
         let response = query(&store, &params, now, 0, 730).unwrap();
         // `since` is floored to UTC midnight, so the window covers days 0..=3.
         assert_eq!(response.buckets.len(), 4);
@@ -338,15 +436,26 @@ mod tests {
         let again = query(&store, &params, now, 0, 730).unwrap();
         assert_eq!(again.totals, response.totals);
         let m2 = response.series.iter().find(|s| s.key == "m2").unwrap();
-        assert_eq!((m2.totals.attempts, m2.totals.events.get("overloaded")), (1, Some(&1)));
+        assert_eq!(
+            (m2.totals.attempts, m2.totals.events.get("overloaded")),
+            (1, Some(&1))
+        );
     }
 
     #[test]
     fn query_rejects_oversized_windows() {
         let store = Store::in_memory().unwrap();
-        let params = StatsParams { since: Some("40d".into()), bucket: Some("hour".into()), ..Default::default() };
+        let params = StatsParams {
+            since: Some("40d".into()),
+            bucket: Some("hour".into()),
+            ..Default::default()
+        };
         assert!(query(&store, &params, 100 * stats::DAY_MS, 0, 730).is_err());
-        let params = StatsParams { since: Some("2y".into()), bucket: Some("day".into()), ..Default::default() };
+        let params = StatsParams {
+            since: Some("2y".into()),
+            bucket: Some("day".into()),
+            ..Default::default()
+        };
         assert!(query(&store, &params, 1000 * stats::DAY_MS, 0, 730).is_ok());
     }
 
@@ -355,7 +464,9 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let day = stats::DAY_MS;
         store.insert_usage(&row("old", 10, 1, "m", None)).unwrap();
-        store.insert_usage(&row("new", 5 * day, 1, "m", None)).unwrap();
+        store
+            .insert_usage(&row("new", 5 * day, 1, "m", None))
+            .unwrap();
         let now = 7 * day;
         let (pruned, rolled) = maintain(&store, now, 3).unwrap();
         // Retention cuts at day 4; day 5 is final, day 6 is still within the grace period.
@@ -368,12 +479,30 @@ mod tests {
     fn import_is_validated_and_idempotent() {
         let store = Store::in_memory().unwrap();
         let now = 10 * stats::DAY_MS;
-        let body = || ImportBody { events: vec![ImportEvent { ts: now - 1000, kind: "overloaded".into(), error_code: Some("server overloaded!".into()), model: Some("gpt-6".into()), dedupe_key: "s1:4".into() }] };
+        let body = || ImportBody {
+            events: vec![ImportEvent {
+                ts: now - 1000,
+                kind: "overloaded".into(),
+                error_code: Some("server overloaded!".into()),
+                model: Some("gpt-6".into()),
+                dedupe_key: "s1:4".into(),
+            }],
+        };
         let events = validate_import(body(), now, 730).unwrap();
         assert_eq!(events[0].error_code.as_deref(), Some("serveroverloaded"));
         assert_eq!(store.insert_upstream_events(&events).unwrap(), 1);
-        assert_eq!(store.insert_upstream_events(&validate_import(body(), now, 730).unwrap()).unwrap(), 0);
-        let bad = ImportBody { events: vec![ImportEvent { kind: "nope".into(), ..body().events[0].clone() }] };
+        assert_eq!(
+            store
+                .insert_upstream_events(&validate_import(body(), now, 730).unwrap())
+                .unwrap(),
+            0
+        );
+        let bad = ImportBody {
+            events: vec![ImportEvent {
+                kind: "nope".into(),
+                ..body().events[0].clone()
+            }],
+        };
         assert!(validate_import(bad, now, 730).is_err());
     }
 }

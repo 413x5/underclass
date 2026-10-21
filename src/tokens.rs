@@ -1,5 +1,5 @@
 use crate::jwt;
-use crate::models::{now_ms, Account};
+use crate::models::{Account, now_ms};
 use crate::store::Store;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -33,6 +33,12 @@ pub enum TokenError {
     MissingToken,
     #[error("token refresh failed: {0}")]
     RefreshFailed(String),
+    /// The issuer refused the refresh for a reason that will pass (rate limiting, a network
+    /// error, a 5xx). ADR 0023 records the Claude token endpoint answering `429 rate_limit_error`
+    /// right after an exchange, so this MUST NOT be reported as `auth_error`: that would strand a
+    /// valid account until an operator intervened.
+    #[error("token refresh unavailable: {0}")]
+    Transient(String),
 }
 
 pub struct TokenManager {
@@ -64,6 +70,8 @@ impl TokenManager {
     /// `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh otherwise. For Copilot
     /// and Cline it MUST return the stored token directly: a GitHub token and a Cline API key are
     /// both long-lived credentials that never expire or refresh, so neither may trigger a refresh.
+    /// For Claude it MUST return the stored OAuth token while it remains valid beyond the same
+    /// margin, and MUST refresh it otherwise.
     pub async fn access_token(&self, account: &Account) -> Result<String, TokenError> {
         match account.backend {
             crate::models::BackendId::Copilot | crate::models::BackendId::Cline => account
@@ -72,7 +80,23 @@ impl TokenManager {
                 .ok_or(TokenError::MissingToken),
             crate::models::BackendId::Codex => {
                 if let Some(token) = &account.access_token {
-                    if account.expires_at.saturating_sub(PROACTIVE_REFRESH_MARGIN_MS) > now_ms() {
+                    if account
+                        .expires_at
+                        .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
+                        > now_ms()
+                    {
+                        return Ok(token.clone());
+                    }
+                }
+                self.force_refresh(&account.id).await
+            }
+            crate::models::BackendId::Claude => {
+                if let Some(token) = &account.access_token {
+                    if account
+                        .expires_at
+                        .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
+                        > now_ms()
+                    {
                         return Ok(token.clone());
                     }
                 }
@@ -96,7 +120,10 @@ impl TokenManager {
             .get_account(account_id)
             .ok_or(TokenError::MissingToken)?;
 
-        let refresh_token = account.refresh_token.clone().ok_or(TokenError::MissingToken)?;
+        let refresh_token = account
+            .refresh_token
+            .clone()
+            .ok_or(TokenError::MissingToken)?;
 
         match account.backend {
             crate::models::BackendId::Copilot | crate::models::BackendId::Cline => {
@@ -123,6 +150,43 @@ impl TokenManager {
                 );
                 Ok(tokens.access_token)
             }
+            crate::models::BackendId::Claude => {
+                let tokens = crate::claude::refresh(&self.client, &refresh_token)
+                    .await
+                    .map_err(|e| match e {
+                        // Transport failures, rate limiting and server errors defer the refresh;
+                        // they say nothing about the credential. A 4xx is the issuer rejecting
+                        // this grant (`invalid_grant` for a rotated-away or revoked token), which
+                        // only a re-login fixes - so that one must reach `auth_error` rather than
+                        // leave a dead account looking healthy forever.
+                        crate::claude::AuthError::Http(_)
+                        | crate::claude::AuthError::Status(429)
+                        | crate::claude::AuthError::Status(500..=599) => {
+                            TokenError::Transient(e.to_string())
+                        }
+                        crate::claude::AuthError::Status(_)
+                        | crate::claude::AuthError::Failed(_) => {
+                            TokenError::RefreshFailed(e.to_string())
+                        }
+                    })?;
+                let expires_at = now_ms() + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
+                // The Anthropic refresh grant rotates the refresh token: persist the new one
+                // immediately or the account is left holding an invalidated credential.
+                self.store.update_tokens(
+                    account_id,
+                    tokens
+                        .refresh_token
+                        .as_deref()
+                        .or(Some(refresh_token.as_str())),
+                    Some(&tokens.access_token),
+                    expires_at,
+                    // The Anthropic account uuid and residency, not a ChatGPT id: pass them
+                    // through so a refresh can never be mistaken for clearing them.
+                    account.account_id.as_deref(),
+                    account.residency.as_deref(),
+                );
+                Ok(tokens.access_token)
+            }
         }
     }
 }
@@ -144,6 +208,7 @@ mod tests {
             account_id: None,
             residency: None,
             enterprise_url: None,
+            plan: None,
             status: AccountStatus::Healthy,
             reset_at: 0,
             scope_cooling: Default::default(),
@@ -174,13 +239,19 @@ mod tests {
 
     #[test]
     fn copilot_and_credential_less_accounts_are_never_due() {
-        assert!(!rotation_due(&account(BackendId::Copilot, Some("gh-token"), 0), i64::MAX));
+        assert!(!rotation_due(
+            &account(BackendId::Copilot, Some("gh-token"), 0),
+            i64::MAX
+        ));
         assert!(!rotation_due(&account(BackendId::Codex, None, 0), i64::MAX));
     }
 
     #[test]
     fn a_clock_behind_the_last_rotation_is_not_due() {
         let due = account(BackendId::Codex, Some("refresh"), 10 * DAY);
-        assert!(!rotation_due(&due, 0), "saturating_sub must not wrap into a false due");
+        assert!(
+            !rotation_due(&due, 0),
+            "saturating_sub must not wrap into a false due"
+        );
     }
 }

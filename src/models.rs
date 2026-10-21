@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 pub enum BackendId {
     Codex,
     Copilot,
+    Claude,
     Cline,
 }
 
@@ -14,6 +15,7 @@ impl BackendId {
         match self {
             BackendId::Codex => "codex",
             BackendId::Copilot => "copilot",
+            BackendId::Claude => "claude",
             BackendId::Cline => "cline",
         }
     }
@@ -22,14 +24,46 @@ impl BackendId {
         match s {
             "codex" => Some(BackendId::Codex),
             "copilot" => Some(BackendId::Copilot),
+            "claude" => Some(BackendId::Claude),
             "cline" => Some(BackendId::Cline),
             _ => None,
         }
     }
 
-    pub fn all() -> [BackendId; 3] {
-        [BackendId::Codex, BackendId::Copilot, BackendId::Cline]
+    pub fn all() -> [BackendId; 4] {
+        [
+            BackendId::Codex,
+            BackendId::Copilot,
+            BackendId::Claude,
+            BackendId::Cline,
+        ]
     }
+}
+
+/// The model name without a trailing parenthesised suffix or surrounding whitespace.
+///
+/// Claude Code appends a thinking suffix such as `(high)` that is not part of the model's
+/// identity, so routing and accounting use the base name. The id is otherwise preserved: it is
+/// matched against operator-editable catalogs, and changing its case would stop an entry with an
+/// uppercase character from matching - the request would then fall through to the unknown-model
+/// fallback instead of the intended backend.
+pub fn normalize_model_name(model: &str) -> String {
+    let trimmed = model.trim();
+    match trimmed.rfind('(') {
+        Some(open) if trimmed.ends_with(')') => trimmed[..open].trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// The wire protocol a client speaks. Backends declare which surfaces they can serve, so the
+/// pool never routes an Anthropic-shaped request to a backend that only speaks OpenAI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Surface {
+    /// OpenAI-shaped: `/v1/responses`, `/v1/chat/completions`.
+    OpenAI,
+    /// Anthropic Messages API: `/v1/messages`, `/v1/messages/count_tokens`.
+    Anthropic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +96,10 @@ pub struct Account {
     pub residency: Option<String>,
     #[serde(default)]
     pub enterprise_url: Option<String>,
+    /// Subscription plan reported by the upstream, when the backend exposes one
+    /// (`pro`/`max`/`team`/`enterprise` for Claude Code accounts).
+    #[serde(default)]
+    pub plan: Option<String>,
     pub status: AccountStatus,
     #[serde(default)]
     pub reset_at: i64,
@@ -105,13 +143,25 @@ impl Account {
     /// scope with a future deadline must not be entered. An empty/absent scope inherits the
     /// account-wide state only.
     pub fn healthy_for(&self, scope: Option<&str>, now: i64) -> bool {
-        self.healthy() && self.scope_cooling_until(scope).is_none_or(|until| until <= now)
+        self.healthy()
+            && self
+                .scope_cooling_until(scope)
+                .is_none_or(|until| until <= now)
     }
 
     /// The deadline stored for `scope`, or `None` when the scope is absent or names no surface.
     pub fn scope_cooling_until(&self, scope: Option<&str>) -> Option<i64> {
         let scope = scope.filter(|scope| !scope.is_empty())?;
         self.scope_cooling.get(scope).copied()
+    }
+
+    /// The plan this account runs on, for display. Codex derives it from the stored access
+    /// token's claims; other backends report it at onboarding and store it on the account.
+    pub fn plan_label(&self) -> Option<String> {
+        match self.backend {
+            BackendId::Codex => self.chatgpt_plan(),
+            _ => self.plan.clone(),
+        }
     }
 }
 
@@ -142,7 +192,14 @@ pub struct Binding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Ok,
-    QuotaExhausted { until_ms: i64 },
+    QuotaExhausted {
+        until_ms: i64,
+    },
+    /// The upstream refused this model on this account, but the account still serves other
+    /// models: the cooldown applies to the model, not to the account.
+    ModelQuotaExhausted {
+        until_ms: i64,
+    },
     AuthFailed,
     Transient,
 }

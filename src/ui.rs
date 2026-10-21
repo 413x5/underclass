@@ -1,13 +1,13 @@
-use crate::models::{now_ms, AccountStatus, BackendId, RequestLogEntry};
+use crate::models::{AccountStatus, BackendId, RequestLogEntry, now_ms};
 use crate::proxy::AppState;
-use axum::extract::{Path, Query, State};
 use crate::store::UsageQuery;
+use axum::Json;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::json;
-use chrono::Datelike;
 use std::sync::Arc;
 
 pub const UI_HTML: &str = include_str!("ui.html");
@@ -52,6 +52,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         .iter()
         .filter(|b| b.account_id == account.id)
         .count();
+    drop(pool);
     let now = now_ms();
     // Remaining time is computed here, not in the browser: an operator's clock is not the server's,
     // and an absolute deadline rendered client-side can show a live cooldown as expired.
@@ -70,7 +71,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
     json!({
         "id": account.id,
         "backend": account.backend.as_str(),
-        "plan": account.chatgpt_plan(),
+        "plan": account.plan_label(),
         "label": account.label,
         "status": account.status,
         "reset_at": account.reset_at,
@@ -82,6 +83,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         "enterprise_url": account.enterprise_url,
         "created_at": account.created_at,
         "usage": state.resets.snapshot(&account.id),
+        "observation": state.observations.lock().unwrap().get(&account.id).cloned(),
     })
 }
 
@@ -96,12 +98,7 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
     let requests: Vec<RequestLogEntry> = state.logs.lock().unwrap().iter().rev().cloned().collect();
     let catalog: serde_json::Map<String, serde_json::Value> = BackendId::all()
         .iter()
-        .map(|b| {
-            (
-                b.as_str().to_string(),
-                json!(state.store.catalog(*b)),
-            )
-        })
+        .map(|b| (b.as_str().to_string(), json!(state.store.catalog(*b))))
         .collect();
     Json(json!({
         "accounts": accounts,
@@ -115,17 +112,38 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
 fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
     if query.from_ms.is_none() && query.to_ms.is_none() {
         let now = chrono::Utc::now();
-        let start = now.date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+        let start = now
+            .date_naive()
+            .with_day(1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
         query.from_ms = Some(start);
     }
-    if query.from_ms.zip(query.to_ms).is_some_and(|(from, to)| from >= to) {
+    if query
+        .from_ms
+        .zip(query.to_ms)
+        .is_some_and(|(from, to)| from >= to)
+    {
         return Err((StatusCode::BAD_REQUEST, "from_ms must precede to_ms").into_response());
     }
-    if query.group_by.as_deref().unwrap_or("").split(',').any(|part| !part.is_empty() && !matches!(part, "model" | "account_id" | "cache_key")) {
+    if query
+        .group_by
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .any(|part| !part.is_empty() && !matches!(part, "model" | "account_id" | "cache_key"))
+    {
         return Err((StatusCode::BAD_REQUEST, "invalid group_by").into_response());
     }
     if query.cache_key.is_some() && query.missing_key == Some(true) {
-        return Err((StatusCode::BAD_REQUEST, "cache_key conflicts with missing_key").into_response());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cache_key conflicts with missing_key",
+        )
+            .into_response());
     }
     Ok(query)
 }
@@ -133,25 +151,49 @@ fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
 /// @cc [owner:ghuntley,label:security] usage-admin-query
 /// Usage summaries MUST be available only under the admin token gate and MUST report unknown
 /// requests separately from measured input and output totals.
-pub async fn usage_summary(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
-    let query = match usage_query(query) { Ok(query) => query, Err(response) => return response };
+pub async fn usage_summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    let query = match usage_query(query) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     match state.store.usage_summary(&query) {
         Ok(groups) => {
-            let total_query = UsageQuery { group_by: None, ..query.clone() };
+            let total_query = UsageQuery {
+                group_by: None,
+                ..query.clone()
+            };
             match state.store.usage_summary(&total_query) {
                 Ok(totals) => Json(json!({"groups": groups, "totals": totals.first(), "from_ms": query.from_ms, "to_ms": query.to_ms})).into_response(),
                 Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
             }
-        },
-        Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "usage.query_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response()
+        }
     }
 }
 
-pub async fn usage_requests(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
-    let query = match usage_query(query) { Ok(query) => query, Err(response) => return response };
+pub async fn usage_requests(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    let query = match usage_query(query) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     match state.store.usage_records(&query) {
-        Ok(requests) => Json(json!({"requests": requests, "from_ms": query.from_ms, "to_ms": query.to_ms})).into_response(),
-        Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+        Ok(requests) => {
+            Json(json!({"requests": requests, "from_ms": query.from_ms, "to_ms": query.to_ms}))
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "usage.query_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response()
+        }
     }
 }
 
@@ -212,7 +254,8 @@ async fn start_cline_flow(
         Ok(account) => {
             state.pool.lock().unwrap().sync_account(account.clone());
             if let Err(error) =
-                crate::cline::refresh_catalog(&state.client, &state.store, &state.pool, &api_key).await
+                crate::cline::refresh_catalog(&state.client, &state.store, &state.pool, &api_key)
+                    .await
             {
                 crate::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
             }
@@ -233,10 +276,9 @@ async fn start_cline_flow(
                 }
                 other => format!("could not verify the Cline API key, try again ({other})"),
             };
-            state.flows.set_state(
-                &flow_id,
-                crate::flows::FlowState::Failed { message },
-            );
+            state
+                .flows
+                .set_state(&flow_id, crate::flows::FlowState::Failed { message });
         }
     }
     (state.flows.clone(), flow_id)
@@ -253,10 +295,7 @@ pub async fn start_flow(
         return (StatusCode::BAD_REQUEST, "unknown backend").into_response();
     };
     if backend == BackendId::Cline {
-        let replace_account = body
-            .account_id
-            .clone()
-            .filter(|id| !id.trim().is_empty());
+        let replace_account = body.account_id.clone().filter(|id| !id.trim().is_empty());
         if let Some(account_id) = replace_account.as_deref() {
             let Some(account) = state.store.get_account(account_id) else {
                 return (StatusCode::NOT_FOUND, "unknown account").into_response();
@@ -292,6 +331,14 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::Claude => crate::claude::start_flow(
+            state.client.clone(),
+            state.store.clone(),
+            state.flows.clone(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string()),
         BackendId::Cline => unreachable!("handled above"),
     };
     match result {
@@ -314,13 +361,55 @@ pub async fn flow_status(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     }
 }
 
-pub async fn delete_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+#[derive(Deserialize)]
+pub struct FlowCodeBody {
+    pub code: String,
+}
+
+/// @cc [owner:ghuntley,label:security] claude-flow-code-never-echoed
+/// `submit_flow_code` MUST exchange the pasted authorization code for tokens and MUST NOT echo
+/// the code, the state, or any token back to the caller.
+pub async fn submit_flow_code(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<FlowCodeBody>,
+) -> Response {
+    match crate::claude::submit_code(
+        state.client.clone(),
+        state.store.clone(),
+        state.flows.clone(),
+        &id,
+        &body.code,
+    )
+    .await
+    {
+        Ok(account_id) => {
+            Json(json!({ "account_id": account_id, "status": "authorized" })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "flow_failed", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn delete_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
     state.store.delete_account(&id);
     state.pool.lock().unwrap().remove_account(&id);
+    // The backend observation is keyed by account id and is never reaped elsewhere; a re-added
+    // account gets a fresh uuid, so leaving it here would accumulate one entry per deletion.
+    state.observations.lock().unwrap().remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn disable_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn disable_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
     set_status(&state, &id, AccountStatus::Disabled, 0)
 }
 
@@ -335,7 +424,10 @@ pub async fn disable_account(State(state): State<Arc<AppState>>, Path(id): Path<
 /// The read, the pool mutation, and the persistence MUST happen in one critical section, so a quota
 /// or auth transition that lands concurrently is neither lost to a stale snapshot nor resurrected by
 /// the next `sync_from_store`.
-pub async fn enable_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn enable_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
     let mut pool = state.pool.lock().unwrap();
     let Some(current) = pool.account(&id).cloned() else {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
@@ -382,6 +474,14 @@ pub async fn relogin_account(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::Claude => crate::claude::start_flow(
+            state.client.clone(),
+            state.store.clone(),
+            state.flows.clone(),
+            Some(id.clone()),
+        )
+        .await
+        .map_err(|e| e.to_string()),
         // A Cline key cannot be refreshed, so re-keying is a paste-a-new-key flow that keeps this
         // account's id and clears its cooldown. No polling flow is created: the browser collects the
         // new key and posts it to `/admin/api/flows` with this account id.
@@ -394,7 +494,11 @@ pub async fn relogin_account(
             let flow = state.flows.get(&flow_id);
             Json(json!({ "flow_id": flow_id, "flow": flow })).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("failed to start flow: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to start flow: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -406,7 +510,8 @@ pub struct ResetQuery {
 
 /// @cc [owner:ghuntley,label:pool] manual-reset-endpoint-outcomes
 /// `reset_account` MUST return 404 for an unknown account id and otherwise delegate to
-/// `ResetManager::manual_reset` with the `force` query flag. Every non-2xx response MUST carry a
+/// `ResetManager::manual_reset` with the `force` query flag for a ChatGPT/Codex account, or to
+/// the Claude Code redemption path for a Claude account. Every non-2xx response MUST carry a
 /// JSON body with a stable `error` code and a human `message`; refusals that `force` can override
 /// (`not_rate_limited`, `already_redeemed`) and `no_credit` MUST be 409, `not_codex` 400, and
 /// upstream failures 502.
@@ -423,6 +528,52 @@ pub async fn reset_account(
         )
             .into_response();
     };
+    if account.backend == BackendId::Claude {
+        let token = match state.tokens.access_token(&account).await {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(error = %e, "claude.reset.token_unavailable");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": "upstream_error", "message": "no usable credential" })),
+                )
+                    .into_response();
+            }
+        };
+        return match crate::claude::manual_reset(
+            &state.client,
+            &account,
+            &token,
+            &state.pool,
+            &state.store,
+            query.force,
+        )
+        .await
+        {
+            Ok(outcome) => Json(json!({
+                "account_id": account.id,
+                "label": account.label,
+                "outcome": outcome.outcome,
+                "credit_id": outcome.credit_id,
+                "status": outcome.status,
+                "available_resets": outcome.available_resets,
+            }))
+            .into_response(),
+            Err(error) => {
+                // An upstream failure is transient: reporting it as a conflict would tell the
+                // operator their request was rejected when retrying is the right response.
+                let status = match error {
+                    crate::claude::ClaudeResetError::Upstream(_) => StatusCode::BAD_GATEWAY,
+                    _ => StatusCode::CONFLICT,
+                };
+                (
+                    status,
+                    Json(json!({ "error": error.code(), "message": error.message() })),
+                )
+                    .into_response()
+            }
+        };
+    }
     match state
         .resets
         .manual_reset(
@@ -484,7 +635,8 @@ pub async fn get_catalog(
     let Some(backend) = BackendId::parse(&backend) else {
         return (StatusCode::NOT_FOUND, "unknown backend").into_response();
     };
-    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) })).into_response()
+    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) }))
+        .into_response()
 }
 
 pub async fn put_catalog(
@@ -503,7 +655,8 @@ pub async fn put_catalog(
     }
     state.store.set_catalog(backend, &models);
     state.pool.lock().unwrap().set_catalog(backend, &models);
-    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) })).into_response()
+    Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) }))
+        .into_response()
 }
 
 /// @cc [owner:ghuntley,label:pool] cline-catalog-refresh-endpoint
@@ -552,7 +705,11 @@ pub async fn refresh_copilot_catalog(State(state): State<Arc<AppState>>) -> Resp
         match crate::copilot::fetch_catalog(&state.client, &account, &token).await {
             Ok(models) if !models.is_empty() => {
                 state.store.set_catalog(BackendId::Copilot, &models);
-                state.pool.lock().unwrap().set_catalog(BackendId::Copilot, &models);
+                state
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .set_catalog(BackendId::Copilot, &models);
                 refreshed += 1;
             }
             Ok(_) => {}

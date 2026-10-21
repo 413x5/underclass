@@ -1,4 +1,4 @@
-use crate::models::{new_id, now_ms, Account, AccountStatus, BackendId};
+use crate::models::{Account, AccountStatus, BackendId, new_id, now_ms};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,10 @@ pub enum FlowState {
         user_code: String,
         verify_url: String,
     },
+    /// The flow needs the user to paste a code back from a hosted callback page.
+    AwaitingCode {
+        authorize_url: String,
+    },
     Authorized {
         account_id: String,
     },
@@ -18,11 +22,21 @@ pub enum FlowState {
     },
 }
 
+/// Browser-side OAuth material for a flow that redirects the user to an authorization page.
+/// It never leaves the server: the struct is skipped when a flow is serialized to the admin API.
+#[derive(Clone, Debug)]
+pub struct OAuthState {
+    pub verifier: String,
+    pub state: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Flow {
     pub backend: BackendId,
     pub state: FlowState,
     pub replace_account: Option<String>,
+    #[serde(skip_serializing)]
+    pub oauth: Option<OAuthState>,
 }
 
 #[derive(Clone, Default)]
@@ -31,7 +45,22 @@ pub struct FlowRegistry {
 }
 
 impl FlowRegistry {
-    pub fn create(&self, backend: BackendId, state: FlowState, replace_account: Option<String>) -> String {
+    pub fn create(
+        &self,
+        backend: BackendId,
+        state: FlowState,
+        replace_account: Option<String>,
+    ) -> String {
+        self.create_with_oauth(backend, state, replace_account, None)
+    }
+
+    pub fn create_with_oauth(
+        &self,
+        backend: BackendId,
+        state: FlowState,
+        replace_account: Option<String>,
+        oauth: Option<OAuthState>,
+    ) -> String {
         let id = new_id();
         self.inner.lock().unwrap().insert(
             id.clone(),
@@ -39,6 +68,7 @@ impl FlowRegistry {
                 backend,
                 state,
                 replace_account,
+                oauth,
             },
         );
         id
@@ -68,6 +98,7 @@ pub fn new_account(backend: BackendId, label: String) -> Account {
         account_id: None,
         residency: None,
         enterprise_url: None,
+        plan: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
         scope_cooling: Default::default(),

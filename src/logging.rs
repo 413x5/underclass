@@ -67,7 +67,11 @@ pub fn log_account_state(account_id: &str, label: Option<&str>, event: &str, det
 
 /// Catalog refresh outcome for one account. Identity is logged as a label plus a truncated id so
 /// raw UUIDs never reach the log.
-pub fn log_catalog_refresh(account: &crate::models::Account, models: Option<usize>, error: Option<&str>) {
+pub fn log_catalog_refresh(
+    account: &crate::models::Account,
+    models: Option<usize>,
+    error: Option<&str>,
+) {
     match (models, error) {
         (Some(models), _) => tracing::info!(
             account = %account.label,
@@ -96,7 +100,10 @@ pub fn log_stream_finished(
     saw_output: bool,
     duration_ms: i64,
 ) {
-    if matches!(outcome, "failed" | "incomplete" | "truncated" | "upstream_error") {
+    if matches!(
+        outcome,
+        "failed" | "incomplete" | "truncated" | "upstream_error"
+    ) {
         tracing::warn!(
             request_id = %request_id,
             model = %model,
@@ -120,6 +127,27 @@ pub fn log_stream_finished(
     }
 }
 
+/// An upstream stream failed with a capacity code before any output, so the request is retried on
+/// another account instead of being passed through.
+pub fn log_overload_failover(
+    request_id: &str,
+    model: &str,
+    account_id: &str,
+    label: &str,
+    error_code: &str,
+    held_ms: u64,
+) {
+    tracing::warn!(
+        request_id = %request_id,
+        model = %model,
+        account = %label,
+        account_id = %truncate(account_id),
+        error_code = %error_code,
+        held_ms = held_ms,
+        "request.overload_failover"
+    );
+}
+
 /// `until_ms` is the absolute epoch-millisecond pool reset; `retry_after_ms` is the relative wait.
 pub fn log_saturated(request_id: &str, until_ms: i64, now_ms: i64) {
     tracing::warn!(
@@ -130,7 +158,12 @@ pub fn log_saturated(request_id: &str, until_ms: i64, now_ms: i64) {
     );
 }
 
-pub fn log_reset_decision(request_id: &str, reason: &str, cooling_accounts: usize, selected_wait_ms: Option<i64>) {
+pub fn log_reset_decision(
+    request_id: &str,
+    reason: &str,
+    cooling_accounts: usize,
+    selected_wait_ms: Option<i64>,
+) {
     tracing::info!(
         request_id = %request_id,
         reason = %reason,
@@ -140,7 +173,13 @@ pub fn log_reset_decision(request_id: &str, reason: &str, cooling_accounts: usiz
     );
 }
 
-pub fn log_reset_account(request_id: &str, account_id: &str, label: &str, outcome: &str, natural_wait_ms: i64) {
+pub fn log_reset_account(
+    request_id: &str,
+    account_id: &str,
+    label: &str,
+    outcome: &str,
+    natural_wait_ms: i64,
+) {
     tracing::info!(
         request_id = %request_id,
         account = %label,

@@ -59,7 +59,7 @@
       </div>
     </div>
     <table id="accounts">
-      <thead><tr><th>label</th><th>backend</th><th>status</th><th>in-flight</th><th>sticky sessions</th><th>renews in</th><th>Codex usage</th><th>banked resets</th><th></th></tr></thead>
+      <thead><tr><th>label</th><th>backend</th><th>plan</th><th>status</th><th>in-flight</th><th>sticky sessions</th><th>renews in</th><th>quota</th><th>Codex usage</th><th>banked resets</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <p class="muted">Healthy accounts serve requests. Quota exhaustion moves an account to <b>cooling</b> until its window resets — it stays configured. <b>auth error</b> accounts need re-login.</p>
@@ -137,6 +137,7 @@
     <select id="catalogBackend" onchange="loadCatalog()">
       <option value="codex">codex</option>
       <option value="copilot">copilot</option>
+      <option value="claude">claude</option>
       <option value="cline">cline</option>
     </select>
     <label>models (JSON array of {id, name, context, input, output})</label>
@@ -155,6 +156,7 @@
     <select id="flowBackend">
       <option value="codex">ChatGPT / Codex</option>
       <option value="copilot">GitHub Copilot</option>
+      <option value="claude">Claude Code (Anthropic)</option>
       <option value="cline">Cline (API key)</option>
     </select>
     <div id="enterpriseWrap" style="display:none">
@@ -179,6 +181,15 @@
     <p class="muted"><span class="spin">⠋</span> waiting for authorization…</p>
     <button onclick="closeFlow()">Cancel</button>
   </div>
+  <div id="flowAwaitingCode" style="display:none">
+    <p>Sign in at <a id="flowAuthorizeUrl" target="_blank" rel="noopener"></a>, then paste the code it shows.</p>
+    <input id="flowCodeInput" placeholder="code#state">
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="submitFlowCode()">Finish</button>
+      <button onclick="closeFlow()">Cancel</button>
+    </div>
+    <p class="muted">The callback page shows a code like <code>abc123#state</code>. Paste the whole thing.</p>
+  </div>
   <div id="flowDone" style="display:none">
     <p>✅ Account authorized.</p>
     <button class="primary" onclick="closeFlow()">Done</button>
@@ -200,6 +211,7 @@
 
 <script>
 let flowTimer = null;
+let currentFlowId = null;
 let usageOffset = 0;
 let usageGroupOffset = 0;
 let usageLoaded = false;
@@ -227,6 +239,24 @@ function fmtDuration(ms) {
   return s + 's';
 }
 
+function formatQuota(o) {
+  if (!o) return '—';
+  const parts = [];
+  const window = (label, w) => {
+    // Remaining, not used: `utop` renders the same observation as remaining percentage, and a
+    // fully spent window must read 0% rather than 100%.
+    if (w && typeof w.utilization === 'number') parts.push(label + ' ' + Math.round((1 - w.utilization) * 100) + '% left');
+  };
+  window('5h', o.five_hour);
+  window('7d', o.seven_day);
+  window('7d fable', o.seven_day_fable);
+  if (o.reset_credits) parts.push(o.reset_credits + ' reset' + (o.reset_credits > 1 ? 's' : ''));
+  // Escaped: the observation is backend-supplied, so an unescaped fallback here would be an
+  // XSS the moment a backend derives a status from upstream text.
+  if (!parts.length) return esc(o.status || '—');
+  return parts.join(' · ');
+}
+
 // An account can be healthy while one billing surface is cooling, so the account-wide status alone
 // would misreport availability. Remaining times are computed server-side; the browser clock may not
 // be the server clock.
@@ -248,15 +278,18 @@ async function loadState() {
     for (const a of data.accounts) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${esc(a.label)}</td><td>${a.backend}</td>
+        <td>${esc(a.plan || (a.observation && a.observation.plan) || '—')}</td>
         <td><span class="badge ${a.status}">${a.status}</span></td>
         <td>${a.inflight}</td><td>${a.sticky_sessions}</td>
         <td>${fmtReset(a.cooling_remaining_ms, a)}</td>
+        <td>${formatQuota(a.observation)}</td>
         <td>${formatUsage(a.usage)}</td>
-        <td>${formatCredits(a.usage)}</td>
+        <td>${a.backend === 'claude' ? formatObservationCredits(a.observation) : formatCredits(a.usage)}</td>
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
           ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">${a.backend === 'cline' ? 'Re-key' : 'Re-login'}</button>` : ''}
           ${a.backend === 'codex' && a.usage && a.usage.available_resets > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
+          ${a.backend === 'claude' && (a.status === 'healthy' || a.status === 'cooling') && a.observation && a.observation.reset_credits > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
         </td>`;
       tbody.appendChild(tr);
@@ -425,6 +458,13 @@ function formatUsage(usage) {
   return `${value || 'no windows'}<br><span class="muted">checked ${new Date(usage.fetched_at_ms).toLocaleTimeString()}</span>`;
 }
 
+// Claude Code banked resets live on the usage observation, not the Codex usage snapshot, so the
+// count and the Use reset button must read the same source.
+function formatObservationCredits(observation) {
+  if (!observation || typeof observation.reset_credits !== 'number') return '—';
+  return `${observation.reset_credits} available`;
+}
+
 function formatCredits(usage) {
   if (!usage) return '—';
   const expiries = (usage.credit_expirations || []).filter(Boolean).map(ms => new Date(ms).toLocaleDateString());
@@ -434,6 +474,9 @@ function formatCredits(usage) {
 function snippet(catalog) {
   const models = {};
   for (const backend of Object.keys(catalog || {})) {
+    // The Anthropic surface is not OpenAI-shaped, so its models do not belong in an
+    // OpenAI-compatible provider block.
+    if (backend === 'claude') continue;
     for (const m of catalog[backend]) models[m.id] = { name: m.name };
   }
   return {
@@ -480,6 +523,7 @@ async function startFlow() {
   document.getElementById('flowLabel').value = '';
   document.getElementById('flowIdle').style.display = 'block';
   document.getElementById('flowPending').style.display = 'none';
+  document.getElementById('flowAwaitingCode').style.display = 'none';
   document.getElementById('flowDone').style.display = 'none';
   document.getElementById('flowFailed').style.display = 'none';
   document.getElementById('flowDialog').showModal();
@@ -504,26 +548,57 @@ async function beginFlow() {
   pollFlow(data.flow_id);
 }
 
+async function submitFlowCode() {
+  const code = document.getElementById('flowCodeInput').value.trim();
+  if (!code) return;
+  document.getElementById('flowError').style.display = 'none';
+  const res = await api('/admin/api/flows/' + currentFlowId + '/code', { method: 'POST', body: JSON.stringify({ code }) });
+  if (!res.ok) {
+    // The server-side flow is still `awaiting_code`, so a corrected paste is accepted: show the
+    // error inline and leave the input in place instead of forcing the operator to start over.
+    const body = await res.json().catch(() => ({}));
+    document.getElementById('flowError').textContent = body.message || 'could not finish the flow';
+    document.getElementById('flowError').style.display = 'block';
+    return;
+  }
+  document.getElementById('flowAwaitingCode').style.display = 'none';
+  document.getElementById('flowDone').style.display = 'block';
+  clearInterval(flowTimer);
+  loadState();
+}
+
 function pollFlow(flowId) {
+  currentFlowId = flowId;
   document.getElementById('flowIdle').style.display = 'none';
-  document.getElementById('flowPending').style.display = 'block';
+  document.getElementById('flowPending').style.display = 'none';
+  document.getElementById('flowAwaitingCode').style.display = 'none';
+  // A second Start click before the first POST resolves must not leave two pollers alive: the
+  // stale one could flip the dialog for a flow the operator already abandoned.
   clearInterval(flowTimer);
   flowTimer = setInterval(async () => {
     const res = await api('/admin/api/flows/' + flowId);
     const data = await res.json();
     const state = data.flow.state;
     if (state.state === 'pending') {
+      document.getElementById('flowPending').style.display = 'block';
       document.getElementById('flowUserCode').textContent = state.user_code;
       const link = document.getElementById('flowVerifyUrl');
       link.href = state.verify_url; link.textContent = state.verify_url;
+    } else if (state.state === 'awaiting_code') {
+      clearInterval(flowTimer);
+      document.getElementById('flowAwaitingCode').style.display = 'block';
+      const link = document.getElementById('flowAuthorizeUrl');
+      link.href = state.authorize_url; link.textContent = state.authorize_url;
     } else if (state.state === 'authorized') {
       clearInterval(flowTimer);
       document.getElementById('flowPending').style.display = 'none';
+      document.getElementById('flowAwaitingCode').style.display = 'none';
       document.getElementById('flowDone').style.display = 'block';
       loadState();
     } else if (state.state === 'failed') {
       clearInterval(flowTimer);
       document.getElementById('flowPending').style.display = 'none';
+      document.getElementById('flowAwaitingCode').style.display = 'none';
       document.getElementById('flowFailed').style.display = 'block';
       document.getElementById('flowError').textContent = state.message;
     }

@@ -34,3 +34,6 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 - [Prompt Cache Scope Across Subscriptions](prompt-cache-scope-across-subscriptions.md) — measured
   finding that Cline's prompt cache is shared across API keys, so cross-subscription reuse already
   happens and no derived sticky key is needed.
+- [Quota Dimensions Compose in Selection](quota-dimensions-compose-in-selection.md) — how the
+  fork's per-billing-surface cooling and upstream's per-model cooling coexist in one eligibility
+  predicate, and why neither subsumes the other.

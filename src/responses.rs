@@ -4,7 +4,7 @@
 //! proxy converts the request body before the upstream call and converts the upstream body back
 //! before it reaches the client.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::io::Write;
 
 /// @cc [owner:ghuntley,label:proxy] responses-request-translation
@@ -56,7 +56,10 @@ pub fn request_to_chat(body: &Value) -> Value {
             chat.insert(key.into(), value.clone());
         }
     }
-    if let Some(value) = body.get("max_output_tokens").filter(|value| !value.is_null()) {
+    if let Some(value) = body
+        .get("max_output_tokens")
+        .filter(|value| !value.is_null())
+    {
         chat.insert("max_tokens".into(), value.clone());
     }
     if let Some(effort) = body
@@ -164,7 +167,11 @@ fn chat_tool_choice(choice: &Value) -> Value {
 fn push_input_item(messages: &mut Vec<Value>, item: &Value) {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
-            let call_id = item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null);
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .cloned()
+                .unwrap_or(Value::Null);
             let name = item.get("name").cloned().unwrap_or(Value::Null);
             let arguments = match item.get("arguments") {
                 Some(Value::String(arguments)) => Value::String(arguments.clone()),
@@ -182,7 +189,11 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) {
             }));
         }
         Some("function_call_output") => {
-            let call_id = item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null);
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .cloned()
+                .unwrap_or(Value::Null);
             let output = match item.get("output") {
                 Some(Value::String(output)) => Value::String(output.clone()),
                 Some(other) => Value::String(other.to_string()),
@@ -253,7 +264,12 @@ fn image_url(part: &Value) -> Option<Value> {
 /// `content_filter` MUST map to `status: incomplete` with the matching `incomplete_details.reason`,
 /// and an upstream `error` -- whether top-level or a choice-level `finish_reason: "error"` -- MUST
 /// map to `status: failed` with an empty `output` and an `error` object.
-pub fn completion_to_response(chat: &Value, model: &str, response_id: &str, created_at: i64) -> Value {
+pub fn completion_to_response(
+    chat: &Value,
+    model: &str,
+    response_id: &str,
+    created_at: i64,
+) -> Value {
     if let Some(error) = chat.get("error").filter(|error| !error.is_null()) {
         return json!({
             "id": response_id,
@@ -287,7 +303,10 @@ pub fn completion_to_response(chat: &Value, model: &str, response_id: &str, crea
     if let Some(reasoning) = message.and_then(reasoning_text) {
         output.push(reasoning_item("rs_0", &reasoning));
     }
-    if let Some(text) = message.and_then(message_text).filter(|text| !text.is_empty()) {
+    if let Some(text) = message
+        .and_then(message_text)
+        .filter(|text| !text.is_empty())
+    {
         output.push(json!({
             "type": "message",
             "id": "msg_0",
@@ -296,7 +315,10 @@ pub fn completion_to_response(chat: &Value, model: &str, response_id: &str, crea
             "content": [{"type": "output_text", "text": text, "annotations": []}]
         }));
     }
-    if let Some(tool_calls) = message.and_then(|message| message.get("tool_calls")).and_then(Value::as_array) {
+    if let Some(tool_calls) = message
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
         for (index, call) in tool_calls.iter().enumerate() {
             let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = call
@@ -390,8 +412,16 @@ fn reasoning_item(item_id: &str, text: &str) -> Value {
 
 fn usage_to_responses(usage: &Value) -> Value {
     let number = |value: Option<&Value>| value.and_then(Value::as_i64).unwrap_or(0);
-    let input = number(usage.get("prompt_tokens").or_else(|| usage.get("input_tokens")));
-    let output = number(usage.get("completion_tokens").or_else(|| usage.get("output_tokens")));
+    let input = number(
+        usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens")),
+    );
+    let output = number(
+        usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens")),
+    );
     let total = number(usage.get("total_tokens")).max(input.saturating_add(output));
     let cached = number(
         usage
@@ -621,7 +651,11 @@ impl ChatStreamTranslator {
         }
         let delta = choice.get("delta");
         if let Some(text) = delta
-            .and_then(|delta| delta.get("reasoning").or_else(|| delta.get("reasoning_content")))
+            .and_then(|delta| {
+                delta
+                    .get("reasoning")
+                    .or_else(|| delta.get("reasoning_content"))
+            })
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
@@ -1018,7 +1052,11 @@ impl ChatStreamTranslator {
         let mut output: Vec<Value> = items.into_iter().map(|(_, item)| item).collect();
         let (event, status, incomplete_reason) = match &finish {
             Finish::Completed => ("response.completed", "completed", None),
-            Finish::Length => ("response.incomplete", "incomplete", Some("max_output_tokens")),
+            Finish::Length => (
+                "response.incomplete",
+                "incomplete",
+                Some("max_output_tokens"),
+            ),
             Finish::ContentFilter => ("response.incomplete", "incomplete", Some("content_filter")),
             Finish::Failed(_) => {
                 // A failed response carries no usable output; this matches the non-streaming
@@ -1045,7 +1083,12 @@ impl ChatStreamTranslator {
             response["error"] = error;
         }
         let seq = self.next_seq();
-        emit(out, seq, event, json!({"type": event, "response": response}));
+        emit(
+            out,
+            seq,
+            event,
+            json!({"type": event, "response": response}),
+        );
     }
 }
 
@@ -1056,7 +1099,6 @@ fn emit(out: &mut Vec<u8>, seq: u64, event: &str, mut data: Value) {
     let _ = writeln!(out, "event: {event}");
     let _ = writeln!(out, "data: {data}\n");
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1085,7 +1127,10 @@ mod tests {
         });
         let chat = request_to_chat(&request);
         assert_eq!(chat["model"], "cline/anthropic/claude-sonnet-4-6");
-        assert_eq!(chat["messages"][0], json!({"role": "system", "content": "be terse"}));
+        assert_eq!(
+            chat["messages"][0],
+            json!({"role": "system", "content": "be terse"})
+        );
         assert_eq!(
             chat["messages"][1],
             json!({"role": "user", "content": [{"type": "text", "text": "hello"}]})
@@ -1102,7 +1147,10 @@ mod tests {
     #[test]
     fn request_translation_accepts_plain_string_input_and_images() {
         let chat = request_to_chat(&json!({"input": "plain"}));
-        assert_eq!(chat["messages"], json!([{"role": "user", "content": "plain"}]));
+        assert_eq!(
+            chat["messages"],
+            json!([{"role": "user", "content": "plain"}])
+        );
         let chat = request_to_chat(&json!({"input": [{"role": "user", "content": [
             {"type": "input_image", "image_url": "data:image/png;base64,xx"}
         ]}]}));
@@ -1145,8 +1193,14 @@ mod tests {
         }));
         let function = chat["tools"][0]["function"].clone();
         assert_eq!(function["name"], "ping");
-        assert!(function.get("description").is_none(), "null description must be omitted");
-        assert_eq!(function["parameters"], json!({"type": "object", "properties": {}}));
+        assert!(
+            function.get("description").is_none(),
+            "null description must be omitted"
+        );
+        assert_eq!(
+            function["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
     }
 
     #[test]
@@ -1181,7 +1235,10 @@ mod tests {
         );
         out.extend(translator.finish_on_eof());
         let frames = stream_frames(&out);
-        let failed = frames.iter().find(|f| f["type"] == "response.failed").unwrap();
+        let failed = frames
+            .iter()
+            .find(|f| f["type"] == "response.failed")
+            .unwrap();
         assert_eq!(
             failed["response"]["output"],
             json!([]),
@@ -1199,11 +1256,15 @@ mod tests {
         out.extend(translator.finish_on_eof());
         let frames = stream_frames(&out);
         assert!(
-            !frames.iter().any(|f| f.get("type").and_then(|v| v.as_str()) == Some("response.output_item.added")
+            !frames.iter().any(|f| f.get("type").and_then(|v| v.as_str())
+                == Some("response.output_item.added")
                 && f["item"]["type"] == "message"),
             "an empty content delta must not add a message item"
         );
-        let completed = frames.iter().find(|f| f["type"] == "response.completed").unwrap();
+        let completed = frames
+            .iter()
+            .find(|f| f["type"] == "response.completed")
+            .unwrap();
         assert!(
             !completed["response"]["output"]
                 .as_array()
@@ -1222,11 +1283,17 @@ mod tests {
             "text": {"format": {"type": "json_schema"}},
             "input": [{"role": "user", "content": "hi"}],
         }));
-        assert!(chat.get("reasoning_effort").is_none(), "null effort must be omitted");
+        assert!(
+            chat.get("reasoning_effort").is_none(),
+            "null effort must be omitted"
+        );
         let schema = chat["response_format"]["json_schema"].clone();
         assert_eq!(schema["name"], "response");
         assert_eq!(schema["schema"], json!({}));
-        assert!(schema.get("strict").is_none(), "null strict must be omitted");
+        assert!(
+            schema.get("strict").is_none(),
+            "null strict must be omitted"
+        );
     }
 
     #[test]
@@ -1274,7 +1341,10 @@ mod tests {
             "tools": [{"type": "web_search"}, {"type": "file_search"}],
             "tool_choice": "auto"
         }));
-        assert!(hosted_only.get("tools").is_none(), "hosted tools must not convert");
+        assert!(
+            hosted_only.get("tools").is_none(),
+            "hosted tools must not convert"
+        );
         assert!(
             hosted_only.get("tool_choice").is_none(),
             "tool_choice without tools is rejected upstream"
@@ -1289,7 +1359,10 @@ mod tests {
             "tool_choice": null
         }));
         assert!(null_choice.get("tools").is_some());
-        assert!(null_choice.get("tool_choice").is_none(), "null must stay omitted");
+        assert!(
+            null_choice.get("tool_choice").is_none(),
+            "null must stay omitted"
+        );
     }
 
     #[test]
@@ -1318,7 +1391,8 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "Paris."}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 14, "completion_tokens": 8, "total_tokens": 22}
         });
-        let response = completion_to_response(&chat, "cline/anthropic/claude-sonnet-4-6", "resp_1", 5);
+        let response =
+            completion_to_response(&chat, "cline/anthropic/claude-sonnet-4-6", "resp_1", 5);
         assert_eq!(response["status"], "completed");
         assert_eq!(response["output"][0]["content"][0]["text"], "Paris.");
         assert_eq!(response["usage"]["input_tokens"], 14);
@@ -1339,7 +1413,10 @@ mod tests {
         });
         let response = completion_to_response(&chat, "m", "resp_2", 5);
         assert_eq!(response["status"], "incomplete");
-        assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["call_id"], "call_9");
     }
@@ -1347,7 +1424,8 @@ mod tests {
     #[test]
     fn stream_translation_emits_created_deltas_and_completed() {
         let mut translator = ChatStreamTranslator::new("m", "resp_1", 5);
-        let mut out = translator.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n");
+        let mut out =
+            translator.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n");
         assert!(!out.is_empty());
         out.extend(translator.feed(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
@@ -1359,7 +1437,10 @@ mod tests {
         assert!(kinds.contains(&"response.output_text.delta"));
         assert_eq!(*kinds.last().unwrap(), "response.completed");
         let completed = frames.last().unwrap();
-        assert_eq!(completed["response"]["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["text"],
+            "Hello"
+        );
         assert_eq!(completed["response"]["usage"]["input_tokens"], 1);
     }
 
@@ -1378,7 +1459,10 @@ mod tests {
         let completed = frames.last().unwrap();
         assert_eq!(completed["type"], "response.completed");
         let output = completed["response"]["output"].as_array().unwrap();
-        let call = output.iter().find(|item| item["type"] == "function_call").unwrap();
+        let call = output
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
         assert_eq!(call["arguments"], "{\"a\":1}");
     }
 
@@ -1390,13 +1474,21 @@ mod tests {
         );
         let frames = stream_frames(&out);
         assert_eq!(frames.last().unwrap()["type"], "response.failed");
-        assert_eq!(frames.last().unwrap()["response"]["error"]["code"], "rate_limit");
+        assert_eq!(
+            frames.last().unwrap()["response"]["error"]["code"],
+            "rate_limit"
+        );
 
         let mut truncated = ChatStreamTranslator::new("m", "resp_2", 5);
-        let mut out = truncated.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        let mut out =
+            truncated.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
         out.extend(truncated.finish_on_eof());
         let frames = stream_frames(&out);
-        assert!(!frames.iter().any(|frame| frame["type"] == "response.completed"));
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["type"] == "response.completed")
+        );
     }
 
     #[test]

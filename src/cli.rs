@@ -16,7 +16,10 @@ pub struct ConnectArgs {
     pub model: String,
     #[arg(long, help = "do not set the default model in opencode config")]
     pub no_default_model: bool,
-    #[arg(long, help = "write to ./.opencode/opencode.json instead of the global config")]
+    #[arg(
+        long,
+        help = "write to ./.opencode/opencode.json instead of the global config"
+    )]
     pub project: bool,
     #[arg(long)]
     pub dry_run: bool,
@@ -135,9 +138,9 @@ pub fn reset(args: &ResetArgs) -> Result<(), String> {
         .map_err(|e| format!("admin state response: {e}"))?;
     let accounts = account_refs(&state);
     let account = match_account(&accounts, &args.account)?;
-    if account.backend != "codex" {
+    if !matches!(account.backend.as_str(), "codex" | "claude") {
         return Err(format!(
-            "{} is a {} account; only ChatGPT/Codex accounts have banked resets",
+            "{} is a {} account; only ChatGPT/Codex and Claude Code accounts have banked resets",
             account.label, account.backend
         ));
     }
@@ -319,7 +322,10 @@ pub fn merge_provider(doc: &mut Value, block: &Value, default_model: Option<&str
         .insert(PROVIDER_ID.to_string(), block.clone());
     match default_model {
         Some(model) => {
-            map.insert("model".into(), Value::String(format!("{PROVIDER_ID}/{model}")));
+            map.insert(
+                "model".into(),
+                Value::String(format!("{PROVIDER_ID}/{model}")),
+            );
         }
         None => {
             if let Some(model) = map.get("model").and_then(|v| v.as_str()) {
@@ -348,12 +354,10 @@ pub fn merge_auth(doc: &mut Value, key: &str) {
     if !doc.is_object() {
         *doc = serde_json::json!({});
     }
-    doc.as_object_mut()
-        .unwrap()
-        .insert(
-            PROVIDER_ID.to_string(),
-            serde_json::json!({ "type": "api", "key": key }),
-        );
+    doc.as_object_mut().unwrap().insert(
+        PROVIDER_ID.to_string(),
+        serde_json::json!({ "type": "api", "key": key }),
+    );
 }
 
 pub fn remove_auth(doc: &mut Value) {
@@ -390,7 +394,10 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
     let mut all_models = underclass_store.catalog(crate::models::BackendId::Codex);
     let mut seen: std::collections::HashSet<String> =
         all_models.iter().map(|m| m.id.clone()).collect();
-    for backend in [crate::models::BackendId::Copilot, crate::models::BackendId::Cline] {
+    for backend in [
+        crate::models::BackendId::Copilot,
+        crate::models::BackendId::Cline,
+    ] {
         for m in underclass_store.catalog(backend) {
             if seen.insert(m.id.clone()) {
                 all_models.push(m);
@@ -434,18 +441,30 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
 
     if args.dry_run {
         println!("--- {} ---", config_path.display());
-        println!("{}", serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?
+        );
         println!("--- {} ---", auth_path.display());
-        println!("{}", serde_json::to_string_pretty(&auth_doc).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&auth_doc).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
-    write_with_backup(&config_path, &serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?)?;
+    write_with_backup(
+        &config_path,
+        &serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?,
+    )?;
     if let Some(parent) = auth_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&auth_path, serde_json::to_string_pretty(&auth_doc).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &auth_path,
+        serde_json::to_string_pretty(&auth_doc).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -453,8 +472,21 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
     }
 
     verify(&base_url, &api_key);
-    println!("configured opencode provider '{PROVIDER_ID}' at {}", config_path.display());
-    println!("run: opencode --provider {PROVIDER_ID} --model {PROVIDER_ID}/{}", args.model);
+    println!(
+        "configured opencode provider '{PROVIDER_ID}' at {}",
+        config_path.display()
+    );
+    println!(
+        "run: opencode --provider {PROVIDER_ID} --model {PROVIDER_ID}/{}",
+        args.model
+    );
+    println!();
+    println!("point Claude Code at the same pool (it speaks the Anthropic surface):");
+    println!(
+        "  export ANTHROPIC_BASE_URL={}",
+        base_url.trim_end_matches("/v1")
+    );
+    println!("  export CLAUDE_CODE_OAUTH_TOKEN=<the underclass proxy key>");
     Ok(())
 }
 
@@ -490,10 +522,16 @@ fn remove(config_path: &PathBuf, auth_path: &PathBuf, dry_run: bool) -> Result<(
         let mut doc = parse_jsonc(&text)?;
         remove_provider(&mut doc);
         if !dry_run {
-            write_with_backup(config_path, &serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?)?;
+            write_with_backup(
+                config_path,
+                &serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
+            )?;
         } else {
             println!("--- {} (dry run) ---", config_path.display());
-            println!("{}", serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?
+            );
         }
     }
     if auth_path.exists() {
@@ -501,10 +539,16 @@ fn remove(config_path: &PathBuf, auth_path: &PathBuf, dry_run: bool) -> Result<(
         let mut doc = parse_jsonc(&text)?;
         remove_auth(&mut doc);
         if !dry_run {
-            write_with_backup(auth_path, &serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?)?;
+            write_with_backup(
+                auth_path,
+                &serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
+            )?;
         } else {
             println!("--- {} (dry run) ---", auth_path.display());
-            println!("{}", serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?
+            );
         }
     }
     println!("removed '{PROVIDER_ID}' from opencode config and auth");
@@ -546,7 +590,10 @@ mod tests {
         let block = json!({"npm": "@ai-sdk/openai-compatible"});
         merge_provider(&mut doc, &block, Some("gpt-5.5"));
         assert_eq!(doc["theme"], "dark");
-        assert_eq!(doc["provider"]["underclass"]["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(
+            doc["provider"]["underclass"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
         assert_eq!(doc["model"], "underclass/gpt-5.5");
     }
 
@@ -582,7 +629,8 @@ mod tests {
     #[test]
     fn remove_undoes_merge() {
         let block = json!({"npm": "@ai-sdk/openai-compatible"});
-        let mut doc = json!({"model": "openai/gpt-5.4", "provider": {"openai": {"npm": "@ai-sdk/openai"}}});
+        let mut doc =
+            json!({"model": "openai/gpt-5.4", "provider": {"openai": {"npm": "@ai-sdk/openai"}}});
         merge_provider(&mut doc, &block, Some("gpt-5.5"));
         remove_provider(&mut doc);
         assert_eq!(doc["provider"]["openai"]["npm"], "@ai-sdk/openai");

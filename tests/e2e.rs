@@ -3,10 +3,14 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
+use underclass::claude::ClaudeBackend;
+use underclass::cline::ClineBackend;
 use underclass::codex::CodexBackend;
 use underclass::copilot::CopilotBackend;
 use underclass::flows::FlowRegistry;
-use underclass::models::{now_ms, Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry};
+use underclass::models::{
+    Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
+};
 use underclass::pool::PoolCore;
 use underclass::provider::BackendMap;
 use underclass::proxy::AppState;
@@ -18,11 +22,13 @@ struct MockState {
     failing: BTreeSet<String>,
     /// Models whose upstream answers `402 Payment Required` (Cline's exhausted-credits signal).
     payment_required: BTreeSet<String>,
-    served_by: VecDeque<String>,
     /// Upstream model IDs in request order, so a test can assert what was attempted.
     models: VecDeque<String>,
+    served_by: VecDeque<String>,
     fourtwonined: VecDeque<String>,
-    chat_usage_options: VecDeque<bool>,
+    /// `stream_options.include_usage` seen per bearer, in request order. Keyed by bearer so a
+    /// parallel test's request cannot be mistaken for this test's own.
+    chat_usage_options: std::collections::HashMap<String, VecDeque<bool>>,
     reject_stream_usage: bool,
     /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
     /// credential rejection that a token refresh clears.
@@ -46,70 +52,259 @@ async fn mock_responses(
     if bearer.starts_with("bad-") {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
-            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
             r#"{"error":{"message":"bad token"}}"#.to_string(),
-        ).into_response();
+        )
+            .into_response();
     }
 
-    let remaining = state.lock().unwrap().forbidden.get(&bearer).copied().unwrap_or(0);
+    let remaining = state
+        .lock()
+        .unwrap()
+        .forbidden
+        .get(&bearer)
+        .copied()
+        .unwrap_or(0);
     if remaining > 0 {
-        state.lock().unwrap().forbidden.insert(bearer.clone(), remaining - 1);
+        state
+            .lock()
+            .unwrap()
+            .forbidden
+            .insert(bearer.clone(), remaining - 1);
         return (
             axum::http::StatusCode::FORBIDDEN,
-            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
             r#"{"error":{"message":"credential rejected"}}"#.to_string(),
-        ).into_response();
+        )
+            .into_response();
     }
 
-    let requested_model = serde_json::from_str::<serde_json::Value>(&body).ok()
-        .and_then(|value| value.get("model").and_then(|m| m.as_str()).map(str::to_string))
+    // A model-scoped refusal applies to one model only, the way Anthropic's weekly
+    // other-models window does.
+    let requested_model = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default();
-    state.lock().unwrap().models.push_back(requested_model.clone());
-    let payment_required = state.lock().unwrap().payment_required.contains(&requested_model);
+    state
+        .lock()
+        .unwrap()
+        .models
+        .push_back(requested_model.clone());
+    let payment_required = state
+        .lock()
+        .unwrap()
+        .payment_required
+        .contains(&requested_model);
     if payment_required {
         return (
             axum::http::StatusCode::PAYMENT_REQUIRED,
-            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
-            r#"{"error":{"code":"insufficient_credits","message":"credit balance exhausted"}}"#.to_string(),
-        ).into_response();
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            r#"{"error":{"code":"insufficient_credits","message":"credit balance exhausted"}}"#
+                .to_string(),
+        )
+            .into_response();
     }
 
-    let failing = state.lock().unwrap().failing.contains(&bearer);
+    let model_scoped_refusal = bearer.starts_with("claude-model-quota-")
+        && uri.path().ends_with("/messages")
+        && requested_model == "claude-opus-5-5";
+    let failing = state.lock().unwrap().failing.contains(&bearer)
+        || (bearer.starts_with("claude-quota-") && uri.path().ends_with("/messages"))
+        || model_scoped_refusal;
     if failing {
-        state.lock().unwrap().fourtwonined.push_back(bearer);
+        state.lock().unwrap().fourtwonined.push_back(bearer.clone());
+        if uri.path().ends_with("/messages") {
+            // Anthropic reports the exhausted subscription window on the response headers: a
+            // rejected shared window blocks the account, a rejected model window blocks the
+            // model only.
+            let reset = (now_ms() / 1000 + 3600).to_string();
+            let model_scoped = bearer.starts_with("claude-model-quota-");
+            fn name(value: &'static str) -> axum::http::header::HeaderName {
+                axum::http::header::HeaderName::from_static(value)
+            }
+            let mut headers = vec![
+                (
+                    name("anthropic-ratelimit-unified-status"),
+                    "rejected".to_string(),
+                ),
+                (name("anthropic-ratelimit-unified-reset"), reset),
+            ];
+            if model_scoped {
+                headers.push((
+                    name("anthropic-ratelimit-unified-5h-status"),
+                    "allowed".to_string(),
+                ));
+                headers.push((
+                    name("anthropic-ratelimit-unified-7d-status"),
+                    "allowed".to_string(),
+                ));
+                headers.push((
+                    name("anthropic-ratelimit-unified-7d_oi-status"),
+                    "rejected".to_string(),
+                ));
+            }
+            let mut builder = axum::response::Response::builder()
+                .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                .header(axum::http::header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            return builder
+                .body(axum::body::Body::from(
+                    r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}"#,
+                ))
+                .unwrap();
+        }
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
-            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
-            r#"{"error":{"code":"usage_limit_reached","message":"usage limit reached"}}"#.to_string(),
-        ).into_response();
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            r#"{"error":{"code":"usage_limit_reached","message":"usage limit reached"}}"#
+                .to_string(),
+        )
+            .into_response();
     }
 
     state.lock().unwrap().served_by.push_back(bearer.clone());
+    if uri.path().ends_with("/messages") {
+        // Echo what the Anthropic upstream received, so the test can assert the credential
+        // swap, the forwarded client headers, and the verbatim body.
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+            serde_json::json!({
+                "account": bearer,
+                "app": header("x-app"),
+                "beta": header("anthropic-beta"),
+                "session": header("x-claude-code-session-id"),
+                "body": serde_json::from_str::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null),
+                "raw": body,
+                "usage": {"input_tokens": 11, "output_tokens": 3}
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
     let chat = uri.path().ends_with("/chat/completions");
     if chat {
-        let enabled = serde_json::from_str::<serde_json::Value>(&body).ok()
-            .and_then(|value| value.pointer("/stream_options/include_usage").and_then(|v| v.as_bool())) == Some(true);
+        let enabled = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/stream_options/include_usage")
+                    .and_then(|v| v.as_bool())
+            })
+            == Some(true);
         let mut mock = state.lock().unwrap();
-        mock.chat_usage_options.push_back(enabled);
-        if enabled && mock.reject_stream_usage {
+        mock.chat_usage_options
+            .entry(bearer.clone())
+            .or_default()
+            .push_back(enabled);
+        // Bearer-keyed so a test can exercise the retry without flipping process-wide state that
+        // the other tests in this binary depend on.
+        let rejects_for_bearer = bearer == "key-reject-usage";
+        if enabled && (mock.reject_stream_usage || rejects_for_bearer) {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
-                [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".to_string(),
+                )],
                 r#"{"error":{"message":"stream_options.include_usage unsupported"}}"#.to_string(),
-            ).into_response();
+            )
+                .into_response();
         }
     }
-    if serde_json::from_str::<serde_json::Value>(&body).ok()
-        .and_then(|value| value.get("overload").and_then(|flag| flag.as_bool())) == Some(true) {
-        // A 200 stream that fails before any output, like upstream capacity errors in practice.
+    if chat && bearer.starts_with("key-chat-ovl-") {
+        // A chat upstream that fails before any output; the frames are chat-shaped, so a
+        // translated request only reaches the client correctly through the translator.
         return (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-            "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
+            "data: {\"error\":{\"message\":\"Selected model is at capacity\",\"type\":\"server_is_overloaded\"}}\n\n"
+                .to_string(),
+        )
+            .into_response();
+    }
+    if serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("overload").and_then(|flag| flag.as_bool()))
+        == Some(true)
+    {
+        // A 200 stream that fails before any output, like upstream capacity errors in practice.
+        // A chat upstream speaks chat frames, which is what the translator must be handed.
+        let payload = if chat {
+            "data: {\"error\":{\"message\":\"Selected model is at capacity\",\"type\":\"server_is_overloaded\"}}\n\n"
+        } else {
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n"
+        };
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            payload.to_string(),
+        )
+            .into_response();
+    }
+    if bearer.starts_with("tok-ovl-") && wants_stream {
+        // The shape Codex upstream sends today: a 200 stream, a pause, then a stream `error` event
+        // whose code is nested under `error`.
+        let stream = futures::stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                        b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Some((Ok(axum::body::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}\n\n")), 2))
+                }
+                _ => None,
+            }
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+    if bearer.starts_with("tok-late-ovl-") && wants_stream {
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\"}}\n\n",
         ).into_response();
     }
-    if serde_json::from_str::<serde_json::Value>(&body).ok()
-        .and_then(|value| value.get("slow_abort").and_then(|flag| flag.as_bool())) == Some(true) {
+    if serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("slow_abort").and_then(|flag| flag.as_bool()))
+        == Some(true)
+    {
         let stream = futures::stream::unfold(0, |step| async move {
             match step {
                 0 => Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")), 1)),
@@ -124,7 +319,8 @@ async fn mock_responses(
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
             Body::from_stream(stream),
-        ).into_response();
+        )
+            .into_response();
     }
     let usage_event = if chat {
         "data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n"
@@ -137,9 +333,13 @@ async fn mock_responses(
     if wants_stream {
         (
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/event-stream".to_string())],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/event-stream".to_string(),
+            )],
             payload,
-        ).into_response()
+        )
+            .into_response()
     } else {
         (
             axum::http::StatusCode::OK,
@@ -182,6 +382,7 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
         unsafe {
             std::env::set_var("UNDERCLASS_CODEX_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
+            std::env::set_var("UNDERCLASS_CLAUDE_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLINE_UPSTREAM", format!("http://{addr}"));
         }
         format!("http://{addr}")
@@ -202,9 +403,10 @@ fn account(id: &str, backend: BackendId, token: &str) -> Account {
         account_id: Some(format!("chatgpt-{id}")),
         residency: None,
         enterprise_url: None,
+        plan: None,
+        scope_cooling: Default::default(),
         status: AccountStatus::Healthy,
         reset_at: 0,
-        scope_cooling: Default::default(),
         created_at: ts,
         updated_at: ts,
     }
@@ -220,11 +422,35 @@ fn copilot_account(id: &str, token: &str) -> Account {
     a
 }
 
+/// The surfaces the end-to-end app serves.
+fn scoped_model(id: &str, scope: &str) -> ModelInfo {
+    ModelInfo {
+        scope: scope.into(),
+        ..model(id)
+    }
+}
+
 fn cline_account(id: &str, token: &str) -> Account {
     // Cline holds a static API key; `TokenManager` hands the refresh token to the backend.
     let mut a = account(id, BackendId::Cline, "unused-access");
     a.refresh_token = Some(token.to_string());
     a
+}
+
+fn openai_surfaces() -> std::collections::HashMap<BackendId, Vec<Surface>> {
+    std::collections::HashMap::from([
+        (BackendId::Codex, vec![Surface::OpenAI]),
+        (BackendId::Copilot, vec![Surface::OpenAI]),
+        (BackendId::Claude, vec![Surface::Anthropic]),
+        (BackendId::Cline, vec![Surface::OpenAI]),
+    ])
+}
+
+fn backend_surfaces(backends: &BackendMap) -> std::collections::HashMap<BackendId, Vec<Surface>> {
+    backends
+        .iter()
+        .map(|(id, backend)| (*id, backend.surfaces().to_vec()))
+        .collect()
 }
 
 fn model(id: &str) -> ModelInfo {
@@ -238,13 +464,6 @@ fn model(id: &str) -> ModelInfo {
     }
 }
 
-fn scoped_model(id: &str, scope: &str) -> ModelInfo {
-    ModelInfo {
-        scope: scope.into(),
-        ..model(id)
-    }
-}
-
 async fn spawn_app(
     store: Arc<Store>,
     cooldown_ms: i64,
@@ -254,16 +473,14 @@ async fn spawn_app(
     Arc<Mutex<PoolCore>>,
 ) {
     let client = reqwest::Client::new();
-    let core = PoolCore::new(&store);
-    let pool = Arc::new(Mutex::new(core));
     let tokens = Arc::new(TokenManager::new(store.clone(), client.clone()));
     let mut backends: BackendMap = std::collections::HashMap::new();
     backends.insert(BackendId::Codex, Arc::new(CodexBackend { cooldown_ms }));
     backends.insert(BackendId::Copilot, Arc::new(CopilotBackend { cooldown_ms }));
-    backends.insert(
-        BackendId::Cline,
-        Arc::new(underclass::cline::ClineBackend { cooldown_ms }),
-    );
+    backends.insert(BackendId::Claude, Arc::new(ClaudeBackend { cooldown_ms }));
+    backends.insert(BackendId::Cline, Arc::new(ClineBackend { cooldown_ms }));
+    let core = PoolCore::new(&store, backend_surfaces(&backends));
+    let pool = Arc::new(Mutex::new(core));
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
     let state = Arc::new(AppState {
         store,
@@ -276,9 +493,12 @@ async fn spawn_app(
         proxy_key: Some("test-key".to_string()),
         ui_token: "unused".to_string(),
         resets: Arc::new(underclass::resets::ResetManager::new(
-            reqwest::Client::new(), "http://127.0.0.1:1".to_string(), false,
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".to_string(),
+            false,
         )),
         stream_usage_unsupported: Mutex::new(Default::default()),
+        observations: Mutex::new(Default::default()),
         stats_retention_days: 730,
     });
 
@@ -289,6 +509,29 @@ async fn spawn_app(
             "/chat/completions",
             axum::routing::post(underclass::proxy::infer),
         )
+        .route(
+            "/messages",
+            axum::routing::post(underclass::proxy::messages),
+        )
+        .route(
+            "/messages/count_tokens",
+            axum::routing::post(underclass::proxy::messages),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            underclass::proxy::require_proxy_key,
+        ))
+        .with_state(state.clone());
+
+    let anthropic_alias = axum::Router::new()
+        .route(
+            "/messages",
+            axum::routing::post(underclass::proxy::messages),
+        )
+        .route(
+            "/messages/count_tokens",
+            axum::routing::post(underclass::proxy::messages),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             underclass::proxy::require_proxy_key,
@@ -296,23 +539,45 @@ async fn spawn_app(
         .with_state(state.clone());
 
     let admin = axum::Router::new()
-        .route("/admin/api/state", axum::routing::get(underclass::ui::state))
+        .route(
+            "/admin/api/state",
+            axum::routing::get(underclass::ui::state),
+        )
         .route(
             "/admin/api/catalog/{backend}",
             axum::routing::get(underclass::ui::get_catalog).put(underclass::ui::put_catalog),
         )
-        .route("/admin/api/monitor", axum::routing::get(underclass::monitor::snapshot))
-        .route("/admin/api/usage", axum::routing::get(underclass::ui::usage_summary))
-        .route("/admin/api/usage/requests", axum::routing::get(underclass::ui::usage_requests))
-        .route("/admin/api/stats", axum::routing::get(underclass::stats_api::stats_handler))
+        .route(
+            "/admin/api/monitor",
+            axum::routing::get(underclass::monitor::snapshot),
+        )
+        .route(
+            "/admin/api/usage",
+            axum::routing::get(underclass::ui::usage_summary),
+        )
+        .route(
+            "/admin/api/usage/requests",
+            axum::routing::get(underclass::ui::usage_requests),
+        )
+        .route(
+            "/admin/api/stats",
+            axum::routing::get(underclass::stats_api::stats_handler),
+        )
         .route(
             "/admin/api/accounts/{id}/enable",
             axum::routing::post(underclass::ui::enable_account),
         )
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), underclass::ui::require_ui_token));
-    let app = axum::Router::new().nest("/v1", v1)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            underclass::ui::require_ui_token,
+        ));
+    let app = axum::Router::new()
+        .nest("/v1", v1)
+        .merge(anthropic_alias)
         .merge(admin)
-        .layer(axum::middleware::from_fn(underclass::correlation::middleware))
+        .layer(axum::middleware::from_fn(
+            underclass::correlation::middleware,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -333,13 +598,26 @@ async fn e2e_mid_stream_overload_is_recorded() {
         .header("Authorization", "Bearer test-key")
         .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": true, "overload": true}))
         .send().await.unwrap();
-    assert_eq!(response.status(), 200, "mid-stream failures keep the upstream status");
-    assert!(response.text().await.unwrap().contains("response.failed"), "failure passes through to the client");
+    assert_eq!(
+        response.status(),
+        200,
+        "mid-stream failures keep the upstream status"
+    );
+    assert!(
+        response.text().await.unwrap().contains("response.failed"),
+        "failure passes through to the client"
+    );
 
     let mut row = None;
     for _ in 0..50 {
-        row = store.usage_records(&Default::default()).unwrap().into_iter().next();
-        if row.is_some() { break; }
+        row = store
+            .usage_records(&Default::default())
+            .unwrap()
+            .into_iter()
+            .next();
+        if row.is_some() {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let row = row.expect("usage row written when the stream ends");
@@ -347,20 +625,39 @@ async fn e2e_mid_stream_overload_is_recorded() {
     assert_eq!(row.error_code.as_deref(), Some("server_is_overloaded"));
     assert_eq!(row.saw_output, Some(false));
     assert!(row.duration_ms.is_some());
-    let entry = logs.lock().unwrap().iter().find(|e| e.request_id == row.request_id).cloned().unwrap();
+    let entry = logs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.request_id == row.request_id)
+        .cloned()
+        .unwrap();
     assert_eq!(entry.stream_outcome.as_deref(), Some("failed"));
     assert_eq!(entry.error_code.as_deref(), Some("server_is_overloaded"));
 
     // Windows are half-open at `now`; step past the millisecond the event was stamped with.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let stats: serde_json::Value = http.get(format!("{base}/admin/api/stats?since=1h&bucket=minute"))
+    let stats: serde_json::Value = http
+        .get(format!("{base}/admin/api/stats?since=1h&bucket=minute"))
         .header("Authorization", "Bearer unused")
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(stats["totals"]["events"]["overloaded"], 1, "{stats}");
     assert_eq!(stats["totals"]["outcomes"]["failed"], 1, "{stats}");
     assert_eq!(stats["totals"]["requests"], 1);
-    assert!(!stats.to_string().contains("capacity. Please"), "upstream message text must not be stored");
-    let denied = http.get(format!("{base}/admin/api/stats")).send().await.unwrap();
+    assert!(
+        !stats.to_string().contains("capacity. Please"),
+        "upstream message text must not be stored"
+    );
+    let denied = http
+        .get(format!("{base}/admin/api/stats"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(denied.status(), 401);
 }
 
@@ -387,7 +684,8 @@ async fn e2e_full_pool_story() {
                 body["prompt_cache_key"] = serde_json::Value::String(k.clone());
             }
             let request_id = uuid::Uuid::new_v4().to_string();
-            let response = http.post(format!("{base}/v1/responses"))
+            let response = http
+                .post(format!("{base}/v1/responses"))
                 .header("Authorization", "Bearer test-key")
                 .header("x-request-id", &request_id)
                 .json(&body)
@@ -407,17 +705,39 @@ async fn e2e_full_pool_story() {
         "text/event-stream"
     );
     let body1 = r1.text().await.unwrap();
-    assert!(body1.contains("[DONE]"), "stream passthrough broken: {body1}");
-    assert!(body1.contains("hello from tok-acc-1"), "unexpected payload: {body1}");
+    assert!(
+        body1.contains("[DONE]"),
+        "stream passthrough broken: {body1}"
+    );
+    assert!(
+        body1.contains("hello from tok-acc-1"),
+        "unexpected payload: {body1}"
+    );
 
     let r2 = post(Some("sess-a"), true).await;
     let body2 = r2.text().await.unwrap();
-    assert!(body2.contains("hello from tok-acc-1"), "sticky session moved accounts: {body2}");
-    let rows = store.usage_records(&underclass::store::UsageQuery { cache_key: Some("sess-a".into()), ..Default::default() }).unwrap();
-    let denied = http.get(format!("{base}/admin/api/monitor")).send().await.unwrap();
+    assert!(
+        body2.contains("hello from tok-acc-1"),
+        "sticky session moved accounts: {body2}"
+    );
+    let rows = store
+        .usage_records(&underclass::store::UsageQuery {
+            cache_key: Some("sess-a".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let denied = http
+        .get(format!("{base}/admin/api/monitor"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(denied.status(), 401);
-    let monitor = http.get(format!("{base}/admin/api/monitor"))
-        .bearer_auth("unused").send().await.unwrap();
+    let monitor = http
+        .get(format!("{base}/admin/api/monitor"))
+        .bearer_auth("unused")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(monitor.status(), 200);
     let monitor_text = monitor.text().await.unwrap();
     assert!(!monitor_text.contains("sess-a"));
@@ -428,7 +748,9 @@ async fn e2e_full_pool_story() {
     assert_eq!(monitor["month"]["attempts"], 2);
     assert_eq!(monitor["minute_bins"].as_array().unwrap().len(), 60);
     assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|r| r.input_tokens == Some(11) && r.output_tokens == Some(3) && r.account_id == "acc-1"));
+    assert!(rows.iter().all(|r| r.input_tokens == Some(11)
+        && r.output_tokens == Some(3)
+        && r.account_id == "acc-1"));
 
     // phase 2: an unsticky request is served by the pool
     let r3 = post(None, false).await;
@@ -445,21 +767,63 @@ async fn e2e_full_pool_story() {
         "failover should land on the healthy copilot account (bearer = its stored token): {body4}"
     );
     assert!(
-        mock.lock().unwrap().fourtwonined.contains(&"tok-acc-1".to_string()),
+        mock.lock()
+            .unwrap()
+            .fourtwonined
+            .contains(&"tok-acc-1".to_string()),
         "mock never saw the 429-causing request for acc-1"
     );
-    assert!(logs.lock().unwrap().iter().filter(|entry| entry.request_id == failover_id).count() >= 2,
-        "failed and successful attempts must share the correlation ID in request history");
-    let rows = store.usage_records(&underclass::store::UsageQuery { cache_key: Some("sess-a".into()), ..Default::default() }).unwrap();
-    assert_eq!(rows.iter().filter(|r| r.request_id == failover_id).count(), 2);
-    assert_eq!(rows.iter().find(|r| r.request_id == failover_id && r.account_id == "acc-1").unwrap().input_tokens, None);
-    assert_eq!(rows.iter().find(|r| r.request_id == failover_id && r.account_id == "acc-2").unwrap().input_tokens, Some(11));
+    assert!(
+        logs.lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.request_id == failover_id)
+            .count()
+            >= 2,
+        "failed and successful attempts must share the correlation ID in request history"
+    );
+    let rows = store
+        .usage_records(&underclass::store::UsageQuery {
+            cache_key: Some("sess-a".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        rows.iter().filter(|r| r.request_id == failover_id).count(),
+        2
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.request_id == failover_id && r.account_id == "acc-1")
+            .unwrap()
+            .input_tokens,
+        None
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.request_id == failover_id && r.account_id == "acc-2")
+            .unwrap()
+            .input_tokens,
+        Some(11)
+    );
 
-    let summary = http.get(format!("{base}/admin/api/usage?from_ms=0&group_by=account_id"))
-        .header("Authorization", "Bearer unused").send().await.unwrap();
+    let summary = http
+        .get(format!(
+            "{base}/admin/api/usage?from_ms=0&group_by=account_id"
+        ))
+        .header("Authorization", "Bearer unused")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(summary.status(), 200);
     let groups: serde_json::Value = summary.json().await.unwrap();
-    assert!(groups["groups"].as_array().unwrap().iter().any(|g| g["account_id"] == "acc-2" && g["input_tokens"].as_i64().unwrap() >= 11));
+    assert!(
+        groups["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["account_id"] == "acc-2" && g["input_tokens"].as_i64().unwrap() >= 11)
+    );
     let filtered = http.get(format!("{base}/admin/api/usage/requests?from_ms=0&to_ms={}&model=gpt-5.5&account_id=acc-2&cache_key=sess-a", now_ms() + 100_000))
         .header("Authorization", "Bearer unused").send().await.unwrap();
     assert_eq!(filtered.status(), 200);
@@ -467,9 +831,17 @@ async fn e2e_full_pool_story() {
     let filtered_rows = filtered_body["requests"].as_array().unwrap();
     assert_eq!(filtered_rows.len(), 1);
     assert_eq!(filtered_rows[0]["input_tokens"], 11);
-    let forbidden = http.get(format!("{base}/admin/api/usage")).send().await.unwrap();
+    let forbidden = http
+        .get(format!("{base}/admin/api/usage"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(forbidden.status(), 401);
-    let forbidden_details = http.get(format!("{base}/admin/api/usage/requests")).send().await.unwrap();
+    let forbidden_details = http
+        .get(format!("{base}/admin/api/usage/requests"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(forbidden_details.status(), 401);
 
     // phase 4: both accounts exhausted -> fail fast with earliest reset
@@ -483,25 +855,39 @@ async fn e2e_full_pool_story() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(retry_after.parse::<u64>().is_ok(), "Retry-After not numeric");
+    assert!(
+        retry_after.parse::<u64>().is_ok(),
+        "Retry-After not numeric"
+    );
 
     let accounts = store.list_accounts();
     let cooling: Vec<_> = accounts
         .iter()
         .filter(|a| a.status == AccountStatus::Cooling)
         .collect();
-    assert_eq!(cooling.len(), 2, "both accounts should be cooling after 429s");
+    assert_eq!(
+        cooling.len(),
+        2,
+        "both accounts should be cooling after 429s"
+    );
 
     // phase 5: cooldown expiry restores the pool automatically
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     mock.lock().unwrap().failing.clear();
     let r6 = post(Some("sess-d"), true).await;
-    assert_eq!(r6.status(), 200, "accounts must return to rotation after cooldown");
+    assert_eq!(
+        r6.status(),
+        200,
+        "accounts must return to rotation after cooldown"
+    );
     let body6 = r6.text().await.unwrap();
-    assert!(body6.contains("hello from tok-acc-"), "served by a pool account");
+    assert!(
+        body6.contains("hello from tok-acc-"),
+        "served by a pool account"
+    );
 
     // persisted cooling rows are normalized (what the sync loop / a restart does)
-    let mut fresh_core = PoolCore::new(&store);
+    let mut fresh_core = PoolCore::new(&store, openai_surfaces());
     fresh_core.sync_from_store(&store);
     let accounts = store.list_accounts();
     assert!(
@@ -512,7 +898,10 @@ async fn e2e_full_pool_story() {
     // phase 6: request log records the serving account
     {
         let log = logs.lock().unwrap();
-        let entry = log.iter().find(|e| e.sticky == "sess-a").expect("log entry for sess-a");
+        let entry = log
+            .iter()
+            .find(|e| e.sticky == "sess-a")
+            .expect("log entry for sess-a");
         assert_eq!(entry.account.as_deref(), Some("acc-1"));
         assert_eq!(entry.backend.as_deref(), Some("codex"));
         assert_eq!(entry.status, 200);
@@ -533,9 +922,17 @@ async fn e2e_full_pool_story() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "401 on codex must fail over to copilot account");
+    assert_eq!(
+        resp.status(),
+        200,
+        "401 on codex must fail over to copilot account"
+    );
     let acc1 = store2.get_account("acc-1").unwrap();
-    assert_eq!(acc1.status, AccountStatus::AuthError, "401 must mark auth_error");
+    assert_eq!(
+        acc1.status,
+        AccountStatus::AuthError,
+        "401 must mark auth_error"
+    );
     let acc2 = store2.get_account("acc-2").unwrap();
     assert_eq!(acc2.status, AccountStatus::Healthy);
     let streamed_chat = http.post(format!("{base2}/v1/chat/completions"))
@@ -544,10 +941,26 @@ async fn e2e_full_pool_story() {
         .send().await.unwrap();
     assert_eq!(streamed_chat.status(), 200);
     streamed_chat.text().await.unwrap();
-    assert_eq!(mock.lock().unwrap().chat_usage_options.back(), Some(&true));
-    let chat_rows = store2.usage_records(&underclass::store::UsageQuery { cache_key: Some("chat-session".into()), ..Default::default() }).unwrap();
+    assert_eq!(
+        mock.lock()
+            .unwrap()
+            .chat_usage_options
+            .get("tok-good")
+            .and_then(|options| options.back())
+            .copied(),
+        Some(true)
+    );
+    let chat_rows = store2
+        .usage_records(&underclass::store::UsageQuery {
+            cache_key: Some("chat-session".into()),
+            ..Default::default()
+        })
+        .unwrap();
     assert_eq!(chat_rows.len(), 1);
-    assert_eq!((chat_rows[0].input_tokens, chat_rows[0].output_tokens), (Some(11), Some(3)));
+    assert_eq!(
+        (chat_rows[0].input_tokens, chat_rows[0].output_tokens),
+        (Some(11), Some(3))
+    );
     mock.lock().unwrap().reject_stream_usage = true;
     let fallback_chat = http.post(format!("{base2}/v1/chat/completions"))
         .header("Authorization", "Bearer test-key")
@@ -561,13 +974,35 @@ async fn e2e_full_pool_story() {
         .send().await.unwrap();
     assert_eq!(after_fallback.status(), 200);
     after_fallback.text().await.unwrap();
-    let options = mock.lock().unwrap().chat_usage_options.clone();
+    let options = mock
+        .lock()
+        .unwrap()
+        .chat_usage_options
+        .get("tok-good")
+        .cloned()
+        .unwrap_or_default();
     assert!(options.len() >= 4);
-    assert_eq!(options.iter().rev().take(3).copied().collect::<Vec<_>>(), vec![false, false, true]);
-    let fallback_rows = store2.usage_records(&underclass::store::UsageQuery { cache_key: Some("chat-fallback".into()), ..Default::default() }).unwrap();
+    assert_eq!(
+        options.iter().rev().take(3).copied().collect::<Vec<_>>(),
+        vec![false, false, true]
+    );
+    let fallback_rows = store2
+        .usage_records(&underclass::store::UsageQuery {
+            cache_key: Some("chat-fallback".into()),
+            ..Default::default()
+        })
+        .unwrap();
     assert_eq!(fallback_rows.len(), 2);
-    assert!(fallback_rows.iter().any(|r| r.status == 400 && r.input_tokens.is_none()));
-    assert!(fallback_rows.iter().any(|r| r.status == 200 && r.input_tokens == Some(11)));
+    assert!(
+        fallback_rows
+            .iter()
+            .any(|r| r.status == 400 && r.input_tokens.is_none())
+    );
+    assert!(
+        fallback_rows
+            .iter()
+            .any(|r| r.status == 200 && r.input_tokens == Some(11))
+    );
     mock.lock().unwrap().reject_stream_usage = false;
 
     let aborted = http.post(format!("{base2}/v1/responses"))
@@ -578,13 +1013,25 @@ async fn e2e_full_pool_story() {
     drop(aborted);
     let abort_rows = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            let rows = store2.usage_records(&underclass::store::UsageQuery { cache_key: Some("aborted-session".into()), ..Default::default() }).unwrap();
-            if !rows.is_empty() { break rows; }
+            let rows = store2
+                .usage_records(&underclass::store::UsageQuery {
+                    cache_key: Some("aborted-session".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if !rows.is_empty() {
+                break rows;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.expect("aborted stream was never recorded");
+    })
+    .await
+    .expect("aborted stream was never recorded");
     assert_eq!(abort_rows.len(), 1);
-    assert_eq!((abort_rows[0].input_tokens, abort_rows[0].output_tokens), (None, None));
+    assert_eq!(
+        (abort_rows[0].input_tokens, abort_rows[0].output_tokens),
+        (None, None)
+    );
 
     // phase 8: models endpoint + auth enforcement
     let models = http
@@ -612,8 +1059,16 @@ async fn e2e_full_pool_story() {
     assert_eq!(unauth.status(), 401, "missing proxy key must be rejected");
 
     store.delete_account("acc-1");
-    let history = store.usage_records(&underclass::store::UsageQuery { account_id: Some("acc-1".into()), ..Default::default() }).unwrap();
-    assert!(!history.is_empty(), "account removal must retain token accounting history");
+    let history = store
+        .usage_records(&underclass::store::UsageQuery {
+            account_id: Some("acc-1".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !history.is_empty(),
+        "account removal must retain token accounting history"
+    );
 }
 
 /// A 403 that clears after a token refresh must not escalate the account to `auth_error`:
@@ -630,7 +1085,10 @@ async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
     store.set_catalog(BackendId::Copilot, &[m]);
     store.upsert_account(&copilot_account("cop-403", "cop-403-token"));
     store.upsert_account(&copilot_account("cop-spare", "cop-spare-token"));
-    mock.lock().unwrap().forbidden.insert("cop-403-token".into(), 1);
+    mock.lock()
+        .unwrap()
+        .forbidden
+        .insert("cop-403-token".into(), 1);
     let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
 
     let resp = reqwest::Client::new()
@@ -652,7 +1110,10 @@ async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
         AccountStatus::Healthy,
         "a 403 that survives one token refresh must not mark the account auth_error"
     );
-    assert_eq!(mock.lock().unwrap().forbidden.get("cop-403-token"), Some(&0));
+    assert_eq!(
+        mock.lock().unwrap().forbidden.get("cop-403-token"),
+        Some(&0)
+    );
 }
 
 /// `enable` is the operator's recovery lever. It must clear a stranded `auth_error` account, and it
@@ -704,7 +1165,10 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     // An operator-set disable still clears.
     set_status("acct-disabled", AccountStatus::Disabled, 0);
     assert_eq!(enable("acct-disabled").await.status(), 204);
-    assert_eq!(store.get_account("acct-disabled").unwrap().status, AccountStatus::Healthy);
+    assert_eq!(
+        store.get_account("acct-disabled").unwrap().status,
+        AccountStatus::Healthy
+    );
 
     // A quota cooldown is upstream state, not an operator block: enabling must not wipe it,
     // otherwise the account is re-selected while still out of quota.
@@ -713,7 +1177,10 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     assert_eq!(enable("acct-cooling").await.status(), 204);
     let cooling = store.get_account("acct-cooling").unwrap();
     assert_eq!(cooling.status, AccountStatus::Cooling);
-    assert_eq!(cooling.reset_at, deadline, "enable must preserve an upstream quota deadline");
+    assert_eq!(
+        cooling.reset_at, deadline,
+        "enable must preserve an upstream quota deadline"
+    );
 
     // Scoped deadlines follow the same split: an operator disable clears them so the account is
     // fully usable again, while an upstream account-wide cooldown keeps them.
@@ -731,7 +1198,9 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     );
 
     let mut account_wide = store.get_account("acct-cooling").unwrap();
-    account_wide.scope_cooling.insert("credits".into(), deadline);
+    account_wide
+        .scope_cooling
+        .insert("credits".into(), deadline);
     store.update_account_health(&account_wide);
     pool.lock().unwrap().sync_account(account_wide);
     assert_eq!(enable("acct-cooling").await.status(), 204);
@@ -742,6 +1211,395 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
         Some(&deadline),
         "an upstream cooldown must keep its scoped deadlines"
     );
+}
+
+/// The reported bug: a credits `402` is an account-level-looking signal on one billing surface.
+/// It must cool only that surface, so a ClinePass request through the same key is still attempted
+/// instead of failing fast with "all subscriptions are out of quota".
+
+async fn wait_for_rows(store: &Store, count: usize) -> Vec<underclass::store::UsageRecord> {
+    for _ in 0..100 {
+        let rows = store.usage_records(&Default::default()).unwrap();
+        if rows.len() >= count {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    store.usage_records(&Default::default()).unwrap()
+}
+
+async fn post_stream(base: &str, key: &str) -> (u16, String) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": true, "prompt_cache_key": key}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_overload_before_output_fails_over_to_another_account() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    // `fo-a` sorts first, so a new sticky key binds to the overloaded account.
+    store.upsert_account(&codex_account("fo-a", "tok-ovl-fo-a"));
+    store.upsert_account(&codex_account("fo-b", "tok-fo-b"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_stream(&base, "failover-session").await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("hello from tok-fo-b"),
+        "served by the healthy account: {body}"
+    );
+    assert!(
+        !body.contains("server_is_overloaded"),
+        "the discarded attempt never reaches the client"
+    );
+
+    let rows = wait_for_rows(&store, 2).await;
+    let failed = rows
+        .iter()
+        .find(|r| r.account_id == "fo-a")
+        .expect("overloaded attempt recorded");
+    assert_eq!(failed.stream_outcome.as_deref(), Some("failed"));
+    assert_eq!(failed.error_code.as_deref(), Some("server_is_overloaded"));
+    assert_eq!(failed.saw_output, Some(false));
+    let served = rows
+        .iter()
+        .find(|r| r.account_id == "fo-b")
+        .expect("retry recorded");
+    assert_eq!(
+        served.request_id, failed.request_id,
+        "one client request, two attempts"
+    );
+
+    // The session was rebound, so the next turn goes straight to the healthy account.
+    let (_, body) = post_stream(&base, "failover-session").await;
+    assert!(body.contains("hello from tok-fo-b"));
+    assert_eq!(
+        wait_for_rows(&store, 3).await.len(),
+        3,
+        "no second overloaded attempt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_overload_on_every_account_replays_upstream_error() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("all-a", "tok-ovl-all-a"));
+    store.upsert_account(&codex_account("all-b", "tok-ovl-all-b"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_stream(&base, "doomed-session").await;
+    assert_eq!(status, 200, "the upstream status is preserved");
+    assert!(
+        body.contains("server_is_overloaded"),
+        "the client sees the upstream error: {body}"
+    );
+    let rows = wait_for_rows(&store, 2).await;
+    let accounts: BTreeSet<_> = rows.iter().map(|r| r.account_id.as_str()).collect();
+    assert_eq!(
+        accounts,
+        BTreeSet::from(["all-a", "all-b"]),
+        "each account tried once"
+    );
+    for account in ["all-a", "all-b"] {
+        let healthy = store
+            .list_accounts()
+            .into_iter()
+            .find(|a| a.id == account)
+            .unwrap()
+            .status;
+        assert_eq!(
+            healthy,
+            AccountStatus::Healthy,
+            "an overload must not cool the account"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_overload_after_output_passes_through() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("late-a", "tok-late-ovl-late-a"));
+    store.upsert_account(&codex_account("late-b", "tok-late-b"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let (status, body) = post_stream(&base, "late-session").await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("partial") && body.contains("server_is_overloaded"),
+        "{body}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "output already reached the client, so no retry"
+    );
+    assert_eq!(rows[0].saw_output, Some(true));
+}
+
+/// The Anthropic surface serves only official Claude Code clients, forwards their headers and
+/// body verbatim, and spends the pooled account's credential instead of the client's own.
+#[tokio::test]
+async fn e2e_anthropic_surface_serves_claude_code_clients_only() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let mut claude = account("claude-1", BackendId::Claude, "claude-token-1");
+    claude.refresh_token = Some("claude-refresh-1".into());
+    store.upsert_account(&claude);
+    let (base, _logs, _pool) = spawn_app(store, 60_000).await;
+
+    // A client that is not Claude Code is rejected before a pooled credential is spent.
+    let foreign = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign.status(),
+        403,
+        "only Claude Code clients are admitted"
+    );
+    let spent = mock
+        .lock()
+        .unwrap()
+        .served_by
+        .iter()
+        .any(|token| token == "claude-token-1");
+    assert!(
+        !spent,
+        "a rejected client must not spend a pooled credential"
+    );
+
+    // Claude Code traffic travels upstream with the pooled credential and the client's own
+    // headers and body.
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/messages?beta=true"))
+        .header("Authorization", "Bearer test-key")
+        .header("x-app", "cli")
+        .header("user-agent", "claude-cli/2.1.304 (external, sdk-cli)")
+        .header(
+            "anthropic-beta",
+            "oauth-2025-04-20,claude-code-20250219",
+        )
+        .header("x-claude-code-session-id", "sess-claude")
+        .json(&serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 16,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["account"], "claude-token-1",
+        "the pooled credential replaces the client's own"
+    );
+    assert_eq!(body["app"], "cli", "client headers travel upstream");
+    assert_eq!(body["session"], "sess-claude");
+    assert!(
+        body["beta"].as_str().unwrap().contains("oauth-2025-04-20"),
+        "the oauth beta is present: {}",
+        body["beta"]
+    );
+    assert_eq!(
+        body["body"]["system"][0]["text"],
+        "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;",
+        "the request body travels upstream unchanged"
+    );
+}
+
+/// A Claude Code subscription window that is exhausted cools the account until the window
+/// resets, and the next Claude account serves the request.
+#[tokio::test]
+async fn e2e_anthropic_window_quota_cools_the_account() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    for id in ["claude-1", "claude-2"] {
+        let token = if id == "claude-1" {
+            "claude-quota-1".to_string()
+        } else {
+            format!("{id}-token")
+        };
+        let mut claude = account(id, BackendId::Claude, &token);
+        claude.refresh_token = Some(format!("{id}-refresh"));
+        store.upsert_account(&claude);
+    }
+    let (base, _logs, _pool) = spawn_app(store.clone(), 60_000).await;
+
+    let request = || async {
+        reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("Authorization", "Bearer test-key")
+            .header("x-app", "cli")
+            .header("user-agent", "claude-cli/2.1.304 (external, sdk-cli)")
+            .header(
+                "anthropic-beta",
+                "oauth-2025-04-20,claude-code-20250219",
+            )
+            .json(&serde_json::json!({
+                "model": "claude-haiku-5-5",
+                "max_tokens": 16,
+                "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;"}],
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    };
+
+    let first = request().await;
+    assert_eq!(
+        first.status(),
+        200,
+        "the second Claude account serves the request"
+    );
+    let served_healthy = mock
+        .lock()
+        .unwrap()
+        .served_by
+        .iter()
+        .any(|token| token == "claude-2-token");
+    assert!(served_healthy, "the healthy account served the request");
+
+    // The exhausted account is cooling until the window reset the upstream reported.
+    let accounts = store.list_accounts();
+    let cooling = accounts
+        .iter()
+        .find(|a| a.id == "claude-1")
+        .expect("the exhausted account");
+    assert_eq!(cooling.status, AccountStatus::Cooling);
+    assert!(
+        cooling.reset_at > now_ms(),
+        "the cooldown follows the window reset"
+    );
+}
+
+/// A model-scoped rejection cools that model on the account; the account keeps serving its
+/// other models.
+#[tokio::test]
+async fn e2e_anthropic_model_scoped_limit_leaves_other_models_alone() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let mut claude = account("claude-1", BackendId::Claude, "claude-model-quota-1");
+    claude.refresh_token = Some("claude-refresh-1".into());
+    store.upsert_account(&claude);
+    let (base, _logs, _pool) = spawn_app(store.clone(), 60_000).await;
+
+    let request = |model: &'static str| {
+        let base = base.clone();
+        async move {
+            reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("Authorization", "Bearer test-key")
+            .header("x-app", "cli")
+            .header("user-agent", "claude-cli/2.1.304 (external, sdk-cli)")
+            .header(
+                "anthropic-beta",
+                "oauth-2025-04-20,claude-code-20250219",
+            )
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": 16,
+                "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;"}],
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+        }
+    };
+
+    let refused = request("claude-opus-5-5").await;
+    assert_eq!(
+        refused.status(),
+        429,
+        "the refused model is reported to the client"
+    );
+
+    // The account is not cooling as a whole: another model still reaches it.
+    let accounts = store.list_accounts();
+    let account = accounts.first().expect("the account");
+    assert_ne!(
+        account.status,
+        AccountStatus::Cooling,
+        "a model-scoped limit must not cool the account"
+    );
+
+    let other = request("claude-sonnet-5-5").await;
+    assert_eq!(
+        other.status(),
+        200,
+        "the account still serves its other models"
+    );
+    let served = mock
+        .lock()
+        .unwrap()
+        .served_by
+        .iter()
+        .any(|t| t == "claude-model-quota-1");
+    assert!(served, "the account served the other model");
+}
+
+/// The root-level `/messages` alias serves the same Anthropic surface as `/v1/messages`.
+#[tokio::test]
+async fn e2e_anthropic_messages_alias_serves_the_same_surface() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let mut claude = account("claude-1", BackendId::Claude, "claude-alias-token");
+    claude.refresh_token = Some("claude-refresh-1".into());
+    store.upsert_account(&claude);
+    let (base, _logs, _pool) = spawn_app(store, 60_000).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/messages"))
+        .header("Authorization", "Bearer test-key")
+        .header("x-app", "cli")
+        .header("user-agent", "claude-cli/2.1.304 (external, sdk-cli)")
+        .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
+        .json(&serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 16,
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["account"], "claude-alias-token");
+    let served = mock
+        .lock()
+        .unwrap()
+        .served_by
+        .iter()
+        .any(|token| token == "claude-alias-token");
+    assert!(served, "the alias reached the upstream");
 }
 
 /// The reported bug: a credits `402` is an account-level-looking signal on one billing surface.
@@ -759,7 +1617,10 @@ async fn e2e_credits_402_keeps_the_clinepass_surface_routable() {
     store.upsert_account(&cline_account("cline-1", "key-cline-1"));
     // The mock sees the upstream id: `prepare_body` strips the pool-facing `cline/` prefix.
     let unavailable = underclass::cline::upstream_model_id(&credits.id).to_string();
-    mock.lock().unwrap().payment_required.insert(unavailable.clone());
+    mock.lock()
+        .unwrap()
+        .payment_required
+        .insert(unavailable.clone());
     let (base, _logs, _pool) = spawn_app(store.clone(), 3_600_000).await;
     let http = reqwest::Client::new();
 
@@ -779,8 +1640,17 @@ async fn e2e_credits_402_keeps_the_clinepass_surface_routable() {
 
     // 1. Credits is out of balance: the only account cools for that surface, so this fails fast.
     let first = post(&credits.id).await;
-    assert_eq!(first.status(), 429, "an exhausted surface has no other account to fail over to");
-    assert!(first.headers().get(axum::http::header::RETRY_AFTER).is_some());
+    assert_eq!(
+        first.status(),
+        429,
+        "an exhausted surface has no other account to fail over to"
+    );
+    assert!(
+        first
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_some()
+    );
 
     let account = store.get_account("cline-1").unwrap();
     assert_eq!(
@@ -798,7 +1668,10 @@ async fn e2e_credits_402_keeps_the_clinepass_surface_routable() {
     let second = post(&pass.id).await;
     let status = second.status();
     let body = second.text().await.unwrap();
-    assert_eq!(status, 200, "ClinePass must still be tried, got {status}: {body}");
+    assert_eq!(
+        status, 200,
+        "ClinePass must still be tried, got {status}: {body}"
+    );
     assert!(
         body.contains("key-cline-1"),
         "the request must reach upstream on the same account, got: {body}"
@@ -830,7 +1703,10 @@ async fn e2e_credits_402_keeps_the_clinepass_surface_routable() {
     assert_eq!(stats["totals"]["events"]["quota_cooling"], 1, "{stats}");
     assert_eq!(stats["totals"]["outcomes"]["completed"], 1, "{stats}");
     assert!(
-        stats["totals"]["events"]["pool_saturated"].as_i64().unwrap_or(0) >= 1,
+        stats["totals"]["events"]["pool_saturated"]
+            .as_i64()
+            .unwrap_or(0)
+            >= 1,
         "the refused credits request must record saturation: {stats}"
     );
     let monitor: serde_json::Value = http
@@ -913,7 +1789,6 @@ async fn e2e_catalog_put_backfills_cline_scopes() {
         vec!["credits", "cline-pass"],
         "a PUT must not leave Cline rows account-wide: {saved}"
     );
-
 }
 
 /// A rejected key is not a quota signal: it must never be recorded as a cooling surface, or the
@@ -924,7 +1799,7 @@ async fn e2e_catalog_put_backfills_cline_scopes() {
 async fn e2e_cline_auth_failure_never_creates_a_cooling_scope() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let credits = scoped_model("cline/anthropic/claude-sonnet-4-6", "credits");
+    let credits = scoped_model("cline/anthropic/claude-sonnet-4-6-auth-e2e", "credits");
     let pass = scoped_model("cline/cline-pass/kimi-k3", "cline-pass");
     store.set_catalog(BackendId::Cline, &[credits.clone(), pass.clone()]);
     // The mock rejects any bearer starting with `bad-`.
@@ -939,7 +1814,11 @@ async fn e2e_cline_auth_failure_never_creates_a_cooling_scope() {
         .send()
         .await
         .unwrap();
-    assert_ne!(response.status(), 200, "a rejected key must not serve the request");
+    assert_ne!(
+        response.status(),
+        200,
+        "a rejected key must not serve the request"
+    );
 
     let account = store.get_account("cline-bad").unwrap();
     assert!(
@@ -951,5 +1830,114 @@ async fn e2e_cline_auth_failure_never_creates_a_cooling_scope() {
         account.status,
         AccountStatus::Cooling,
         "a 401 must not cool the account as if it were out of quota"
+    );
+}
+
+/// The stream-usage retry must resend the *prepared* body. Cline's `prepare_body` strips the
+/// pool-facing `cline/` prefix, so a retry built from the client body would reach upstream still
+/// namespaced and be refused - the original attempt would then look like the only one that worked.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_stream_usage_retry_resends_the_prepared_body() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let credits = scoped_model("cline/anthropic/claude-sonnet-4-6-retry-e2e", "credits");
+    store.set_catalog(BackendId::Cline, &[credits.clone()]);
+    store.upsert_account(&cline_account("cline-retry", "key-reject-usage"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({
+            "model": credits.id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the retry must succeed");
+    response.text().await.unwrap();
+
+    let (attempted, options) = {
+        let mock = mock.lock().unwrap();
+        (
+            mock.models.clone(),
+            mock.chat_usage_options
+                .get("key-reject-usage")
+                .cloned()
+                .unwrap_or_default(),
+        )
+    };
+    // Prove the retry happened at all: the first attempt asked for usage and was rejected, the
+    // second went without it. Without this the test would pass on a single successful attempt and
+    // would not catch a retry built from the unprepared body.
+    assert_eq!(
+        options.iter().copied().collect::<Vec<_>>(),
+        vec![true, false],
+        "expected a rejected attempt then a retry without stream usage"
+    );
+    assert!(
+        attempted.iter().all(|model| !model.starts_with("cline/")),
+        "no attempt may reach Cline's upstream with the pool namespace: {attempted:?}"
+    );
+}
+
+/// A translated stream (Responses client, Cline chat upstream) that fails before its first output
+/// must still close with Responses-protocol event frames. The replay handed back when every
+/// account overloads is built from held upstream chunks, which are chat-completions SSE until the
+/// translator sees them.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_translated_overload_replay_is_a_responses_stream() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let credits = scoped_model("cline/anthropic/claude-sonnet-4-6-ovl-e2e", "credits");
+    store.set_catalog(BackendId::Cline, &[credits.clone()]);
+    store.upsert_account(&cline_account("cline-ovl", "key-chat-ovl-1"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({
+            "model": credits.id,
+            "input": "hi",
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = response.text().await.unwrap();
+    // Every SSE frame the client sees must be a Responses event. A raw chat-completions frame
+    // (`data: {"choices":...}` or `[DONE]`) reaching this client is the bug.
+    for frame in body.split("\n\n") {
+        let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            panic!("chat-completions terminator leaked to a Responses client: {body}");
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        assert!(
+            value.get("choices").is_none(),
+            "chat-completions frame leaked to a Responses client: {data}"
+        );
+    }
+    assert!(
+        body.contains("response."),
+        "a Responses client must receive Responses events, got: {body}"
+    );
+    // Without these the test passes on a truncated stream: the translator synthesises a
+    // `response.failed` for any EOF, so only the upstream code proves the overload was actually
+    // recognised and its attempt replayed rather than merely cut short.
+    assert!(
+        body.contains("server_is_overloaded"),
+        "the upstream capacity code must survive translation: {body}"
+    );
+    assert!(
+        body.contains("response.failed"),
+        "an overloaded reply is a failed response: {body}"
     );
 }

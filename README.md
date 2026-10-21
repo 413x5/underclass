@@ -1,21 +1,22 @@
 # underclass
 
-**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, and Cline subscriptions behind one OpenAI-compatible endpoint.**
+**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, and Cline subscriptions behind one endpoint.**
 
 ```
                        ┌────────────────────────────────────┐
                        │            underclass              │
                        │                                    │
- opencode ────────────►│  /v1/responses                     │
- (any OpenAI-compatible│  /v1/chat/completions              │────► chatgpt.com
-  client)              │  /v1/models                        │      (N Codex subs,
-                       │                                    │       OAuth device flow)
- web UI ◄─────────────►│  sticky sessions · health pool     │
- (accounts, catalog,   │  fail-fast saturation · tracing    │────► api.githubcopilot.com
-  live request feed)   │                                    │      (M Copilot subs,
-                       │                                    │       GitHub device flow)
+ opencode ────────────►│  /v1/responses       (OpenAI)      │────► chatgpt.com
+ (any OpenAI-compatible│  /v1/chat/completions              │      (N Codex subs,
+  client)              │  /v1/models                        │       OAuth device flow)
+                       │                                    │────► api.githubcopilot.com
+ Claude Code ─────────►│  /v1/messages        (Anthropic)   │      (M Copilot subs,
+ (ANTHROPIC_BASE_URL)  │                                    │       GitHub device flow)
+ web UI ◄─────────────►│  sticky sessions · health pool     │────► api.anthropic.com
+ (accounts, catalog,   │  fail-fast saturation · tracing    │      (K Claude Code subs,
+  live request feed)   │  per-surface quota cooling         │       OAuth paste-back)
                        │                                    │────► api.cline.bot
-                       └────────────────────────────────────┘      (K API keys,
+                       └────────────────────────────────────┘      (J API keys,
                                                                      Cline + ClinePass)
 ```
 
@@ -49,7 +50,7 @@ never writes them to diagnostics. Open the web UI and paste the value supplied a
 `UNDERCLASS_UI_TOKEN`.
 
 1. Open the web UI and paste the configured admin token.
-2. Click **Add account** → pick *ChatGPT / Codex* or *GitHub Copilot* → enter the device code at the shown URL, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys. Accounts are labeled automatically with the account's email or username.
+2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, or *Claude Code (Anthropic)* → follow the flow, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys. Accounts are labeled automatically with the account's email or username.
 3. Repeat for every subscription you want in the pool.
 4. Point opencode at the pool:
 
@@ -60,17 +61,28 @@ opencode --provider underclass --model underclass/gpt-5.5
 
 `underclass connect` writes the provider block and credentials into your global opencode config (`~/.config/opencode/opencode.json{,c}` + `auth.json`), idempotently and with backups. Re-run it any time; `--remove` undoes it.
 
+5. Point Claude Code at the same pool (it speaks the Anthropic surface):
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export CLAUDE_CODE_OAUTH_TOKEN=<the underclass proxy key>
+```
+
+`CLAUDE_CODE_OAUTH_TOKEN` is what the official client uses when an auth-injecting proxy sits in front of it: the client keeps its Claude Code request shape and sends the proxy key as its bearer token, and underclass replaces that with the pooled subscription credential.
+
 ## How routing works
 
 - **Sticky sessions.** Requests carrying `prompt_cache_key` / `promptCacheKey` (opencode sends the session ID when configured with `setCacheKey: true`) always land on the same subscription. Bindings live for 24h, survive restarts, and rebind preferentially within the same backend when an account cools.
-- **Health pool.** A quota response moves an account to *cooling* until the upstream deadline or a per-backend default. When the catalog scopes a model to a billing surface (Cline's `credits` and `cline-pass`), the cooldown applies only to that surface, so an exhausted credit balance does not take the ClinePass subscription out of rotation. Codex uses the later valid deadline from its usage-limit error and `retry-after`, and its account usage poll can extend cooldown to a later exhausted-window reset or readmit an account when upstream reports it allowed. 401s trigger one token refresh + retry, then the account needs re-login. Cooling accounts stay configured and return to rotation automatically.
-- **Codex usage and banked resets.** The admin page shows per-account usage windows and available reset credits. When a live request finds every enabled ChatGPT/Codex account unavailable, underclass can redeem one banked reset, choosing the account that would otherwise wait longest for natural quota recovery. This is enabled by default; set `auto_codex_resets = false` in `~/.config/underclass/config.toml` or `UNDERCLASS_AUTO_CODEX_RESETS=false` to disable automatic redemption. To spend a credit by hand, click **Use reset** on the account row in the admin page or run `underclass reset <email-or-id>` against the running server (it uses the same admin token resolution as `underclass top`; pass `--url` plus `UNDERCLASS_UI_TOKEN` for a remote server). The manual path redeems exactly one credit for that account, refuses when upstream reports the account is not rate limited or a reset already redeemed for this outage has not restored usage, and `--force` overrides both refusals.
+- **Health pool.** A quota response moves an account to *cooling* until the upstream deadline or a per-backend default. When the catalog scopes a model to a billing surface (Cline's `credits` and `cline-pass`), the cooldown applies only to that surface, so an exhausted credit balance does not take the ClinePass subscription out of rotation. Claude Code adds a per-model dimension: a limit that names one model family cools only that model on that account. Codex uses the later valid deadline from its usage-limit error and `retry-after`, and its account usage poll can extend cooldown to a later exhausted-window reset or readmit an account when upstream reports it allowed. 401s trigger one token refresh + retry, then the account needs re-login. Cooling accounts stay configured and return to rotation automatically.
+- **Codex usage and banked resets.** The admin page shows per-account usage windows and available reset credits. When a live request finds every enabled ChatGPT/Codex account unavailable, underclass can redeem one banked reset, choosing the account that would otherwise wait longest for natural quota recovery. This is enabled by default; set `auto_codex_resets = false` in `~/.config/underclass/config.toml` or `UNDERCLASS_AUTO_CODEX_RESETS=false` to disable automatic redemption. To spend a credit by hand, click **Use reset** on the account row in the admin page or run `underclass reset <email-or-id>` against the running server (it uses the same admin token resolution as `underclass top`; pass `--url` plus `UNDERCLASS_UI_TOKEN` for a remote server). The manual path redeems exactly one credit for that account, refuses when upstream reports the account is not rate limited or a reset already redeemed for this outage has not restored usage, and `--force` overrides both refusals. Claude Code accounts have banked credits too; redeeming one is always manual, because it spends your own subscription.
 - **Token accounting.** Each upstream attempt is recorded in SQLite with its model, account, prompt cache key, and reported input/output tokens. Missing counts remain marked unknown. The admin page shows current-month totals and filters; historical rows remain queryable after account removal.
 - **Stream outcomes and statistics.** A 2xx stream can still fail upstream (e.g. `response.failed` with `server_is_overloaded`, which Codex shows as "Selected model is at capacity"). underclass records how every body ended (`completed`, `failed`, `incomplete`, `truncated`, `upstream_error`, `client_closed`), the sanitized error code, and the attempt duration. It logs `stream.finished` at warn for failures, and records capacity, policy (`cyber_policy`), quota, and saturation events. `underclass stats` and the admin page's Statistics panel report requests, sessions, tokens, peak and mean concurrency, outcomes, and events over up to two years. See [ADR 0021](docs/adr/0021-stream-outcome-and-capacity-statistics.md).
 - **Fail fast.** If every account eligible for the requested model is cooling, the proxy answers `429` + `Retry-After` = earliest reset. No queuing. Eligibility follows the model's quota scope, so saturation is reported only when the surface that model bills against is exhausted.
-- **Flat pool.** Codex, Copilot, and Cline accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to Codex so new models work without proxy changes.
+- **Flat pool.** Codex, Copilot, Claude Code, and Cline accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to the surface's default backend so new models work without proxy changes.
+- **Two surfaces, one pool.** `/v1/responses` and `/v1/chat/completions` speak OpenAI; `/v1/messages` speaks the Anthropic Messages API. A request is only ever routed to a backend that serves its surface, so an Anthropic request never lands on a Codex account and the other way round. See [ADR 0024](docs/adr/0024-surface-partitioned-routing.md).
+- **Claude Code subscriptions.** The Anthropic surface serves the official Claude Code client only: the request must carry `x-app: cli`, a `claude-cli/` user agent, the `claude-code-20250219` beta, and a Claude Code identity block, and underclass forwards the client's headers and body verbatim, swapping only the credential. Anthropic's subscription quota is window-based (5-hour session, 7-day weekly, and a weekly window scoped to one model family), and underclass reads all of them from the account's own usage API, so an exhausted account leaves rotation exactly when its window resets — and a limit that only affects one model family leaves that account serving its other models. The admin page shows the plan, the three windows, and the banked reset credits; **Use reset** redeems exactly one of those credits when you ask for it (never automatically, because a credit is your own subscription). See [ADR 0023](docs/adr/0023-claude-code-subscription-backend.md).
 - **Cline and ClinePass.** Cline models are namespaced `cline/…`: credit-based models keep their upstream ID after the prefix (`cline/anthropic/claude-sonnet-4-6`, `cline/openai/gpt-5.4`), and ClinePass subscription models appear as `cline/cline-pass/…` (`cline/cline-pass/kimi-k3`, `cline/cline-pass/deepseek-v4.1-flash`). Cline only speaks Chat Completions, so `/v1/responses` requests routed to it are translated to `/api/v1/chat/completions` and the reply is translated back to the Responses format. `402 Payment Required` cools only the billing surface the model draws from (`credits` or `cline-pass`), so the other surface on the same key stays routable; `403` (model outside the plan) leaves the account in rotation. See [the Cline backend ADR](docs/adr/fork/cline-backend-responses-translation.md) and [per-surface quota cooling](docs/adr/fork/per-surface-quota-cooling.md).
-- **Pre-first-byte failover only.** Once a stream starts, upstream errors pass through — no silent re-send of half-finished turns.
+- **Failover only before output.** A stream that fails with an upstream capacity error before any output is retried on another account. Once output starts — or, on the Anthropic surface, once the upstream has accepted the request — upstream errors pass through, so half-finished turns are never re-sent silently.
 
 Design decisions and their trade-offs live in [`docs/adr/`](docs/adr) — start with [ADR 0010](docs/adr/0010-unprefixed-routing-flat-pool.md) for the routing model.
 
@@ -85,6 +97,7 @@ Optional `~/.config/underclass/config.toml`:
 | `ui_token` | minted on first run | admin token for the web UI + `/admin/api/*` |
 | `codex_cooldown_secs` | `1800` | cooling window when upstream omits `retry-after` |
 | `copilot_cooldown_secs` | `1800` | same, for Copilot |
+| `claude_cooldown_secs` | `1800` | same, for Claude Code accounts |
 | `cline_cooldown_secs` | `1800` | same, for Cline (applied on `402`, scoped to the model's billing surface) |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
@@ -107,7 +120,7 @@ underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
 
 `connect` targets the global opencode config by default; `--project` writes `./.opencode/opencode.json` instead. `--dry-run` prints the merged documents without writing.
 
-Run `underclass top` (or `utop` from the Nix package) in a second terminal while `underclass serve` is running for a continuously updating, read-only pool monitor. It shows live in-flight requests, a 60-minute attempt chart, current UTC month token accounting, account status and sticky sessions, Codex quota windows and banked resets, and recent outcomes. Each account has a PLAN column showing the ChatGPT plan reported by its stored access token (for example, plus or pro); missing plan metadata shows unknown and Copilot shows —. Plan metadata updates with token rotation. Account states and quota levels are color coded and also labeled in text. Press `q` to quit; use arrow keys, `j`/`k`, or Page Up/Down to scroll accounts. The dashboard reconnects if the server becomes unavailable. Locally it uses a Unix socket without a token; the NixOS service exposes `/run/underclass/monitor.sock` to local users. The socket serves only the monitor snapshot, which includes account labels and usage. If no socket is available, `top` can use the local admin token from `UNDERCLASS_UI_TOKEN`, config, or the existing database. For another server, pass `--url` and set `UNDERCLASS_UI_TOKEN` in the environment. The browser UI still requires its admin token. Copilot quota availability is shown as unknown because underclass has no Copilot quota snapshot. Counts are upstream attempts; token totals omit unknown usage.
+Run `underclass top` (or `utop` from the Nix package) in a second terminal while `underclass serve` is running for a continuously updating, read-only pool monitor. It shows live in-flight requests, a 60-minute attempt chart, current UTC month token accounting, account status and sticky sessions, quota windows and banked resets, and recent outcomes. Each account has a PLAN column showing the plan the upstream reports (the ChatGPT plan for Codex accounts, `pro`/`max`/`team`/`enterprise` for Claude Code accounts); missing plan metadata shows unknown and Copilot shows —. Plan metadata updates with token rotation. Account states and quota levels are color coded and also labeled in text. Press `q` to quit; use arrow keys, `j`/`k`, or Page Up/Down to scroll accounts. The dashboard reconnects if the server becomes unavailable. Locally it uses a Unix socket without a token; the NixOS service exposes `/run/underclass/monitor.sock` to local users. The socket serves only the monitor snapshot, which includes account labels and usage. If no socket is available, `top` can use the local admin token from `UNDERCLASS_UI_TOKEN`, config, or the existing database. For another server, pass `--url` and set `UNDERCLASS_UI_TOKEN` in the environment. The browser UI still requires its admin token. Copilot quota availability is shown as unknown because underclass has no Copilot quota snapshot. Counts are upstream attempts; token totals omit unknown usage.
 
 ![utop showing a five-account Codex pool: live inference counts, a 60-minute attempts chart, per-account state, quota left and resets, and recent request outcomes](docs/images/utop.png)
 
@@ -117,6 +130,9 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 |---|---|---|
 | `POST /v1/responses` | proxy key | Responses API, streamed through to the pool (translated for Cline) |
 | `POST /v1/chat/completions` | proxy key | Chat Completions, same |
+| `POST /v1/messages` | proxy key | Anthropic Messages API (Claude Code clients) |
+| `POST /v1/messages/count_tokens` | proxy key | Anthropic token counting, same |
+| `POST /messages` | proxy key | Messages API alias, for clients whose base URL already ends in `/v1` |
 | `GET /v1/models` | proxy key | union catalog with merged limits |
 | `GET /` | none | web UI |
 | `GET /admin/api/state` | admin token | accounts, catalog, last 200 requests |
@@ -127,6 +143,7 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `POST /admin/api/events/import` | admin token | idempotent upstream-event backfill (used by `stats import-codex`) |
 | `POST /admin/api/flows` | admin token | start onboarding (device flow, or Cline API key via `api_key`) |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
+| `POST /admin/api/flows/{id}/code` | admin token | finish a Claude Code paste-back flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |
 | `DELETE /admin/api/accounts/{id}` | admin token | remove from pool |
 | `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog (`codex`, `copilot`, `cline`) |
@@ -241,7 +258,8 @@ Notes:
 - Account labels (email/username) appear in logs and the UI by design; raw UUID account IDs are truncated.
 - `auth.json` written by `connect` uses `0600`. Never commit `pool.db` or `*.bak`.
 - The proxy binds to localhost by default; put it behind a tunnel only if you understand the exposure.
-- OAuth tokens rotate: every Codex refresh persists the new refresh token immediately.
+- OAuth tokens rotate: every Codex refresh persists the new refresh token immediately, and so does every Claude Code refresh.
+- **Anthropic's terms restrict subscription OAuth.** As of February 2026 Anthropic states that subscription OAuth is intended exclusively for Claude Code and Claude.ai, that third parties may not collect, store, or intermediate those credentials, and that using them in any other product or service violates the Consumer Terms of Service. Anthropic enforces this server-side and can invalidate a credential without notice. underclass's Claude Code support is therefore local-only, serves the official client exclusively, and stores the credential in the pool database. See [ADR 0023](docs/adr/0023-claude-code-subscription-backend.md) for the measured behaviour and the full risk statement.
 
 ## Development
 
@@ -272,11 +290,14 @@ src/
   provider.rs    Backend trait
   codex.rs       ChatGPT/Codex backend (device flow, refresh, headers)
   copilot.rs     GitHub Copilot backend (device flow, catalog, headers)
+  claude.rs      Claude Code backend (PKCE paste-back flow, Anthropic surface)
+  cline.rs       Cline backend (API key, Chat-Completions upstream)
   flows.rs       device-code flow registry for onboarding
   tokens.rs      single-flight token refresh
   jwt.rs         token claim parsing (account id extraction)
   resets.rs      Codex usage snapshots and banked reset redemption
   proxy.rs       /v1/* handlers, failover, streaming
+  responses.rs   Responses-to-Chat-Completions translation
   usage.rs       token + stream-outcome tap over upstream bodies
   stats.rs       pure stats core: concurrency sweep, bucketing, rollup merge
   stats_api.rs   stats query, event import, retention/rollup maintenance
