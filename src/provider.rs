@@ -13,7 +13,10 @@ pub trait Backend: Send + Sync {
 
     fn default_cooldown_ms(&self) -> i64;
 
-    fn rewrite_url(&self, path: &str, account: &Account) -> String;
+    /// The upstream URL for a request to `path` for `model`. `model` is the pool-facing id: a
+    /// gateway that serves each model over a different upstream API (OpenCode Go) needs it to
+    /// choose the path, and every other backend ignores it.
+    fn rewrite_url(&self, path: &str, model: &str, account: &Account) -> String;
 
     /// Injects the upstream request headers.
     ///
@@ -32,11 +35,13 @@ pub trait Backend: Send + Sync {
     fn prepare_body(&self, _body: &mut Value) {}
 
     /// @cc [owner:ghuntley,label:proxy] responses-translation-before-upstream
-    /// When this returns true, the proxy MUST translate an inbound `/v1/responses` body to Chat
-    /// Completions before header injection and `prepare_body`, and MUST translate the upstream body
-    /// back to the Responses format (streamed or not) before it reaches the client. Backends that
-    /// return false MUST pass request and response bodies through unchanged.
-    fn responses_via_chat(&self) -> bool {
+    /// When this returns true for the requested `model`, the proxy MUST translate an inbound
+    /// `/v1/responses` body to Chat Completions before header injection and `prepare_body`, and
+    /// MUST translate the upstream body back to the Responses format (streamed or not) before it
+    /// reaches the client. Backends that return false MUST pass request and response bodies
+    /// through unchanged. The decision is per model because a backend may serve some models over
+    /// each wire API.
+    fn responses_via_chat(&self, _model: &str) -> bool {
         false
     }
 
@@ -63,6 +68,14 @@ pub trait Backend: Send + Sync {
         } else {
             UsageDialect::Responses
         }
+    }
+
+    /// Whether a response with this status means the account's credential may be stale, so the
+    /// proxy should force one refresh and retry the same account before failing over. A backend
+    /// whose credential cannot be refreshed MUST return false for every status: the retry would
+    /// replay the identical request with the identical key.
+    fn refresh_on(&self, status: u16) -> bool {
+        matches!(status, 401 | 403)
     }
 
     /// Whether the client's own request headers are forwarded upstream. Backends whose upstream

@@ -19,6 +19,7 @@ fn openai_surfaces() -> HashMap<BackendId, Vec<Surface>> {
         (BackendId::Copilot, vec![Surface::OpenAI]),
         (BackendId::Claude, vec![Surface::Anthropic]),
         (BackendId::Cline, vec![Surface::OpenAI]),
+        (BackendId::Go, vec![Surface::OpenAI]),
     ])
 }
 

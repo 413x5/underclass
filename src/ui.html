@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>underclass — codex/copilot/cline pool</title>
+<title>underclass — codex/copilot/claude/cline/go pool</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -47,7 +47,7 @@
 </head>
 <body>
 <main>
-  <h1>underclass <small>pooled codex + copilot + cline subscriptions</small></h1>
+  <h1>underclass <small>pooled codex + copilot + claude + cline + opencode go subscriptions</small></h1>
 
   <section class="card">
     <div class="row" style="justify-content: space-between">
@@ -56,6 +56,7 @@
         <button onclick="startFlow()">Add account</button>
         <button onclick="refreshCopilotCatalog()">Refresh Copilot catalog</button>
         <button onclick="refreshClineCatalog()">Refresh Cline catalog</button>
+        <button onclick="refreshGoCatalog()">Refresh OpenCode Go catalog</button>
       </div>
     </div>
     <table id="accounts">
@@ -139,6 +140,7 @@
       <option value="copilot">copilot</option>
       <option value="claude">claude</option>
       <option value="cline">cline</option>
+      <option value="go">go</option>
     </select>
     <label>models (JSON array of {id, name, context, input, output})</label>
     <textarea id="catalogEditor" rows="10"></textarea>
@@ -158,6 +160,7 @@
       <option value="copilot">GitHub Copilot</option>
       <option value="claude">Claude Code (Anthropic)</option>
       <option value="cline">Cline (API key)</option>
+      <option value="go">OpenCode Go (API key)</option>
     </select>
     <div id="enterpriseWrap" style="display:none">
       <label>GitHub Enterprise URL or domain (blank for github.com)</label>
@@ -169,6 +172,13 @@
       <label>label (optional — defaults to the account email)</label>
       <input id="flowLabel" placeholder="me@example.com">
       <p class="muted">ClinePass models appear as <code>underclass/cline/cline-pass/*</code>; the credit-based models as <code>underclass/cline/&lt;provider&gt;/*</code>.</p>
+    </div>
+    <div id="goWrap" style="display:none">
+      <label>API key from <a href="https://opencode.ai/console" target="_blank" rel="noopener">opencode.ai/console</a> → Account → Personal API keys</label>
+      <input id="flowGoApiKey" type="password" autocomplete="off" placeholder="oc_sk_…">
+      <label>label (optional — defaults to the Go workspace id)</label>
+      <input id="flowGoLabel" placeholder="wrk_…">
+      <p class="muted">Go models appear as <code>underclass/go/*</code>. Models Go serves only over its Anthropic or Gemini API are not pooled.</p>
     </div>
     <div class="row" style="margin-top:16px">
       <button class="primary" onclick="beginFlow()">Continue</button>
@@ -287,7 +297,7 @@ async function loadState() {
         <td>${a.backend === 'claude' ? formatObservationCredits(a.observation) : formatCredits(a.usage)}</td>
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
-          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">${a.backend === 'cline' ? 'Re-key' : 'Re-login'}</button>` : ''}
+          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">${a.backend === 'cline' || a.backend === 'go' ? 'Re-key' : 'Re-login'}</button>` : ''}
           ${a.backend === 'codex' && a.usage && a.usage.available_resets > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           ${a.backend === 'claude' && (a.status === 'healthy' || a.status === 'cooling') && a.observation && a.observation.reset_credits > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
@@ -482,7 +492,7 @@ function snippet(catalog) {
   return {
     provider: { underclass: {
       npm: '@ai-sdk/openai-compatible',
-      name: 'Underclass (pooled Codex + Copilot + Cline)',
+      name: 'Underclass (pooled Codex + Copilot + Claude + Cline + OpenCode Go)',
       options: { baseURL: location.origin + '/v1', apiKey: '<proxy-key>', setCacheKey: true },
       models
     }},
@@ -514,6 +524,7 @@ document.getElementById('flowBackend').addEventListener('change', () => {
   const backend = document.getElementById('flowBackend').value;
   document.getElementById('enterpriseWrap').style.display = backend === 'copilot' ? 'block' : 'none';
   document.getElementById('clineWrap').style.display = backend === 'cline' ? 'block' : 'none';
+  document.getElementById('goWrap').style.display = backend === 'go' ? 'block' : 'none';
 });
 
 async function startFlow() {
@@ -521,6 +532,8 @@ async function startFlow() {
   document.getElementById('flowTitle').textContent = 'Add account';
   document.getElementById('flowApiKey').value = '';
   document.getElementById('flowLabel').value = '';
+  document.getElementById('flowGoApiKey').value = '';
+  document.getElementById('flowGoLabel').value = '';
   document.getElementById('flowIdle').style.display = 'block';
   document.getElementById('flowPending').style.display = 'none';
   document.getElementById('flowAwaitingCode').style.display = 'none';
@@ -536,9 +549,9 @@ async function beginFlow() {
     const ent = document.getElementById('flowEnterprise').value.trim();
     if (ent) body.enterprise_url = ent;
   }
-  if (backend === 'cline') {
-    body.api_key = document.getElementById('flowApiKey').value.trim();
-    const label = document.getElementById('flowLabel').value.trim();
+  if (backend === 'cline' || backend === 'go') {
+    body.api_key = (backend === 'go' ? document.getElementById('flowGoApiKey') : document.getElementById('flowApiKey')).value.trim();
+    const label = (backend === 'go' ? document.getElementById('flowGoLabel') : document.getElementById('flowLabel')).value.trim();
     if (label) body.label = label;
     if (pendingReplace) body.account_id = pendingReplace;
   }
@@ -616,14 +629,19 @@ async function relogin(id) {
   if (!res.ok) { alert(await res.text()); return; }
   const data = await res.json();
   if (data.rekey) {
-    // Cline: the server only tells us to collect a new key; the paste dialog does the work.
+    // Cline and OpenCode Go: the server only tells us to collect a new key; the paste dialog does
+    // the work. `data.backend` comes from the relogin response, which reports the account's own
+    // backend, so the matching key box is the one shown.
     pendingReplace = data.rekey;
     document.getElementById('flowTitle').textContent = 'Re-key account';
-    document.getElementById('flowBackend').value = 'cline';
+    document.getElementById('flowBackend').value = data.backend;
     document.getElementById('flowApiKey').value = '';
     document.getElementById('flowLabel').value = '';
+    document.getElementById('flowGoApiKey').value = '';
+    document.getElementById('flowGoLabel').value = '';
     document.getElementById('enterpriseWrap').style.display = 'none';
-    document.getElementById('clineWrap').style.display = 'block';
+    document.getElementById('clineWrap').style.display = document.getElementById('flowBackend').value === 'cline' ? 'block' : 'none';
+    document.getElementById('goWrap').style.display = document.getElementById('flowBackend').value === 'go' ? 'block' : 'none';
     document.getElementById('flowIdle').style.display = 'block';
     document.getElementById('flowPending').style.display = 'none';
     document.getElementById('flowDone').style.display = 'none';
@@ -656,6 +674,13 @@ async function del(id) {
 }
 async function refreshCopilotCatalog() {
   await api('/admin/api/catalog/refresh-copilot', { method: 'POST' });
+  loadState();
+  loadCatalog();
+}
+async function refreshGoCatalog() {
+  const res = await api('/admin/api/catalog/refresh-go', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (data.errors && data.errors.length) alert('OpenCode Go catalog errors: ' + data.errors.join('; '));
   loadState();
   loadCatalog();
 }

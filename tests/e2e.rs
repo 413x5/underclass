@@ -11,6 +11,7 @@ use underclass::flows::FlowRegistry;
 use underclass::models::{
     Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
 };
+use underclass::opencode_go::GoBackend;
 use underclass::pool::PoolCore;
 use underclass::provider::BackendMap;
 use underclass::proxy::AppState;
@@ -33,6 +34,11 @@ struct MockState {
     /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
     /// credential rejection that a token refresh clears.
     forbidden: std::collections::HashMap<String, u32>,
+    /// The paths Go requests arrived on, in order, so a test can assert that a model was sent to
+    /// the upstream API its family requires rather than the path the client used.
+    go_paths: VecDeque<String>,
+    /// The `x-opencode-session` value per request, in order.
+    go_sessions: VecDeque<String>,
 }
 
 async fn mock_responses(
@@ -48,6 +54,16 @@ async fn mock_responses(
         .unwrap_or("unknown")
         .to_string();
     let wants_stream = body.contains("\"stream\": true") || body.contains("\"stream\":true");
+    if bearer.starts_with("go-") {
+        let session = headers
+            .get("x-opencode-session")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let mut mock = state.lock().unwrap();
+        mock.go_paths.push_back(uri.path().to_string());
+        mock.go_sessions.push_back(session);
+    }
 
     if bearer.starts_with("bad-") {
         return (
@@ -133,6 +149,19 @@ async fn mock_responses(
             format!(
                 r#"{{"detail":"The '{requested_model}' model is not supported when using Codex with a ChatGPT account."}}"#
             ),
+        )
+            .into_response();
+    }
+    // Go meters usage per model and reports the exhaustion as a rate limit on that model.
+    if bearer.starts_with("go-quota-") && requested_model == "kimi-k3" {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            r#"{"error":{"type":"server_error","message":"Upstream request failed: Go usage limit reached for this model"}}"#
+                .to_string(),
         )
             .into_response();
     }
@@ -398,6 +427,7 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLAUDE_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLINE_UPSTREAM", format!("http://{addr}"));
+            std::env::set_var("UNDERCLASS_GO_UPSTREAM", format!("http://{addr}"));
         }
         format!("http://{addr}")
     });
@@ -444,6 +474,13 @@ fn scoped_model(id: &str, scope: &str) -> ModelInfo {
     }
 }
 
+/// Go holds a static Console API key in the same column as Cline's.
+fn go_account(id: &str, token: &str) -> Account {
+    let mut a = account(id, BackendId::Go, "unused-access");
+    a.refresh_token = Some(token.to_string());
+    a
+}
+
 fn cline_account(id: &str, token: &str) -> Account {
     // Cline holds a static API key; `TokenManager` hands the refresh token to the backend.
     let mut a = account(id, BackendId::Cline, "unused-access");
@@ -457,6 +494,7 @@ fn openai_surfaces() -> std::collections::HashMap<BackendId, Vec<Surface>> {
         (BackendId::Copilot, vec![Surface::OpenAI]),
         (BackendId::Claude, vec![Surface::Anthropic]),
         (BackendId::Cline, vec![Surface::OpenAI]),
+        (BackendId::Go, vec![Surface::OpenAI]),
     ])
 }
 
@@ -493,6 +531,7 @@ async fn spawn_app(
     backends.insert(BackendId::Copilot, Arc::new(CopilotBackend { cooldown_ms }));
     backends.insert(BackendId::Claude, Arc::new(ClaudeBackend { cooldown_ms }));
     backends.insert(BackendId::Cline, Arc::new(ClineBackend { cooldown_ms }));
+    backends.insert(BackendId::Go, Arc::new(GoBackend { cooldown_ms }));
     let core = PoolCore::new(&store, backend_surfaces(&backends));
     let pool = Arc::new(Mutex::new(core));
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -2039,5 +2078,238 @@ async fn e2e_translated_overload_replay_is_a_responses_stream() {
     assert!(
         body.contains("response.failed"),
         "an overloaded reply is a failed response: {body}"
+    );
+}
+
+/// @cc [owner:ghuntley,label:proxy] go-routes-by-model-family
+/// A Go request MUST reach the upstream path its model's family requires, whatever path the
+/// client used, and MUST carry a session id. The client's own path is not the family: a
+/// Chat-Completions model asked for over `/v1/responses` must still go upstream as chat (and be
+/// translated), and a Responses-family model asked for over `/v1/chat/completions` must still go
+/// upstream as responses.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let chat_model = model("go/kimi-k3");
+    let responses_model = model("go/gpt-6-luna");
+    store.set_catalog(
+        BackendId::Go,
+        &[chat_model.clone(), responses_model.clone()],
+    );
+    store.upsert_account(&go_account("go-routing", "go-acc-1"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 3_600_000).await;
+    let http = reqwest::Client::new();
+
+    // A Responses client asking for a Chat-family model: translated, and sent to chat.
+    let response = http
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({
+            "model": chat_model.id,
+            "input": "hi",
+            "prompt_cache_key": "go-session-1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the translated request must serve");
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("\"object\":\"response\""),
+        "a Responses client must get a Responses object: {body}"
+    );
+    assert!(
+        !body.contains("\"choices\""),
+        "a chat completion must not leak to a Responses client: {body}"
+    );
+
+    // A Chat client asking for a Responses-family model: not translated, sent to responses.
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": responses_model.id, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    response.text().await.unwrap();
+
+    let (paths, sessions, attempted) = {
+        let mock = mock.lock().unwrap();
+        (
+            mock.go_paths.iter().cloned().collect::<Vec<_>>(),
+            mock.go_sessions.iter().cloned().collect::<Vec<_>>(),
+            mock.models.iter().cloned().collect::<Vec<_>>(),
+        )
+    };
+    assert!(
+        paths
+            .iter()
+            .all(|path| path.ends_with("/openai/v1/chat/completions")
+                || path.ends_with("/openai/v1/responses")),
+        "Go requests must use its OpenAI surface: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("/chat/completions")),
+        "the chat-family model must go upstream as chat: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("/responses")),
+        "the Responses-family model must go upstream as responses: {paths:?}"
+    );
+    assert!(
+        attempted.iter().all(|m| !m.starts_with("go/")),
+        "the pool namespace must not reach Go: {attempted:?}"
+    );
+    assert!(
+        sessions.contains(&"go-session-1".to_string()),
+        "the sticky key must travel as x-opencode-session: {sessions:?}"
+    );
+    assert!(
+        sessions.iter().all(|s| !s.is_empty()),
+        "every request needs a session id or Go refuses it: {sessions:?}"
+    );
+}
+
+/// @cc [owner:ghuntley,label:pool] go-session-pinned-to-one-account
+/// A session that starts on a Go account MUST keep reaching that same account while it is eligible,
+/// so Go's prompt cache stays warm, and MUST only move when that account can no longer serve. A
+/// second account in the pool MUST NOT attract the session, however idle it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_go_session_stays_pinned_to_its_account() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let model = model("go/kimi-k3");
+    store.set_catalog(BackendId::Go, &[model.clone()]);
+    // Two accounts so a non-sticky choice has somewhere else to go.
+    store.upsert_account(&go_account("go-pin-a", "go-pin-a"));
+    store.upsert_account(&go_account("go-pin-b", "go-pin-b"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
+    let http = reqwest::Client::new();
+
+    let call = |key: &str| {
+        let http = http.clone();
+        let base = base.clone();
+        let model = model.id.clone();
+        let key = key.to_string();
+        async move {
+            http.post(format!("{base}/v1/chat/completions"))
+                .header("Authorization", concat!("Bear", "er ", "test-key"))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "prompt_cache_key": key,
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Three turns of one conversation. Only the first is allowed to choose an account; the rest
+    // must hit the same one.
+    let mut served = Vec::new();
+    for _ in 0..3 {
+        let response = call("go-session-pin").await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        served.push(body["account"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        served[0], served[1],
+        "the second turn must stay on the account the session started on: {served:?}"
+    );
+    assert_eq!(
+        served[1], served[2],
+        "the third turn must stay too: {served:?}"
+    );
+
+    // The pin is a recorded binding, not an artefact of there being one usable account: the
+    // session's key maps to the account that served it, and a second conversation records its own
+    // binding without disturbing the first.
+    let bound = {
+        let pool = pool.lock().unwrap();
+        pool.binding("go-session-pin")
+            .expect("a sticky session must be bound")
+            .0
+    };
+    assert_eq!(
+        bound, served[0],
+        "the binding must name the account the session has been served by"
+    );
+    assert!(
+        pool.lock().unwrap().binding("go-session-other").is_none(),
+        "the second conversation has not run yet"
+    );
+
+    let other: serde_json::Value = call("go-session-other").await.json().await.unwrap();
+    assert!(other["account"].is_string());
+    let after = pool.lock().unwrap();
+    assert_eq!(
+        after.binding("go-session-pin").unwrap().0,
+        bound,
+        "a second conversation must not steal the first session's binding"
+    );
+    assert!(
+        after.binding("go-session-other").is_some(),
+        "the second conversation gets its own binding"
+    );
+}
+
+/// Go meters usage per model, so a 429 must cool the requested model on that account and leave the
+/// rest of its catalog servable.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_go_rate_limit_cools_only_the_model() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let limited = model("go/kimi-k3");
+    let other = model("go/glm-5.3");
+    store.set_catalog(BackendId::Go, &[limited.clone(), other.clone()]);
+    store.upsert_account(&go_account("go-quota", "go-quota-1"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
+    let http = reqwest::Client::new();
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": limited.id, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429, "the upstream limit passes through");
+    response.text().await.unwrap();
+
+    let account = store.get_account("go-quota").unwrap();
+    assert_eq!(
+        account.status,
+        AccountStatus::Healthy,
+        "a per-model limit must not cool the whole account"
+    );
+    assert!(
+        account.scope_cooling.is_empty(),
+        "a per-model limit is not a billing surface: {:?}",
+        account.scope_cooling
+    );
+    let cooling = pool
+        .lock()
+        .unwrap()
+        .model_cooling_until("go-quota", "go/kimi-k3");
+    assert!(
+        cooling.is_some_and(|until| until > now_ms()),
+        "the limited model must cool"
+    );
+
+    // The same account still serves its other models.
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": other.id, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "another model on the same account must still serve"
     );
 }

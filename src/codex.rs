@@ -390,7 +390,7 @@ impl Backend for CodexBackend {
         }
     }
 
-    fn rewrite_url(&self, path: &str, _account: &Account) -> String {
+    fn rewrite_url(&self, path: &str, _model: &str, _account: &Account) -> String {
         if path.ends_with("/responses") || path.ends_with("/chat/completions") {
             codex_endpoint()
         } else {
@@ -546,15 +546,15 @@ mod tests {
         let backend = CodexBackend { cooldown_ms: 1000 };
         let account = crate::flows::new_account(crate::models::BackendId::Codex, "x".into());
         assert_eq!(
-            backend.rewrite_url("/v1/responses", &account),
+            backend.rewrite_url("/v1/responses", "gpt-5.5", &account),
             CODEX_ENDPOINT
         );
         assert_eq!(
-            backend.rewrite_url("/v1/chat/completions", &account),
+            backend.rewrite_url("/v1/chat/completions", "gpt-5.5", &account),
             CODEX_ENDPOINT
         );
         assert_eq!(
-            backend.rewrite_url("/v1/other", &account),
+            backend.rewrite_url("/v1/other", "gpt-5.5", &account),
             "https://api.openai.com/v1/other"
         );
     }

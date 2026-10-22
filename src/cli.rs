@@ -291,7 +291,7 @@ pub fn provider_block(base_url: &str, api_key: &str, models: &[crate::models::Mo
         .collect();
     serde_json::json!({
         "npm": "@ai-sdk/openai-compatible",
-        "name": "Underclass (pooled Codex + Copilot + Cline)",
+        "name": "Underclass (pooled Codex + Copilot + Claude + Cline + OpenCode Go)",
         "options": {
             "baseURL": base_url,
             "apiKey": api_key,
@@ -397,6 +397,7 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
     for backend in [
         crate::models::BackendId::Copilot,
         crate::models::BackendId::Cline,
+        crate::models::BackendId::Go,
     ] {
         for m in underclass_store.catalog(backend) {
             if seen.insert(m.id.clone()) {

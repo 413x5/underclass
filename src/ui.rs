@@ -284,6 +284,87 @@ async fn start_cline_flow(
     (state.flows.clone(), flow_id)
 }
 
+/// @cc [owner:ghuntley,label:auth] go-flow-verifies-key
+/// An OpenCode Go onboarding request MUST create a flow record, validate the pasted API key, and
+/// report either `authorized` with the persisted account id or `failed` with a message; it MUST NOT
+/// persist an account when the key is empty or rejected upstream. When `replace_account` names an
+/// existing account, a successful flow MUST keep that account's id rather than creating a second
+/// account against the same subscription.
+async fn start_go_flow(
+    state: &Arc<AppState>,
+    api_key: Option<String>,
+    label: Option<String>,
+    replace_account: Option<String>,
+) -> (crate::flows::FlowRegistry, String) {
+    let flow_id = state.flows.create(
+        BackendId::Go,
+        crate::flows::FlowState::Pending {
+            user_code: String::new(),
+            verify_url: "https://opencode.ai/console/go".into(),
+        },
+        replace_account.clone(),
+    );
+    let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) else {
+        state.flows.set_state(
+            &flow_id,
+            crate::flows::FlowState::Failed {
+                message: "an OpenCode API key from opencode.ai/console is required".into(),
+            },
+        );
+        return (state.flows.clone(), flow_id);
+    };
+    // `add_account` stores the trimmed key, so the catalog refresh must authenticate with that same
+    // value; a pasted trailing newline would otherwise fail only the refresh.
+    let api_key = api_key.trim().to_string();
+    match crate::opencode_go::add_account(
+        &state.client,
+        &state.store,
+        &api_key,
+        label,
+        replace_account,
+    )
+    .await
+    {
+        Ok(account) => {
+            state.pool.lock().unwrap().sync_account(account.clone());
+            if let Err(error) = crate::opencode_go::refresh_catalog(
+                &state.client,
+                &state.store,
+                &state.pool,
+                &api_key,
+            )
+            .await
+            {
+                crate::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
+            }
+            state.flows.set_state(
+                &flow_id,
+                crate::flows::FlowState::Authorized {
+                    account_id: account.id,
+                },
+            );
+        }
+        Err(error) => {
+            // Only a `Rejected` error means the key itself was refused; anything else is a transient
+            // upstream problem and must not tell the operator to replace a working key.
+            let message = match error {
+                crate::opencode_go::AuthError::Rejected(why) => {
+                    format!("OpenCode Console rejected the API key: {why}")
+                }
+                crate::opencode_go::AuthError::BadReplaceTarget => {
+                    "that account no longer exists or is not an OpenCode Go account; close this dialog and re-key it from the account list".to_string()
+                }
+
+                other => format!("could not verify the OpenCode API key, try again ({other})"),
+            };
+            state
+                .flows
+                .set_state(&flow_id, crate::flows::FlowState::Failed { message });
+        }
+    }
+    (state.flows.clone(), flow_id)
+}
+
 pub async fn start_flow(
     State(state): State<Arc<AppState>>,
     body: Option<Json<StartFlowBody>>,
@@ -294,23 +375,40 @@ pub async fn start_flow(
     let Some(backend) = BackendId::parse(&body.backend) else {
         return (StatusCode::BAD_REQUEST, "unknown backend").into_response();
     };
-    if backend == BackendId::Cline {
+    if backend == BackendId::Cline || backend == BackendId::Go {
         let replace_account = body.account_id.clone().filter(|id| !id.trim().is_empty());
         if let Some(account_id) = replace_account.as_deref() {
             let Some(account) = state.store.get_account(account_id) else {
                 return (StatusCode::NOT_FOUND, "unknown account").into_response();
             };
-            if account.backend != BackendId::Cline {
-                return (StatusCode::BAD_REQUEST, "account is not a Cline account").into_response();
+            if account.backend != backend {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("account is not a {} account", backend.as_str()),
+                )
+                    .into_response();
             }
         }
-        let (flows, flow_id) = start_cline_flow(
-            &state,
-            body.api_key.clone(),
-            body.label.clone(),
-            replace_account,
-        )
-        .await;
+        let (flows, flow_id) = match backend {
+            BackendId::Go => {
+                start_go_flow(
+                    &state,
+                    body.api_key.clone(),
+                    body.label.clone(),
+                    replace_account,
+                )
+                .await
+            }
+            _ => {
+                start_cline_flow(
+                    &state,
+                    body.api_key.clone(),
+                    body.label.clone(),
+                    replace_account,
+                )
+                .await
+            }
+        };
         return Json(json!({ "flow_id": flow_id, "flow": flows.get(&flow_id) })).into_response();
     }
     let result = match backend {
@@ -339,7 +437,7 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
-        BackendId::Cline => unreachable!("handled above"),
+        BackendId::Cline | BackendId::Go => unreachable!("handled above"),
     };
     match result {
         Ok(flow_id) => {
@@ -482,11 +580,14 @@ pub async fn relogin_account(
         )
         .await
         .map_err(|e| e.to_string()),
-        // A Cline key cannot be refreshed, so re-keying is a paste-a-new-key flow that keeps this
-        // account's id and clears its cooldown. No polling flow is created: the browser collects the
-        // new key and posts it to `/admin/api/flows` with this account id.
-        BackendId::Cline => {
-            return Json(json!({ "rekey": id })).into_response();
+        // A Cline or OpenCode key cannot be refreshed, so re-keying is a paste-a-new-key flow that
+        // keeps this account's id and clears its cooldown. No polling flow is created: the browser
+        // collects the new key and posts it to `/admin/api/flows` with this account id.
+        BackendId::Cline | BackendId::Go => {
+            // The dialog needs to know which key box to show; the row the operator clicked already
+            // says which backend this account belongs to.
+            return Json(json!({ "rekey": id, "backend": account.backend.as_str() }))
+                .into_response();
         }
     };
     match result {
@@ -677,6 +778,34 @@ pub async fn refresh_cline_catalog(State(state): State<Arc<AppState>>) -> Respon
             continue;
         };
         match crate::cline::refresh_catalog(&state.client, &state.store, &state.pool, &key).await {
+            Ok(models) if !models.is_empty() => refreshed += 1,
+            Ok(_) => {}
+            Err(error) => errors.push(format!("{}: {error}", account.label)),
+        }
+    }
+    Json(json!({ "refreshed_accounts": refreshed, "errors": errors })).into_response()
+}
+
+/// @cc [owner:ghuntley,label:pool] go-catalog-refresh-endpoint
+/// `refresh_go_catalog` MUST attempt a catalog refresh for every Go account that holds a key, MUST
+/// count only non-empty successful refreshes, and MUST report one `label: error` string per failed
+/// account without failing the whole request.
+pub async fn refresh_go_catalog(State(state): State<Arc<AppState>>) -> Response {
+    let accounts: Vec<_> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|account| account.backend == BackendId::Go)
+        .collect();
+    let mut refreshed = 0usize;
+    let mut errors = Vec::new();
+    for account in accounts {
+        let Some(key) = account.refresh_token.clone() else {
+            continue;
+        };
+        match crate::opencode_go::refresh_catalog(&state.client, &state.store, &state.pool, &key)
+            .await
+        {
             Ok(models) if !models.is_empty() => refreshed += 1,
             Ok(_) => {}
             Err(error) => errors.push(format!("{}: {error}", account.label)),

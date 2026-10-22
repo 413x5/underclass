@@ -354,11 +354,11 @@ impl Backend for ClineBackend {
     /// Cline exposes only Chat Completions, so `/responses` requests routed to this backend MUST be
     /// converted to `POST <base>/api/v1/chat/completions` and their bodies translated back to the
     /// Responses API before reaching the client.
-    fn responses_via_chat(&self) -> bool {
+    fn responses_via_chat(&self, _model: &str) -> bool {
         true
     }
 
-    fn rewrite_url(&self, path: &str, _account: &Account) -> String {
+    fn rewrite_url(&self, path: &str, _model: &str, _account: &Account) -> String {
         let base = api_base();
         if path.ends_with("/responses") || path.ends_with("/chat/completions") {
             format!("{base}/api/v1/chat/completions")
@@ -677,10 +677,20 @@ mod tests {
     fn rewrites_completion_paths_and_strips_namespace() {
         let backend = ClineBackend { cooldown_ms: 1000 };
         let account = crate::flows::new_account(BackendId::Cline, "x".into());
-        let url = backend.rewrite_url("/v1/responses", &account);
+        let url = backend.rewrite_url(
+            "/v1/responses",
+            "cline/anthropic/claude-sonnet-4-6",
+            &account,
+        );
         assert!(url.ends_with("/api/v1/chat/completions"));
-        assert!(backend.rewrite_url("/v1/chat/completions", &account) == url);
-        assert!(backend.responses_via_chat());
+        assert!(
+            backend.rewrite_url(
+                "/v1/chat/completions",
+                "cline/anthropic/claude-sonnet-4-6",
+                &account
+            ) == url
+        );
+        assert!(backend.responses_via_chat("cline/anthropic/claude-sonnet-4-6"));
         let mut body = json!({"model": "cline/anthropic/claude-sonnet-4-6", "prompt_cache_key": "k", "store": false});
         backend.prepare_body(&mut body);
         assert_eq!(body["model"], "anthropic/claude-sonnet-4-6");
