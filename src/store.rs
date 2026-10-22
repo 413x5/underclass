@@ -138,6 +138,7 @@ fn schema() -> &'static str {
         enterprise_url TEXT,
         plan TEXT,
         status TEXT NOT NULL DEFAULT 'healthy',
+        disabled_reason TEXT,
         reset_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -234,6 +235,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     if !columns.iter().any(|c| c == "plan") {
         conn.execute("ALTER TABLE accounts ADD COLUMN plan TEXT", [])?;
+    }
+    if !columns.iter().any(|c| c == "disabled_reason") {
+        conn.execute("ALTER TABLE accounts ADD COLUMN disabled_reason TEXT", [])?;
     }
     let mut stmt = conn.prepare("PRAGMA table_info(usage_records)")?;
     let columns: Vec<String> = stmt
@@ -747,7 +751,7 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at, plan
+                        token_refreshed_at, plan, disabled_reason
                  FROM accounts ORDER BY created_at",
             )
             .expect("prepare accounts");
@@ -767,6 +771,7 @@ impl Store {
                     residency: row.get(7)?,
                     enterprise_url: row.get(8)?,
                     plan: row.get(14)?,
+                    disabled_reason: row.get(15)?,
                     status: parse_status(&status),
                     reset_at: row.get(10)?,
                     created_at: row.get(11)?,
@@ -783,7 +788,7 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at, plan
+                        token_refreshed_at, plan, disabled_reason
                  FROM accounts WHERE id = ?1",
             )
             .expect("prepare account");
@@ -802,6 +807,7 @@ impl Store {
                 residency: row.get(7)?,
                 enterprise_url: row.get(8)?,
                 plan: row.get(14)?,
+                disabled_reason: row.get(15)?,
                 status: parse_status(&status),
                 reset_at: row.get(10)?,
                 created_at: row.get(11)?,
@@ -817,12 +823,12 @@ impl Store {
         conn.execute(
             "INSERT INTO accounts (id, backend, label, refresh_token, access_token, expires_at, account_id,
                                    residency, enterprise_url, plan, status, reset_at, created_at, updated_at,
-                                   token_refreshed_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                                   token_refreshed_at, disabled_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(id) DO UPDATE SET
                 label=?3, refresh_token=?4, access_token=?5, expires_at=?6, account_id=?7,
                 residency=?8, enterprise_url=?9, plan=?10, status=?11, reset_at=?12, updated_at=?14,
-                token_refreshed_at=?15",
+                token_refreshed_at=?15, disabled_reason=?16",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -839,6 +845,7 @@ impl Store {
                 a.created_at,
                 a.updated_at,
                 a.token_refreshed_at,
+                a.disabled_reason,
             ],
         )
         .expect("upsert account");
@@ -906,6 +913,17 @@ impl Store {
             params![id, status_str(status), reset_at, crate::models::now_ms()],
         )
         .expect("update status");
+    }
+
+    /// Sets or clears why underclass disabled the account; `None` marks the status as the
+    /// operator's, which the plan gate never reverts.
+    pub fn set_disabled_reason(&self, id: &str, reason: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET disabled_reason = ?2 WHERE id = ?1",
+            params![id, reason],
+        )
+        .expect("update disabled reason");
     }
 
     /// @cc [owner:ghuntley,label:persistence] token-rotation-write-through

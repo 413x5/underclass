@@ -220,6 +220,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
                     pool::BINDING_TTL_MS,
                     pool::DEFAULT_BINDING_CAP,
                 );
+                enforce_plan_gates(&state);
                 state.pool.lock().unwrap().sync_from_store(&store);
             }
         });
@@ -581,6 +582,38 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
             Some(&account.label),
             "cooling",
             &format!("subscription window exhausted until {until}"),
+        );
+    }
+}
+
+/// Disables accounts on a free plan and re-enables those it disabled once they are upgraded.
+///
+/// Codex plans come from the stored access token's claims, which the daily scheduled rotation
+/// keeps current even while the account is disabled.
+fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
+    for account in state.store.list_accounts() {
+        let (status, reason, event) = match account.plan_gate() {
+            Some(models::PlanGate::Disable) => (
+                models::AccountStatus::Disabled,
+                Some(models::FREE_PLAN_REASON),
+                "disabled",
+            ),
+            Some(models::PlanGate::Enable) => (models::AccountStatus::Healthy, None, "enabled"),
+            None => continue,
+        };
+        let plan = account.plan_label().unwrap_or_default();
+        state.store.update_account_status(&account.id, status, 0);
+        state.store.set_disabled_reason(&account.id, reason);
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .set_status(&account.id, status, 0);
+        logging::log_account_state(
+            &account.id,
+            Some(&account.label),
+            event,
+            &format!("subscription plan is {plan}"),
         );
     }
 }

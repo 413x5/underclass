@@ -99,6 +99,7 @@ pub fn new_account(backend: BackendId, label: String) -> Account {
         residency: None,
         enterprise_url: None,
         plan: None,
+        disabled_reason: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
         created_at: ts,

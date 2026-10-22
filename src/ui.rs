@@ -468,6 +468,8 @@ fn set_status(state: &Arc<AppState>, id: &str, status: AccountStatus, reset_at: 
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     }
     state.store.update_account_status(id, status, reset_at);
+    // An operator decision supersedes any automatic disable, so the plan gate leaves it alone.
+    state.store.set_disabled_reason(id, None);
     state.pool.lock().unwrap().set_status(id, status, reset_at);
     StatusCode::NO_CONTENT.into_response()
 }

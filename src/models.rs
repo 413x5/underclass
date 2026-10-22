@@ -89,10 +89,26 @@ pub struct Account {
     #[serde(default)]
     pub plan: Option<String>,
     pub status: AccountStatus,
+    /// Why the account is `Disabled` when underclass disabled it itself, so it can lift the
+    /// disable once the cause clears. `None` for an operator disable, which is never auto-reverted.
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
     #[serde(default)]
     pub reset_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// `disabled_reason` recorded when an account is disabled for running on a free plan.
+pub const FREE_PLAN_REASON: &str = "free_plan";
+
+/// A status change the account's subscription plan calls for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanGate {
+    /// The account is on a free plan: take it out of the pool.
+    Disable,
+    /// The account was disabled for a free plan and has since been upgraded: return it.
+    Enable,
 }
 
 impl Account {
@@ -117,6 +133,24 @@ impl Account {
                     .filter(|s| !s.trim().is_empty())
             })
             .map(str::to_owned)
+    }
+
+    /// @cc [owner:ghuntley,label:pool] free-plan-gate
+    /// `plan_gate` MUST return `Disable` when the account's `plan_label` is `free`
+    /// (case-insensitive) unless it is already `Disabled` with reason `FREE_PLAN_REASON`, and
+    /// MUST return `Enable` only when the account is `Disabled` with reason `FREE_PLAN_REASON` and
+    /// a known, non-free plan. An unknown plan or an operator disable (any other reason) MUST
+    /// yield `None`; no I/O is permitted.
+    pub fn plan_gate(&self) -> Option<PlanGate> {
+        let plan = self.plan_label()?;
+        let gated = self.status == AccountStatus::Disabled
+            && self.disabled_reason.as_deref() == Some(FREE_PLAN_REASON);
+        let free = plan.trim().eq_ignore_ascii_case("free");
+        match (free, gated) {
+            (true, false) => Some(PlanGate::Disable),
+            (false, true) => Some(PlanGate::Enable),
+            _ => None,
+        }
     }
 
     pub fn healthy(&self) -> bool {
@@ -239,5 +273,37 @@ mod plan_tests {
             json!({"chatgpt_plan_type": "free", "https://api.openai.com/auth": {"chatgpt_plan_type": "business"}}),
         ));
         assert_eq!(account.chatgpt_plan().as_deref(), Some("business"));
+    }
+
+    #[test]
+    fn free_plan_disables_and_upgrade_re_enables() {
+        let mut account = crate::flows::new_account(BackendId::Codex, "account".into());
+        account.access_token = Some(token(json!({"chatgpt_plan_type": "free"})));
+        assert_eq!(account.plan_gate(), Some(PlanGate::Disable));
+        account.status = AccountStatus::Disabled;
+        assert_eq!(
+            account.plan_gate(),
+            Some(PlanGate::Disable),
+            "adopts an operator disable"
+        );
+        account.disabled_reason = Some(FREE_PLAN_REASON.into());
+        assert_eq!(account.plan_gate(), None);
+        account.access_token = Some(token(json!({"chatgpt_plan_type": "plus"})));
+        assert_eq!(account.plan_gate(), Some(PlanGate::Enable));
+        account.access_token = None;
+        assert_eq!(
+            account.plan_gate(),
+            None,
+            "an unknown plan keeps the account disabled"
+        );
+    }
+
+    #[test]
+    fn operator_disable_of_a_paid_account_is_never_reverted() {
+        let mut account = crate::flows::new_account(BackendId::Codex, "account".into());
+        account.access_token = Some(token(json!({"chatgpt_plan_type": "pro"})));
+        assert_eq!(account.plan_gate(), None);
+        account.status = AccountStatus::Disabled;
+        assert_eq!(account.plan_gate(), None);
     }
 }
