@@ -1175,7 +1175,7 @@ impl Backend for ClaudeBackend {
         is_claude_code_client(headers, body)
     }
 
-    fn rewrite_url(&self, path: &str, _account: &Account) -> String {
+    fn rewrite_url(&self, path: &str, _model: &str, _account: &Account) -> String {
         // The Anthropic API lives under `/v1`. The proxy's routes are nested under `/v1` as
         // well, so the path arrives without that prefix.
         let path = if path.starts_with("/v1/") {
@@ -1184,6 +1184,14 @@ impl Backend for ClaudeBackend {
             format!("/v1{path}")
         };
         format!("{}{path}", api_base())
+    }
+
+    /// @cc [owner:ghuntley,label:auth] claude-refreshes-on-401-only
+    /// `refresh_on` MUST report true only for a `401`: a Claude `403` is a per-resource permission
+    /// refusal, and rotating the refresh token for it would burn a real rotation - the token
+    /// endpoint rate-limits independently - to then retry a request that is refused again.
+    fn refresh_on(&self, status: u16) -> bool {
+        status == 401
     }
 
     /// @cc [owner:ghuntley,label:proxy] claude-credential-swap

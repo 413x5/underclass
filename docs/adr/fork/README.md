@@ -37,3 +37,6 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 - [Quota Dimensions Compose in Selection](quota-dimensions-compose-in-selection.md) — how the
   fork's per-billing-surface cooling and upstream's per-model cooling coexist in one eligibility
   predicate, and why neither subsumes the other.
+- [OpenCode Go Backend over Go's OpenAI Surface](opencode-go-backend.md) — fifth backend (API-key
+  onboarding, `go/` model namespace, sticky session header) and the per-model wire-family choice
+  that keeps Go's Anthropic- and Gemini-only models out of the catalog.

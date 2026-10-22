@@ -795,7 +795,7 @@ async fn attempt_account(
         }
     };
 
-    let url = backend.rewrite_url(target, &account);
+    let url = backend.rewrite_url(target, model, &account);
     let mut headers = HeaderMap::new();
     if backend.forward_client_headers() {
         for (name, value) in client_headers.iter() {
@@ -817,7 +817,7 @@ async fn attempt_account(
     }
     let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     let responses_path = endpoint.ends_with("/responses");
-    let translate_responses = responses_path && backend.responses_via_chat();
+    let translate_responses = responses_path && backend.responses_via_chat(model);
     // The dialect the *upstream* speaks: a translated request is Chat Completions even though the
     // client's path is `/v1/responses`, so this must not be derived from the client path alone.
     // Used by every body parse - error bodies as much as successful ones.
@@ -965,15 +965,10 @@ async fn attempt_account(
         &response_headers,
     );
 
-    // A 401 always means the credential may be stale. Copilot also redeems 403 by refreshing (its
-    // redemption-triggered rejection is cleared by a token refresh), but for Claude a 403 is a
-    // per-resource permission error: rotating the refresh token for it would burn a real rotation
-    // - the token endpoint rate-limits independently - and then retry a request that is refused
-    // again for the same reason.
-    let refresh_on = |status: StatusCode| match selection.backend {
-        BackendId::Claude => status == StatusCode::UNAUTHORIZED,
-        _ => matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
-    };
+    // Whether a status means the credential may be stale is the backend's decision: Copilot redeems
+    // a 403 by refreshing, Claude's 403 is a per-resource refusal, and a backend on a static API
+    // key cannot be redeemed at all. Asking the backend keeps that difference out of the proxy.
+    let refresh_on = |status: StatusCode| backend.refresh_on(status.as_u16());
     if refresh_on(status) && refreshed.insert(selection.account_id.clone()) {
         let body_text = response.text().await.unwrap_or_default();
         let mut record = usage_record(

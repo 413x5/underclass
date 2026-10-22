@@ -10,6 +10,8 @@ pub struct FileConfig {
     pub copilot_cooldown_secs: Option<u64>,
     pub cline_cooldown_secs: Option<u64>,
     pub cline_cooldown_ms: Option<u64>,
+    pub go_cooldown_secs: Option<u64>,
+    pub go_cooldown_ms: Option<u64>,
     pub claude_cooldown_secs: Option<u64>,
     pub claude_cooldown_ms: Option<u64>,
     pub copilot_cooldown_ms: Option<u64>,
@@ -27,6 +29,7 @@ pub struct Config {
     pub auto_codex_resets: bool,
     pub copilot_cooldown_ms: i64,
     pub cline_cooldown_ms: i64,
+    pub go_cooldown_ms: i64,
     pub claude_cooldown_ms: i64,
     pub stats_retention_days: i64,
     pub data_dir: PathBuf,
@@ -98,6 +101,13 @@ impl Config {
             .or(file_cfg.cline_cooldown_ms)
             .or(file_cfg.cline_cooldown_secs.map(|s| s * 1000))
             .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
+        let go_cooldown_ms = std::env::var("UNDERCLASS_GO_COOLDOWN_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.saturating_mul(1000))
+            .or(file_cfg.go_cooldown_ms)
+            .or(file_cfg.go_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
         let claude_cooldown_ms = file_cfg
             .claude_cooldown_ms
             .or(file_cfg.claude_cooldown_secs.map(|s| s * 1000))
@@ -124,6 +134,7 @@ impl Config {
             auto_codex_resets,
             copilot_cooldown_ms,
             cline_cooldown_ms,
+            go_cooldown_ms,
             claude_cooldown_ms,
             stats_retention_days,
             data_dir,

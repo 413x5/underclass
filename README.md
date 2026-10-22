@@ -1,6 +1,6 @@
 # underclass
 
-**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, and Cline subscriptions behind one endpoint.**
+**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, Cline, and OpenCode Go subscriptions behind one endpoint.**
 
 ```
                        ┌────────────────────────────────────┐
@@ -16,8 +16,11 @@
  (accounts, catalog,   │  fail-fast saturation · tracing    │      (K Claude Code subs,
   live request feed)   │  per-surface quota cooling         │       OAuth paste-back)
                        │                                    │────► api.cline.bot
-                       └────────────────────────────────────┘      (J API keys,
-                                                                     Cline + ClinePass)
+                       │                                    │      (J API keys,
+                       │                                    │       Cline + ClinePass)
+                       │                                    │────► opencode.ai/inference/go
+                       └────────────────────────────────────┘      (I API keys,
+                                                                     OpenCode Go)
 ```
 
 One subscription runs out of quota? It leaves rotation until its window resets — and comes back on its own. Sessions stay pinned to one subscription so upstream prompt caches stay warm. When *everything* is exhausted, the proxy fails fast with the earliest reset time instead of hanging.
@@ -50,7 +53,7 @@ never writes them to diagnostics. Open the web UI and paste the value supplied a
 `UNDERCLASS_UI_TOKEN`.
 
 1. Open the web UI and paste the configured admin token.
-2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, or *Claude Code (Anthropic)* → follow the flow, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys. Accounts are labeled automatically with the account's email or username.
+2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, or *Claude Code (Anthropic)* → follow the flow, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys, or pick *OpenCode Go (API key)* and paste a key from [opencode.ai/console](https://opencode.ai/console) → Account → Personal API keys. Accounts are labeled automatically with the account's email, username, or Go workspace.
 3. Repeat for every subscription you want in the pool.
 4. Point opencode at the pool:
 
@@ -72,16 +75,17 @@ export CLAUDE_CODE_OAUTH_TOKEN=<the underclass proxy key>
 
 ## How routing works
 
-- **Sticky sessions.** Requests carrying `prompt_cache_key` / `promptCacheKey` (opencode sends the session ID when configured with `setCacheKey: true`) always land on the same subscription. Bindings live for 24h, survive restarts, and rebind preferentially within the same backend when an account cools.
+- **Sticky sessions.** Requests carrying `prompt_cache_key` / `promptCacheKey` (opencode sends the session ID when configured with `setCacheKey: true`) always land on the same subscription, and OpenCode Go receives that same value as its required `x-opencode-session` header. Bindings live for 24h, survive restarts, and rebind preferentially within the same backend when an account cools.
 - **Health pool.** A quota response moves an account to *cooling* until the upstream deadline or a per-backend default. When the catalog scopes a model to a billing surface (Cline's `credits` and `cline-pass`), the cooldown applies only to that surface, so an exhausted credit balance does not take the ClinePass subscription out of rotation. Claude Code adds a per-model dimension: a limit that names one model family cools only that model on that account. Codex uses the later valid deadline from its usage-limit error and `retry-after`, and its account usage poll can extend cooldown to a later exhausted-window reset or readmit an account when upstream reports it allowed. 401s trigger one token refresh + retry, then the account needs re-login. Cooling accounts stay configured and return to rotation automatically.
 - **Codex usage and banked resets.** The admin page shows per-account usage windows and available reset credits. When a live request finds every enabled ChatGPT/Codex account unavailable, underclass can redeem one banked reset, choosing the account that would otherwise wait longest for natural quota recovery. This is enabled by default; set `auto_codex_resets = false` in `~/.config/underclass/config.toml` or `UNDERCLASS_AUTO_CODEX_RESETS=false` to disable automatic redemption. To spend a credit by hand, click **Use reset** on the account row in the admin page or run `underclass reset <email-or-id>` against the running server (it uses the same admin token resolution as `underclass top`; pass `--url` plus `UNDERCLASS_UI_TOKEN` for a remote server). The manual path redeems exactly one credit for that account, refuses when upstream reports the account is not rate limited or a reset already redeemed for this outage has not restored usage, and `--force` overrides both refusals. Claude Code accounts have banked credits too; redeeming one is always manual, because it spends your own subscription.
 - **Token accounting.** Each upstream attempt is recorded in SQLite with its model, account, prompt cache key, and reported input/output tokens. Missing counts remain marked unknown. The admin page shows current-month totals and filters; historical rows remain queryable after account removal.
 - **Stream outcomes and statistics.** A 2xx stream can still fail upstream (e.g. `response.failed` with `server_is_overloaded`, which Codex shows as "Selected model is at capacity"). underclass records how every body ended (`completed`, `failed`, `incomplete`, `truncated`, `upstream_error`, `client_closed`), the sanitized error code, and the attempt duration. It logs `stream.finished` at warn for failures, and records capacity, policy (`cyber_policy`), quota, and saturation events. `underclass stats` and the admin page's Statistics panel report requests, sessions, tokens, peak and mean concurrency, outcomes, and events over up to two years. See [ADR 0021](docs/adr/0021-stream-outcome-and-capacity-statistics.md).
 - **Fail fast.** If every account eligible for the requested model is cooling, the proxy answers `429` + `Retry-After` = earliest reset. No queuing. Eligibility follows the model's quota scope, so saturation is reported only when the surface that model bills against is exhausted.
-- **Flat pool.** Codex, Copilot, Claude Code, and Cline accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to the surface's default backend so new models work without proxy changes.
+- **Flat pool.** Codex, Copilot, Claude Code, Cline, and OpenCode Go accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to the surface's default backend so new models work without proxy changes.
 - **Two surfaces, one pool.** `/v1/responses` and `/v1/chat/completions` speak OpenAI; `/v1/messages` speaks the Anthropic Messages API. A request is only ever routed to a backend that serves its surface, so an Anthropic request never lands on a Codex account and the other way round. See [ADR 0024](docs/adr/0024-surface-partitioned-routing.md).
 - **Claude Code subscriptions.** The Anthropic surface serves the official Claude Code client only: the request must carry `x-app: cli`, a `claude-cli/` user agent, the `claude-code-20250219` beta, and a Claude Code identity block, and underclass forwards the client's headers and body verbatim, swapping only the credential. Anthropic's subscription quota is window-based (5-hour session, 7-day weekly, and a weekly window scoped to one model family), and underclass reads all of them from the account's own usage API, so an exhausted account leaves rotation exactly when its window resets — and a limit that only affects one model family leaves that account serving its other models. The admin page shows the plan, the three windows, and the banked reset credits; **Use reset** redeems exactly one of those credits when you ask for it (never automatically, because a credit is your own subscription). See [ADR 0023](docs/adr/0023-claude-code-subscription-backend.md).
 - **Cline and ClinePass.** Cline models are namespaced `cline/…`: credit-based models keep their upstream ID after the prefix (`cline/anthropic/claude-sonnet-4-6`, `cline/openai/gpt-5.4`), and ClinePass subscription models appear as `cline/cline-pass/…` (`cline/cline-pass/kimi-k3`, `cline/cline-pass/deepseek-v4.1-flash`). Cline only speaks Chat Completions, so `/v1/responses` requests routed to it are translated to `/api/v1/chat/completions` and the reply is translated back to the Responses format. `402 Payment Required` cools only the billing surface the model draws from (`credits` or `cline-pass`), so the other surface on the same key stays routable; `403` (model outside the plan) leaves the account in rotation. See [the Cline backend ADR](docs/adr/fork/cline-backend-responses-translation.md) and [per-surface quota cooling](docs/adr/fork/per-surface-quota-cooling.md).
+- **OpenCode Go.** Go models are namespaced `go/…` (`go/kimi-k3`, `go/gpt-6-luna`) and always travel over Go's OpenAI surface: the model decides the upstream path, so `go/kimi-k3` is posted to `/openai/v1/chat/completions` and `go/gpt-6-luna` to `/openai/v1/responses`, and a `/v1/responses` request for a chat-family model is translated. The proxy's sticky key is sent as `x-opencode-session`, which Go requires on every request. Go meters usage per model, so a `429` cools that model on that account and leaves the rest of its catalog servable. Models Go serves only over its Anthropic or Gemini APIs are not pooled at all — see [the Go backend ADR](docs/adr/fork/opencode-go-backend.md).
 - **Failover only before output.** A stream that fails with an upstream capacity error before any output is retried on another account. Once output starts — or, on the Anthropic surface, once the upstream has accepted the request — upstream errors pass through, so half-finished turns are never re-sent silently.
 
 Design decisions and their trade-offs live in [`docs/adr/`](docs/adr) — start with [ADR 0010](docs/adr/0010-unprefixed-routing-flat-pool.md) for the routing model.
@@ -99,9 +103,10 @@ Optional `~/.config/underclass/config.toml`:
 | `copilot_cooldown_secs` | `1800` | same, for Copilot |
 | `claude_cooldown_secs` | `1800` | same, for Claude Code accounts |
 | `cline_cooldown_secs` | `1800` | same, for Cline (applied on `402`, scoped to the model's billing surface) |
+| `go_cooldown_secs` | `1800` | same, for OpenCode Go (applied on `429`, scoped to the requested model) |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`).
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`. `UNDERCLASS_GO_COOLDOWN_SECS` overrides the Go cooldown. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM`, `UNDERCLASS_GO_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`, and the Go base is `https://opencode.ai/inference/go`). Set `UNDERCLASS_GO_UPSTREAM=https://opencode.ai/inference` to pool a pay-as-you-go Console key instead of a Go subscription; `UNDERCLASS_GO_CONSOLE` points key verification at a different Console.
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -128,7 +133,7 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 
 | route | auth | purpose |
 |---|---|---|
-| `POST /v1/responses` | proxy key | Responses API, streamed through to the pool (translated for Cline) |
+| `POST /v1/responses` | proxy key | Responses API, streamed through to the pool (translated for Cline, and for Go's chat-family models) |
 | `POST /v1/chat/completions` | proxy key | Chat Completions, same |
 | `POST /v1/messages` | proxy key | Anthropic Messages API (Claude Code clients) |
 | `POST /v1/messages/count_tokens` | proxy key | Anthropic token counting, same |
@@ -141,12 +146,12 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `GET /admin/api/monitor` | admin token | compact read-only live monitor snapshot |
 | `GET /admin/api/stats` | admin token | bucketed requests, sessions, tokens, concurrency, outcomes, events (`since`, `bucket`, `by`) |
 | `POST /admin/api/events/import` | admin token | idempotent upstream-event backfill (used by `stats import-codex`) |
-| `POST /admin/api/flows` | admin token | start onboarding (device flow, or Cline API key via `api_key`) |
+| `POST /admin/api/flows` | admin token | start onboarding (device flow, or a Cline / OpenCode Go API key via `api_key`) |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
 | `POST /admin/api/flows/{id}/code` | admin token | finish a Claude Code paste-back flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |
 | `DELETE /admin/api/accounts/{id}` | admin token | remove from pool |
-| `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog (`codex`, `copilot`, `cline`) |
+| `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog (`codex`, `copilot`, `claude`, `cline`, `go`) |
 | `GET /admin/api/client-key` | admin token | retrieve the proxy key for `connect` |
 
 Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log-format json|pretty`) and each request logs the account (label) that served it.
@@ -163,7 +168,7 @@ Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase.
 
 ## Models
 
-The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, and Cline's `cline/` + `cline/cline-pass/` IDs. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
+The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, Cline's `cline/` + `cline/cline-pass/` IDs, and OpenCode Go's `go/` IDs. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
 
 ## Nix flake
 
@@ -292,6 +297,7 @@ src/
   copilot.rs     GitHub Copilot backend (device flow, catalog, headers)
   claude.rs      Claude Code backend (PKCE paste-back flow, Anthropic surface)
   cline.rs       Cline backend (API key, Chat-Completions upstream)
+  opencode_go.rs OpenCode Go backend (API key, per-model OpenAI surface)
   flows.rs       device-code flow registry for onboarding
   tokens.rs      single-flight token refresh
   jwt.rs         token claim parsing (account id extraction)

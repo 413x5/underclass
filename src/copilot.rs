@@ -402,7 +402,7 @@ impl Backend for CopilotBackend {
         self.cooldown_ms
     }
 
-    fn rewrite_url(&self, path: &str, account: &Account) -> String {
+    fn rewrite_url(&self, path: &str, _model: &str, account: &Account) -> String {
         format!("{}{}", self.base_for(account), path)
     }
 
@@ -496,17 +496,17 @@ mod tests {
         let backend = CopilotBackend { cooldown_ms: 1000 };
         let mut account = crate::flows::new_account(BackendId::Copilot, "x".into());
         assert_eq!(
-            backend.rewrite_url("/v1/responses", &account),
+            backend.rewrite_url("/v1/responses", "gpt-5.5", &account),
             "https://api.githubcopilot.com/v1/responses"
         );
         account.enterprise_url = Some("https://company.ghe.com".into());
         assert_eq!(
-            backend.rewrite_url("/v1/chat/completions", &account),
+            backend.rewrite_url("/v1/chat/completions", "gpt-5.5", &account),
             "https://copilot-api.company.ghe.com/v1/chat/completions"
         );
         account.enterprise_url = Some("company.ghe.com".into());
         assert_eq!(
-            backend.rewrite_url("/v1/responses", &account),
+            backend.rewrite_url("/v1/responses", "gpt-5.5", &account),
             "https://copilot-api.company.ghe.com/v1/responses"
         );
     }

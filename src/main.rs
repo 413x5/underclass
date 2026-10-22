@@ -23,7 +23,7 @@ const CLAUDE_USAGE_POLL: std::time::Duration = std::time::Duration::from_secs(12
 #[derive(Parser)]
 #[command(
     name = "underclass",
-    about = "pooled multi-subscription codex/copilot/claude/cline proxy for opencode"
+    about = "pooled multi-subscription codex/copilot/claude/cline/opencode-go proxy for opencode"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -157,6 +157,11 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::Cline,
         underclass::cline::default_catalog(),
     );
+    seed_catalog(
+        &store,
+        models::BackendId::Go,
+        underclass::opencode_go::default_catalog(),
+    );
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -187,6 +192,12 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::Cline,
         Arc::new(underclass::cline::ClineBackend {
             cooldown_ms: cfg.cline_cooldown_ms,
+        }),
+    );
+    backends.insert(
+        models::BackendId::Go,
+        Arc::new(underclass::opencode_go::GoBackend {
+            cooldown_ms: cfg.go_cooldown_ms,
         }),
     );
     // The pool learns which surfaces each backend serves from the backends themselves.
@@ -263,6 +274,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     refresh_copilot_catalogs_on_boot(&state).await;
     refresh_claude_catalogs_on_boot(&state).await;
     refresh_cline_catalogs_on_boot(&state).await;
+    refresh_go_catalogs_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -386,6 +398,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/refresh-cline",
             axum::routing::post(ui::refresh_cline_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh-go",
+            axum::routing::post(ui::refresh_go_catalog),
         )
         .route("/admin/api/client-key", axum::routing::get(ui::client_key))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -530,6 +546,40 @@ async fn refresh_cline_catalogs_on_boot(state: &Arc<proxy::AppState>) {
         };
         match underclass::cline::refresh_catalog(&state.client, &state.store, &state.pool, &key)
             .await
+        {
+            Ok(models) if !models.is_empty() => {
+                underclass::logging::log_catalog_refresh(&account, Some(models.len()), None);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                underclass::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
+            }
+        }
+    }
+}
+
+/// @cc [owner:ghuntley,label:pool] go-catalog-refreshed-on-boot
+/// On boot, every Go account holding a key MUST refresh the Go catalog, and a successful non-empty
+/// response MUST replace the stored and routable catalog so a model Go has published since the
+/// last build becomes routable without a restart.
+async fn refresh_go_catalogs_on_boot(state: &Arc<proxy::AppState>) {
+    let accounts: Vec<models::Account> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|account| account.backend == models::BackendId::Go)
+        .collect();
+    for account in accounts {
+        let Some(key) = account.refresh_token.clone() else {
+            continue;
+        };
+        match underclass::opencode_go::refresh_catalog(
+            &state.client,
+            &state.store,
+            &state.pool,
+            &key,
+        )
+        .await
         {
             Ok(models) if !models.is_empty() => {
                 underclass::logging::log_catalog_refresh(&account, Some(models.len()), None);
@@ -724,7 +774,10 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
 /// identity refresh can replace a placeholder with the profile's email or name. A fallback label
 /// reported as non-generic would stay ambiguous in logs and the UI forever.
 fn is_generic_label(label: &str) -> bool {
-    matches!(label, "chatgpt" | "github" | "claude" | "cline") || label.trim().is_empty()
+    matches!(
+        label,
+        "chatgpt" | "github" | "claude" | "cline" | "opencode-go"
+    ) || label.trim().is_empty()
 }
 
 /// @cc [owner:ghuntley,label:auth] scheduled-rotation-never-bricks-account
@@ -795,6 +848,12 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
                     continue;
                 };
                 underclass::cline::fetch_identity(&state.client, &token).await
+            }
+            models::BackendId::Go => {
+                let Some(token) = account.refresh_token.clone() else {
+                    continue;
+                };
+                underclass::opencode_go::fetch_identity(&state.client, &token).await
             }
         };
         let Some(identity) = identity else {
