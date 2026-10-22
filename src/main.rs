@@ -530,11 +530,29 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
         .filter(|a| a.status != models::AccountStatus::Disabled)
         .collect();
     for account in accounts {
-        let Ok(token) = state.tokens.access_token(&account).await else {
-            continue;
+        let token = match state.tokens.access_token(&account).await {
+            Ok(token) => token,
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e.to_string(),
+                );
+                continue;
+            }
         };
-        let Ok(snapshot) = claude::fetch_usage(&state.client, &account, &token).await else {
-            continue;
+        let snapshot = match claude::fetch_usage(&state.client, &account, &token).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e.to_string(),
+                );
+                continue;
+            }
         };
         state
             .observations
