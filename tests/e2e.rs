@@ -11,7 +11,7 @@ use underclass::flows::FlowRegistry;
 use underclass::models::{
     Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
 };
-use underclass::opencode_go::GoBackend;
+use underclass::opencode_go::OpencodeGoBackend;
 use underclass::pool::PoolCore;
 use underclass::provider::BackendMap;
 use underclass::proxy::AppState;
@@ -39,6 +39,10 @@ struct MockState {
     go_paths: VecDeque<String>,
     /// The `x-opencode-session` value per request, in order.
     go_sessions: VecDeque<String>,
+    /// The `User-Agent` the upstream saw, keyed by bearer and in request order. The mock upstream
+    /// is shared by every test in this binary, so a bare queue would let a parallel test's request
+    /// be mistaken for this one's.
+    user_agents: std::collections::HashMap<String, VecDeque<String>>,
 }
 
 async fn mock_responses(
@@ -54,6 +58,19 @@ async fn mock_responses(
         .unwrap_or("unknown")
         .to_string();
     let wants_stream = body.contains("\"stream\": true") || body.contains("\"stream\":true");
+    state
+        .lock()
+        .unwrap()
+        .user_agents
+        .entry(bearer.clone())
+        .or_default()
+        .push_back(
+            headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        );
     if bearer.starts_with("go-") {
         let session = headers
             .get("x-opencode-session")
@@ -490,10 +507,25 @@ fn scoped_model(id: &str, scope: &str) -> ModelInfo {
 
 /// Go holds a static Console API key in the same column as Cline's.
 fn go_account(id: &str, token: &str) -> Account {
-    let mut a = account(id, BackendId::Go, "unused-access");
+    let mut a = account(id, BackendId::OpencodeGo, "unused-access");
     a.refresh_token = Some(token.to_string());
     a
 }
+
+/// The user agent the upstream saw on request `n` (0-based) for `bearer`.
+fn upstream_user_agent(bearer: &str, n: usize) -> String {
+    mock_upstream()
+        .lock()
+        .unwrap()
+        .user_agents
+        .get(bearer)
+        .and_then(|values| values.get(n))
+        .cloned()
+        .unwrap_or_else(|| panic!("no upstream request recorded for {bearer} at index {n}"))
+}
+
+/// A Cline model id the mock serves over Chat Completions.
+const CLINE_TEST_MODEL: &str = "cline/anthropic/claude-sonnet-4-6";
 
 fn cline_account(id: &str, token: &str) -> Account {
     // Cline holds a static API key; `TokenManager` hands the refresh token to the backend.
@@ -508,7 +540,7 @@ fn openai_surfaces() -> std::collections::HashMap<BackendId, Vec<Surface>> {
         (BackendId::Copilot, vec![Surface::OpenAI]),
         (BackendId::Claude, vec![Surface::Anthropic]),
         (BackendId::Cline, vec![Surface::OpenAI]),
-        (BackendId::Go, vec![Surface::OpenAI]),
+        (BackendId::OpencodeGo, vec![Surface::OpenAI]),
     ])
 }
 
@@ -530,9 +562,10 @@ fn model(id: &str) -> ModelInfo {
     }
 }
 
-async fn spawn_app(
+async fn spawn_app_with_user_agent(
     store: Arc<Store>,
     cooldown_ms: i64,
+    user_agent: Option<&str>,
 ) -> (
     String,
     Arc<Mutex<VecDeque<RequestLogEntry>>>,
@@ -544,8 +577,20 @@ async fn spawn_app(
     backends.insert(BackendId::Codex, Arc::new(CodexBackend { cooldown_ms }));
     backends.insert(BackendId::Copilot, Arc::new(CopilotBackend { cooldown_ms }));
     backends.insert(BackendId::Claude, Arc::new(ClaudeBackend { cooldown_ms }));
-    backends.insert(BackendId::Cline, Arc::new(ClineBackend { cooldown_ms }));
-    backends.insert(BackendId::Go, Arc::new(GoBackend { cooldown_ms }));
+    backends.insert(
+        BackendId::Cline,
+        Arc::new(ClineBackend {
+            cooldown_ms,
+            user_agent: user_agent.map(str::to_string),
+        }),
+    );
+    backends.insert(
+        BackendId::OpencodeGo,
+        Arc::new(OpencodeGoBackend {
+            cooldown_ms,
+            user_agent: user_agent.map(str::to_string),
+        }),
+    );
     let core = PoolCore::new(&store, backend_surfaces(&backends));
     let pool = Arc::new(Mutex::new(core));
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -567,6 +612,8 @@ async fn spawn_app(
         stream_usage_unsupported: Mutex::new(Default::default()),
         observations: Mutex::new(Default::default()),
         stats_retention_days: 730,
+        cline_user_agent: user_agent.map(str::to_string),
+        opencode_go_user_agent: user_agent.map(str::to_string),
     });
 
     let v1 = axum::Router::new()
@@ -651,6 +698,19 @@ async fn spawn_app(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), logs, pool)
+}
+
+/// The common case: no configured user-agent override, so the fork's backends resolve one from
+/// the client request. Tests that exercise the override call `spawn_app_with_user_agent`.
+async fn spawn_app(
+    store: Arc<Store>,
+    cooldown_ms: i64,
+) -> (
+    String,
+    Arc<Mutex<VecDeque<RequestLogEntry>>>,
+    Arc<Mutex<PoolCore>>,
+) {
+    spawn_app_with_user_agent(store, cooldown_ms, None).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1994,7 +2054,7 @@ async fn e2e_stream_usage_retry_resends_the_prepared_body() {
     let mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
     let credits = scoped_model("cline/anthropic/claude-sonnet-4-6-retry-e2e", "credits");
-    store.set_catalog(BackendId::Cline, &[credits.clone()]);
+    store.set_catalog(BackendId::Cline, std::slice::from_ref(&credits));
     store.upsert_account(&cline_account("cline-retry", "key-reject-usage"));
     let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
 
@@ -2045,7 +2105,7 @@ async fn e2e_translated_overload_replay_is_a_responses_stream() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
     let credits = scoped_model("cline/anthropic/claude-sonnet-4-6-ovl-e2e", "credits");
-    store.set_catalog(BackendId::Cline, &[credits.clone()]);
+    store.set_catalog(BackendId::Cline, std::slice::from_ref(&credits));
     store.upsert_account(&cline_account("cline-ovl", "key-chat-ovl-1"));
     let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
 
@@ -2095,7 +2155,7 @@ async fn e2e_translated_overload_replay_is_a_responses_stream() {
     );
 }
 
-/// @cc [owner:ghuntley,label:proxy] go-routes-by-model-family
+/// @cc [owner:ghuntley,label:proxy] opencode-go-routes-by-model-family
 /// A Go request MUST reach the upstream path its model's family requires, whatever path the
 /// client used, and MUST carry a session id. The client's own path is not the family: a
 /// Chat-Completions model asked for over `/v1/responses` must still go upstream as chat (and be
@@ -2105,10 +2165,10 @@ async fn e2e_translated_overload_replay_is_a_responses_stream() {
 async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
     let mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let chat_model = model("go/kimi-k3");
-    let responses_model = model("go/gpt-6-luna");
+    let chat_model = model("opencode_go/kimi-k3");
+    let responses_model = model("opencode_go/gpt-6-luna");
     store.set_catalog(
-        BackendId::Go,
+        BackendId::OpencodeGo,
         &[chat_model.clone(), responses_model.clone()],
     );
     store.upsert_account(&go_account("go-routing", "go-acc-1"));
@@ -2172,7 +2232,7 @@ async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
         "the Responses-family model must go upstream as responses: {paths:?}"
     );
     assert!(
-        attempted.iter().all(|m| !m.starts_with("go/")),
+        attempted.iter().all(|m| !m.starts_with("opencode_go/")),
         "the pool namespace must not reach Go: {attempted:?}"
     );
     assert!(
@@ -2185,16 +2245,16 @@ async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
     );
 }
 
-/// @cc [owner:ghuntley,label:pool] go-session-pinned-to-one-account
+/// @cc [owner:ghuntley,label:pool] opencode-go-session-pinned-to-one-account
 /// A session that starts on a Go account MUST keep reaching that same account while it is eligible,
 /// so Go's prompt cache stays warm, and MUST only move when that account can no longer serve. A
 /// second account in the pool MUST NOT attract the session, however idle it is.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_go_session_stays_pinned_to_its_account() {
-    let mock = mock_upstream();
+    mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let model = model("go/kimi-k3");
-    store.set_catalog(BackendId::Go, &[model.clone()]);
+    let model = model("opencode_go/kimi-k3");
+    store.set_catalog(BackendId::OpencodeGo, std::slice::from_ref(&model));
     // Two accounts so a non-sticky choice has somewhere else to go.
     store.upsert_account(&go_account("go-pin-a", "go-pin-a"));
     store.upsert_account(&go_account("go-pin-b", "go-pin-b"));
@@ -2270,7 +2330,7 @@ async fn e2e_go_session_stays_pinned_to_its_account() {
     );
 }
 
-/// @cc [owner:ghuntley,label:pool] go-unavailable-endpoint-leaves-the-account-serving
+/// @cc [owner:ghuntley,label:pool] opencode-go-unavailable-endpoint-leaves-the-account-serving
 /// A Go `402` naming an unavailable endpoint MUST cool only the requested model: Go answers a model
 /// it cannot currently serve that way, and cooling the account would take every other model out of
 /// rotation for one model's outage.
@@ -2278,10 +2338,10 @@ async fn e2e_go_session_stays_pinned_to_its_account() {
 async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let unavailable = model("go/kimi-k3");
-    let other = model("go/glm-5.3");
-    store.set_catalog(BackendId::Go, &[unavailable.clone(), other.clone()]);
-    store.upsert_account(&go_account("go-endpoint", "go-endpoint-1"));
+    let unavailable = model("opencode_go/kimi-k3");
+    let other = model("opencode_go/glm-5.3");
+    store.set_catalog(BackendId::OpencodeGo, &[unavailable.clone(), other.clone()]);
+    store.upsert_account(&go_account("opencode-go-endpoint", "go-endpoint-1"));
     let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
     let http = reqwest::Client::new();
 
@@ -2302,7 +2362,7 @@ async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
     );
     response.text().await.unwrap();
 
-    let account = store.get_account("go-endpoint").unwrap();
+    let account = store.get_account("opencode-go-endpoint").unwrap();
     assert_eq!(
         account.status,
         AccountStatus::Healthy,
@@ -2311,7 +2371,7 @@ async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
     assert!(
         pool.lock()
             .unwrap()
-            .model_cooling_until("go-endpoint", "go/kimi-k3")
+            .model_cooling_until("opencode-go-endpoint", "opencode_go/kimi-k3")
             .is_some_and(|until| until > now_ms()),
         "the unavailable model must cool"
     );
@@ -2336,10 +2396,10 @@ async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
 async fn e2e_go_rate_limit_cools_only_the_model() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let limited = model("go/kimi-k3");
-    let other = model("go/glm-5.3");
-    store.set_catalog(BackendId::Go, &[limited.clone(), other.clone()]);
-    store.upsert_account(&go_account("go-quota", "go-quota-1"));
+    let limited = model("opencode_go/kimi-k3");
+    let other = model("opencode_go/glm-5.3");
+    store.set_catalog(BackendId::OpencodeGo, &[limited.clone(), other.clone()]);
+    store.upsert_account(&go_account("opencode-go-quota", "go-quota-1"));
     let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
     let http = reqwest::Client::new();
 
@@ -2353,7 +2413,7 @@ async fn e2e_go_rate_limit_cools_only_the_model() {
     assert_eq!(response.status(), 429, "the upstream limit passes through");
     response.text().await.unwrap();
 
-    let account = store.get_account("go-quota").unwrap();
+    let account = store.get_account("opencode-go-quota").unwrap();
     assert_eq!(
         account.status,
         AccountStatus::Healthy,
@@ -2367,7 +2427,7 @@ async fn e2e_go_rate_limit_cools_only_the_model() {
     let cooling = pool
         .lock()
         .unwrap()
-        .model_cooling_until("go-quota", "go/kimi-k3");
+        .model_cooling_until("opencode-go-quota", "opencode_go/kimi-k3");
     assert!(
         cooling.is_some_and(|until| until > now_ms()),
         "the limited model must cool"
@@ -2385,5 +2445,119 @@ async fn e2e_go_rate_limit_cools_only_the_model() {
         response.status(),
         200,
         "another model on the same account must still serve"
+    );
+}
+
+/// The fork's own backends present the client's `User-Agent` upstream, so an operator running a
+/// real client is not identified as a proxy; the upstream backends keep their own identity, which
+/// this test pins so a future change cannot quietly widen the rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fork_backends_forward_the_client_user_agent() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Cline, &[model(CLINE_TEST_MODEL)]);
+    store.set_catalog(BackendId::OpencodeGo, &[model("opencode_go/kimi-k3")]);
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&cline_account("cline-ua", "cline-token-ua"));
+    store.upsert_account(&go_account("go-ua", "go-token-ua"));
+    store.upsert_account(&codex_account("codex-ua", "tok-ua"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    let post = |path: &str, model: &str| {
+        let http = http.clone();
+        let url = format!("{base}{path}");
+        let model = model.to_string();
+        async move {
+            http.post(url)
+                .header("Authorization", concat!("Bear", "er ", "test-key"))
+                .header("User-Agent", "opencode/1.17.0")
+                .json(&serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let cline = post("/v1/chat/completions", CLINE_TEST_MODEL).await;
+    assert_eq!(cline.status(), 200);
+    assert_eq!(
+        upstream_user_agent("cline-token-ua", 0),
+        "opencode/1.17.0",
+        "Cline must present the client's own user agent"
+    );
+
+    let go = post("/v1/chat/completions", "opencode_go/kimi-k3").await;
+    assert_eq!(go.status(), 200);
+    assert_eq!(
+        upstream_user_agent("go-token-ua", 0),
+        "opencode/1.17.0",
+        "OpenCode Go must present the client's own user agent"
+    );
+
+    let codex = post("/v1/responses", "gpt-5.5").await;
+    assert_eq!(codex.status(), 200);
+    assert_eq!(
+        upstream_user_agent("tok-ua", 0),
+        concat!(
+            "opencode/",
+            env!("CARGO_PKG_VERSION"),
+            " (underclass-pool-proxy)"
+        ),
+        "Codex keeps upstream's user agent: the client's must not leak in"
+    );
+}
+
+/// Without a client user agent the fork's backends present the built-in default, so the change
+/// above does not leave the header empty when a client sends none.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fork_backends_default_user_agent_when_the_client_sends_none() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::OpencodeGo, &[model("opencode_go/kimi-k3")]);
+    store.upsert_account(&go_account("go-ua-default", "go-token-default"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": "opencode_go/kimi-k3", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        upstream_user_agent("go-token-default", 0),
+        underclass::user_agent::DEFAULT,
+        "with no client value the backend must still identify itself"
+    );
+}
+
+/// The operator's configured override wins over both the client's user agent and the default, and
+/// applies to the fork's backends only.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_configured_user_agent_overrides_the_client_value() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::OpencodeGo, &[model("opencode_go/kimi-k3")]);
+    store.upsert_account(&go_account("go-ua-override", "go-token-override"));
+    let (base, _logs, _pool) =
+        spawn_app_with_user_agent(store.clone(), 400, Some("underclass-fleet/2")).await;
+    let http = reqwest::Client::new();
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .header("User-Agent", "opencode/1.17.0")
+        .json(&serde_json::json!({"model": "opencode_go/kimi-k3", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        upstream_user_agent("go-token-override", 0),
+        "underclass-fleet/2",
+        "the configured override must beat the client's own value"
     );
 }

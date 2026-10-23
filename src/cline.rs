@@ -8,11 +8,6 @@ use std::sync::Mutex;
 
 pub const DEFAULT_API_BASE: &str = "https://api.cline.bot";
 pub const MODEL_PREFIX: &str = "cline/";
-pub const USER_AGENT: &str = concat!(
-    "opencode/",
-    env!("CARGO_PKG_VERSION"),
-    " (underclass-pool-proxy)"
-);
 
 pub fn api_base() -> String {
     std::env::var("UNDERCLASS_CLINE_UPSTREAM")
@@ -169,11 +164,18 @@ pub fn parse_user(body: &Value) -> Option<String> {
     field("email").or_else(|| field("name"))
 }
 
-async fn fetch_user(client: &Client, api_key: &str) -> Result<Value, AuthError> {
+async fn fetch_user(
+    client: &Client,
+    api_key: &str,
+    user_agent: Option<&str>,
+) -> Result<Value, AuthError> {
     let resp = client
         .get(format!("{}/api/v1/users/me", api_base()))
         .bearer_auth(api_key)
-        .header(http::header::USER_AGENT, USER_AGENT)
+        .header(
+            http::header::USER_AGENT,
+            crate::user_agent::resolve(None, user_agent),
+        )
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -182,18 +184,29 @@ async fn fetch_user(client: &Client, api_key: &str) -> Result<Value, AuthError> 
     Ok(resp.json().await?)
 }
 
-pub async fn fetch_identity(client: &Client, api_key: &str) -> Option<String> {
-    fetch_user(client, api_key)
+pub async fn fetch_identity(
+    client: &Client,
+    api_key: &str,
+    user_agent: Option<&str>,
+) -> Option<String> {
+    fetch_user(client, api_key, user_agent)
         .await
         .ok()
         .and_then(|body| parse_user(&body))
 }
 
-async fn fetch_listing(client: &Client, api_key: &str) -> Result<Vec<ModelInfo>, AuthError> {
+async fn fetch_listing(
+    client: &Client,
+    api_key: &str,
+    user_agent: Option<&str>,
+) -> Result<Vec<ModelInfo>, AuthError> {
     let resp = client
         .get(format!("{}/api/v1/models", api_base()))
         .bearer_auth(api_key)
-        .header(http::header::USER_AGENT, USER_AGENT)
+        .header(
+            http::header::USER_AGENT,
+            crate::user_agent::resolve(None, user_agent),
+        )
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -239,8 +252,9 @@ pub async fn refresh_catalog(
     store: &Store,
     pool: &Mutex<crate::pool::PoolCore>,
     api_key: &str,
+    user_agent: Option<&str>,
 ) -> Result<Vec<ModelInfo>, AuthError> {
-    let listing = fetch_listing(client, api_key).await?;
+    let listing = fetch_listing(client, api_key, user_agent).await?;
     if listing.is_empty() {
         return Ok(Vec::new());
     }
@@ -270,12 +284,13 @@ pub async fn add_account(
     api_key: &str,
     label: Option<String>,
     replace_account: Option<String>,
+    user_agent: Option<&str>,
 ) -> Result<Account, AuthError> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
         return Err(AuthError::Failed);
     }
-    let identity = fetch_user(client, api_key)
+    let identity = fetch_user(client, api_key, user_agent)
         .await
         .map_err(|error| match error {
             // A key the upstream rejected must never reach the store. A transient 429/5xx says nothing
@@ -335,6 +350,10 @@ fn resolve_relabel(existing: &str, label: Option<String>, identity: Option<Strin
 
 pub struct ClineBackend {
     pub cooldown_ms: i64,
+    /// The operator's configured outbound user agent, if any. Cline is a fork-local backend, so
+    /// the identity its upstream sees is underclass's to choose: this wins over the client's own
+    /// `User-Agent`, which wins over the built-in default. See `crate::user_agent`.
+    pub user_agent: Option<String>,
 }
 
 impl Backend for ClineBackend {
@@ -447,22 +466,29 @@ impl Backend for ClineBackend {
         true
     }
 
+    /// Outbound Cline requests present the operator's configured user agent when one is set,
+    /// otherwise the client's own `User-Agent` when the client sent one, otherwise
+    /// `crate::user_agent::DEFAULT`; the rule is `user-agent-precedence`.
     fn inject_headers(
         &self,
         _account: &Account,
         token: &str,
         _sticky: Option<&str>,
         _body: &Value,
-        _client: &HeaderMap,
+        client: &HeaderMap,
         headers: &mut HeaderMap,
     ) {
         headers.insert(
             http::header::AUTHORIZATION,
             http::HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
         );
-        if let Ok(value) = http::HeaderValue::from_str(USER_AGENT) {
-            headers.insert(http::header::USER_AGENT, value);
-        }
+        headers.insert(
+            http::header::USER_AGENT,
+            crate::user_agent::resolve(
+                crate::user_agent::client_value(client),
+                self.user_agent.as_deref(),
+            ),
+        );
         headers.insert("X-Title", http::HeaderValue::from_static("underclass"));
     }
 }
@@ -471,6 +497,21 @@ impl Backend for ClineBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (key, value) in pairs {
+            map.insert(
+                http::HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    fn account() -> Account {
+        crate::flows::new_account(BackendId::Cline, "cline-test".into())
+    }
 
     #[test]
     fn catalog_prefixes_ids_and_skips_batch_entries() {
@@ -675,7 +716,10 @@ mod tests {
 
     #[test]
     fn rewrites_completion_paths_and_strips_namespace() {
-        let backend = ClineBackend { cooldown_ms: 1000 };
+        let backend = ClineBackend {
+            cooldown_ms: 1000,
+            user_agent: None,
+        };
         let account = crate::flows::new_account(BackendId::Cline, "x".into());
         let url = backend.rewrite_url(
             "/v1/responses",
@@ -702,6 +746,7 @@ mod tests {
     fn payment_required_cools_and_forbidden_stays_healthy() {
         let backend = ClineBackend {
             cooldown_ms: 30_000,
+            user_agent: None,
         };
         let headers = HeaderMap::new();
         assert!(matches!(
@@ -720,7 +765,10 @@ mod tests {
 
     #[test]
     fn stream_usage_is_requested_once() {
-        let backend = ClineBackend { cooldown_ms: 1000 };
+        let backend = ClineBackend {
+            cooldown_ms: 1000,
+            user_agent: None,
+        };
         let mut body = json!({"stream": true});
         assert!(backend.auto_stream_usage("/v1/responses", &mut body));
         assert_eq!(body["stream_options"], json!({"include_usage": true}));
@@ -803,5 +851,48 @@ mod tests {
             "me@example.com"
         );
         assert_eq!(resolve_relabel("   ", None, None), "cline");
+    }
+
+    /// Cline is a fork-local backend, so it presents the client's own user agent, falls back to
+    /// the built-in default when the client sent none, and lets the operator override both.
+    #[test]
+    fn the_client_user_agent_is_forwarded_and_the_override_wins() {
+        let backend = ClineBackend {
+            cooldown_ms: 1_000,
+            user_agent: None,
+        };
+        let client = headers(&[("user-agent", "opencode/1.17.0")]);
+
+        let mut map = HeaderMap::new();
+        backend.inject_headers(&account(), "sk-cline", None, &json!({}), &client, &mut map);
+        assert_eq!(
+            map.get(http::header::USER_AGENT).unwrap(),
+            "opencode/1.17.0"
+        );
+
+        let mut map = HeaderMap::new();
+        backend.inject_headers(
+            &account(),
+            "sk-cline",
+            None,
+            &json!({}),
+            &HeaderMap::new(),
+            &mut map,
+        );
+        assert_eq!(
+            map.get(http::header::USER_AGENT).unwrap(),
+            crate::user_agent::DEFAULT
+        );
+
+        let configured = ClineBackend {
+            cooldown_ms: 1_000,
+            user_agent: Some("underclass-fleet/2".into()),
+        };
+        let mut map = HeaderMap::new();
+        configured.inject_headers(&account(), "sk-cline", None, &json!({}), &client, &mut map);
+        assert_eq!(
+            map.get(http::header::USER_AGENT).unwrap(),
+            "underclass-fleet/2"
+        );
     }
 }

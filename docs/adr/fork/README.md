@@ -41,5 +41,9 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   of the Go backend record: the module's table, not Go's listing, decides what is routable, and a
   `402` naming an unavailable endpoint cools the model rather than the account.
 - [OpenCode Go Backend over Go's OpenAI Surface](opencode-go-backend.md) — fifth backend (API-key
-  onboarding, `go/` model namespace, sticky session header) and the per-model wire-family choice
-  that keeps Go's Anthropic- and Gemini-only models out of the catalog.
+  onboarding, `opencode_go/` model namespace, sticky session header) and the per-model wire-family
+  choice that keeps Go's Anthropic- and Gemini-only models out of the catalog.
+- [Client User Agent Forwarding and the `opencode_go` Backend Name](client-user-agent-forwarding.md)
+  — Cline and OpenCode Go present the client's own user agent (with an operator override, and the
+  upstream backends' behaviour untouched), and Go is renamed `opencode_go` in every identifier
+  underclass owns, including the model namespace.

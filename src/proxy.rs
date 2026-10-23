@@ -67,6 +67,12 @@ pub struct AppState {
     pub observations: Mutex<std::collections::HashMap<String, Value>>,
     /// How long usage rows, upstream events, and daily rollups are kept.
     pub stats_retention_days: i64,
+    /// The outbound user agent for the fork's own backends (Cline and OpenCode Go), used for the
+    /// catalog, identity, and onboarding calls those modules make themselves. `None` leaves each
+    /// backend its built-in default. Inference requests resolve their own value from the client
+    /// request and the backend's configured override.
+    pub cline_user_agent: Option<String>,
+    pub opencode_go_user_agent: Option<String>,
 }
 
 /// @cc [owner:ghuntley,label:accounting] stream-finish-recorded
@@ -1756,7 +1762,10 @@ mod tests {
 
     #[test]
     fn cline_declares_the_data_envelope() {
-        let backend = crate::cline::ClineBackend { cooldown_ms: 1000 };
+        let backend = crate::cline::ClineBackend {
+            cooldown_ms: 1000,
+            user_agent: None,
+        };
         use crate::provider::Backend;
         assert_eq!(backend.response_envelope(), Some("data"));
     }

@@ -397,7 +397,7 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
     for backend in [
         crate::models::BackendId::Copilot,
         crate::models::BackendId::Cline,
-        crate::models::BackendId::Go,
+        crate::models::BackendId::OpencodeGo,
     ] {
         for m in underclass_store.catalog(backend) {
             if seen.insert(m.id.clone()) {

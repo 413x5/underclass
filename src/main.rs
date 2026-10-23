@@ -159,7 +159,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     );
     seed_catalog(
         &store,
-        models::BackendId::Go,
+        models::BackendId::OpencodeGo,
         underclass::opencode_go::default_catalog(),
     );
 
@@ -192,12 +192,14 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::Cline,
         Arc::new(underclass::cline::ClineBackend {
             cooldown_ms: cfg.cline_cooldown_ms,
+            user_agent: cfg.cline_user_agent.clone(),
         }),
     );
     backends.insert(
-        models::BackendId::Go,
-        Arc::new(underclass::opencode_go::GoBackend {
-            cooldown_ms: cfg.go_cooldown_ms,
+        models::BackendId::OpencodeGo,
+        Arc::new(underclass::opencode_go::OpencodeGoBackend {
+            cooldown_ms: cfg.opencode_go_cooldown_ms,
+            user_agent: cfg.opencode_go_user_agent.clone(),
         }),
     );
     // The pool learns which surfaces each backend serves from the backends themselves.
@@ -229,6 +231,8 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         stream_usage_unsupported: Mutex::new(Default::default()),
         observations: Mutex::new(Default::default()),
         stats_retention_days: cfg.stats_retention_days,
+        cline_user_agent: cfg.cline_user_agent.clone(),
+        opencode_go_user_agent: cfg.opencode_go_user_agent.clone(),
     });
 
     {
@@ -274,7 +278,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     refresh_copilot_catalogs_on_boot(&state).await;
     refresh_claude_catalogs_on_boot(&state).await;
     refresh_cline_catalogs_on_boot(&state).await;
-    refresh_go_catalogs_on_boot(&state).await;
+    refresh_opencode_go_catalogs_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -400,8 +404,8 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             axum::routing::post(ui::refresh_cline_catalog),
         )
         .route(
-            "/admin/api/catalog/refresh-go",
-            axum::routing::post(ui::refresh_go_catalog),
+            "/admin/api/catalog/refresh-opencode-go",
+            axum::routing::post(ui::refresh_opencode_go_catalog),
         )
         .route("/admin/api/client-key", axum::routing::get(ui::client_key))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -544,8 +548,14 @@ async fn refresh_cline_catalogs_on_boot(state: &Arc<proxy::AppState>) {
         let Some(key) = account.refresh_token.clone() else {
             continue;
         };
-        match underclass::cline::refresh_catalog(&state.client, &state.store, &state.pool, &key)
-            .await
+        match underclass::cline::refresh_catalog(
+            &state.client,
+            &state.store,
+            &state.pool,
+            &key,
+            state.cline_user_agent.as_deref(),
+        )
+        .await
         {
             Ok(models) if !models.is_empty() => {
                 underclass::logging::log_catalog_refresh(&account, Some(models.len()), None);
@@ -558,16 +568,16 @@ async fn refresh_cline_catalogs_on_boot(state: &Arc<proxy::AppState>) {
     }
 }
 
-/// @cc [owner:ghuntley,label:pool] go-catalog-refreshed-on-boot
+/// @cc [owner:ghuntley,label:pool] opencode-go-catalog-refreshed-on-boot
 /// On boot, every Go account holding a key MUST refresh the Go catalog, and a successful non-empty
 /// response MUST replace the stored and routable catalog so a model Go has published since the
 /// last build becomes routable without a restart.
-async fn refresh_go_catalogs_on_boot(state: &Arc<proxy::AppState>) {
+async fn refresh_opencode_go_catalogs_on_boot(state: &Arc<proxy::AppState>) {
     let accounts: Vec<models::Account> = state
         .store
         .list_accounts()
         .into_iter()
-        .filter(|account| account.backend == models::BackendId::Go)
+        .filter(|account| account.backend == models::BackendId::OpencodeGo)
         .collect();
     for account in accounts {
         let Some(key) = account.refresh_token.clone() else {
@@ -578,6 +588,7 @@ async fn refresh_go_catalogs_on_boot(state: &Arc<proxy::AppState>) {
             &state.store,
             &state.pool,
             &key,
+            state.opencode_go_user_agent.as_deref(),
         )
         .await
         {
@@ -847,13 +858,23 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
                 let Some(token) = account.refresh_token.clone() else {
                     continue;
                 };
-                underclass::cline::fetch_identity(&state.client, &token).await
+                underclass::cline::fetch_identity(
+                    &state.client,
+                    &token,
+                    state.cline_user_agent.as_deref(),
+                )
+                .await
             }
-            models::BackendId::Go => {
+            models::BackendId::OpencodeGo => {
                 let Some(token) = account.refresh_token.clone() else {
                     continue;
                 };
-                underclass::opencode_go::fetch_identity(&state.client, &token).await
+                underclass::opencode_go::fetch_identity(
+                    &state.client,
+                    &token,
+                    state.opencode_go_user_agent.as_deref(),
+                )
+                .await
             }
         };
         let Some(identity) = identity else {
