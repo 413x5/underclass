@@ -2,8 +2,11 @@
 
 ## Status
 
-Accepted. This is a fork-local ADR: it deliberately carries no upstream number so a future
-`git pull` from `main` cannot collide with a newer upstream `NNNN` record. See [README](README.md).
+Accepted, and corrected in part by
+[Go Serving Set and Failure Scopes](go-serving-set-and-failure-scopes.md), which replaces this
+record's routable-set and `402` decisions and leaves its body unedited. This is a fork-local ADR: it
+deliberately carries no upstream number so a future `git pull` from `main` cannot collide with a
+newer upstream `NNNN` record. See [README](README.md).
 
 ## Context
 

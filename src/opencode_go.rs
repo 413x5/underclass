@@ -126,15 +126,10 @@ const WIRE_FAMILY: &[(&str, Option<Wire>)] = &[
     ("kimi-k2.7-code", Some(Wire::Chat)),
     ("kimi-k3", Some(Wire::Chat)),
     ("longcat-2.0", Some(Wire::Chat)),
-    ("longcat-2.5-preview-free", Some(Wire::Chat)),
     ("mimo-v2.5", Some(Wire::Chat)),
-    ("mimo-v2.5-pro", Some(Wire::Chat)),
     ("mimo-v2.6-flash", Some(Wire::Chat)),
     ("mimo-v2.6-pro", Some(Wire::Chat)),
-    ("minimax-m3.1-flash-free", Some(Wire::Chat)),
-    ("space-bunny", Some(Wire::Chat)),
     ("step-5-preview", Some(Wire::Chat)),
-    ("step-5-preview-free", Some(Wire::Chat)),
     // Anthropic Messages or Gemini only, so no OpenAI path serves them. They are listed rather
     // than omitted so a reader can tell "Go does not offer this over OpenAI" from "this build has
     // never heard of it" - the catalog and the refresh treat both as unroutable.
@@ -199,21 +194,7 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
         ),
         ("kimi-k3", "Kimi K3", 1_048_576, 1_048_576, 131_072),
         ("longcat-2.0", "LongCat-2.0", 1_000_000, 1_000_000, 131_072),
-        (
-            "longcat-2.5-preview-free",
-            "LongCat 2.5 Preview Free",
-            1_000_000,
-            1_000_000,
-            131_072,
-        ),
         ("mimo-v2.5", "MiMo-V2.5", 1_000_000, 1_000_000, 128_000),
-        (
-            "mimo-v2.5-pro",
-            "MiMo-V2.5 Pro",
-            1_048_576,
-            1_048_576,
-            128_000,
-        ),
         (
             "mimo-v2.6-flash",
             "MiMo-V2.6-Flash",
@@ -229,13 +210,6 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
             131_072,
         ),
         (
-            "minimax-m3.1-flash-free",
-            "MiniMax M3.1 Flash Free",
-            1_000_000,
-            1_000_000,
-            512_000,
-        ),
-        (
             "muse-spark-1.2-contributor",
             "Muse Spark 1.2 Contributor",
             1_048_576,
@@ -249,17 +223,9 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
             1_048_576,
             131_072,
         ),
-        ("space-bunny", "Space Bunny", 1_048_576, 524_288, 524_288),
         (
             "step-5-preview",
             "Step 5 Preview",
-            1_000_000,
-            1_000_000,
-            65_536,
-        ),
-        (
-            "step-5-preview-free",
-            "Step 5 Preview Free",
             1_000_000,
             1_000_000,
             65_536,
@@ -292,9 +258,9 @@ pub fn default_catalog() -> Vec<ModelInfo> {
 /// @cc [owner:ghuntley,label:pool] go-catalog-servable-only
 /// `parse_models_response` MUST return one namespaced entry per listed id this backend can route,
 /// MUST drop every other listed id - including one this build has never classified, which has no
-/// known upstream path - and MUST NOT panic on a malformed body or entry. An id this build can
-/// route but records no limits for MUST still be returned, with zero limits, so a model Go
-/// publishes becomes routable before this module records its window.
+/// known upstream path - and MUST NOT panic on a malformed body or entry. It exists to describe a
+/// listing, not to change the catalog: the routable set is this module's table, because an
+/// unclassified id has no upstream path to route to.
 pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
     let Some(items) = body.get("data").and_then(Value::as_array) else {
         return Vec::new();
@@ -348,9 +314,12 @@ fn carry_forward_limits(fetched: &mut [ModelInfo], previous: &[ModelInfo]) {
 }
 
 /// @cc [owner:ghuntley,label:pool] go-refresh-never-shrinks
-/// `refresh_catalog` MUST leave the stored and routable catalog untouched and return `Ok` with an
-/// empty catalog when the listing yields no routable entry, so a silent upstream change cannot
-/// empty the pool; and MUST persist the merged catalog when it does.
+/// `refresh_catalog` MUST publish exactly `default_catalog()` - this build's servable set - with the
+/// stored name and limits carried forward, and MUST persist it to the store and the pool. Go's
+/// listing MUST NOT add or remove an entry: it is not an authority in either direction, omitting ids
+/// Go still serves and carrying ids Go refuses for this plan. A refresh that reaches upstream
+/// therefore leaves the routable set unchanged, which is what makes a transient listing failure
+/// harmless.
 pub async fn refresh_catalog(
     client: &Client,
     store: &Store,
@@ -366,12 +335,10 @@ pub async fn refresh_catalog(
     if !resp.status().is_success() {
         return Err(AuthError::Status(resp.status().as_u16()));
     }
-    let body: Value = resp.json().await?;
-    let listing = parse_models_response(&body);
-    if listing.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut models = listing;
+    // The body is read so a malformed answer is an error rather than a silent no-op, but the
+    // listing itself decides nothing: see the contract above.
+    let _body: Value = resp.json().await?;
+    let mut models = default_catalog();
     carry_forward_limits(&mut models, &store.catalog(BackendId::Go));
     store.set_catalog(BackendId::Go, &models);
     pool.lock().unwrap().set_catalog(BackendId::Go, &models);
@@ -515,6 +482,15 @@ pub struct GoBackend {
     pub cooldown_ms: i64,
 }
 
+/// @cc [owner:ghuntley,label:pool] go-unavailable-endpoint-is-a-model-fault
+/// `names_an_unavailable_endpoint` MUST report true only for a body that says the endpoint is
+/// unavailable, so a `402` from one model is cooled as that model's fault rather than as the whole
+/// workspace's. A body without that phrase MUST report false.
+pub fn names_an_unavailable_endpoint(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("endpoint is unavailable")
+}
+
 impl Backend for GoBackend {
     fn id(&self) -> BackendId {
         BackendId::Go
@@ -637,21 +613,26 @@ impl Backend for GoBackend {
     /// @cc [owner:ghuntley,label:pool] go-model-quota-scope
     /// Go meters usage per model, so `classify` MUST report `ModelQuotaExhausted` for a `429` - the
     /// cooldown applies to the requested model and the account keeps serving the rest of the
-    /// catalog - and MUST use the upstream `Retry-After` deadline when one is present. `402` MUST
-    /// report `QuotaExhausted` (the workspace balance is empty), and `403` MUST stay `Transient`:
-    /// Go answers it for a per-resource refusal, including a workspace with no Go subscription,
-    /// and a key that is merely unsubscribed must not be ejected as if it were rejected.
-    fn classify(&self, status: u16, _body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
+    /// catalog - and MUST use the upstream `Retry-After` deadline when one is present. A `402`
+    /// naming an unavailable endpoint MUST also report `ModelQuotaExhausted`: Go answers a model it
+    /// currently cannot serve that way, and cooling the whole account for one model's outage takes
+    /// every other model out of rotation with it. Any other `402` MUST stay `QuotaExhausted` (the
+    /// workspace balance is empty). `403` MUST stay `Transient`: Go answers it for a per-resource
+    /// refusal, including a workspace with no Go subscription, and a key that is merely unsubscribed
+    /// must not be ejected as if it were rejected.
+    fn classify(&self, status: u16, body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
+        let until = || {
+            crate::health::parse_retry_after_headers(headers, now_ms)
+                .unwrap_or_else(|| now_ms.saturating_add(self.cooldown_ms))
+        };
         if status == 429 {
-            return Outcome::ModelQuotaExhausted {
-                until_ms: crate::health::parse_retry_after_headers(headers, now_ms)
-                    .unwrap_or_else(|| now_ms.saturating_add(self.cooldown_ms)),
-            };
+            return Outcome::ModelQuotaExhausted { until_ms: until() };
         }
         if status == 402 {
-            return Outcome::QuotaExhausted {
-                until_ms: crate::health::parse_retry_after_headers(headers, now_ms)
-                    .unwrap_or_else(|| now_ms.saturating_add(self.cooldown_ms)),
+            return if names_an_unavailable_endpoint(body) {
+                Outcome::ModelQuotaExhausted { until_ms: until() }
+            } else {
+                Outcome::QuotaExhausted { until_ms: until() }
             };
         }
         if status == 403 {
@@ -721,6 +702,20 @@ mod tests {
         assert!(!ids.contains(&"go/claude-haiku-5-5"));
         assert!(!ids.contains(&"go/minimax-m3"));
         assert!(!ids.contains(&"go/gemini-4-argon-contributor"));
+        // Ids Go advertises but does not serve for this plan are not offered either: routing a
+        // client to one produces a refusal the client can only retry.
+        for dead in [
+            "go/mimo-v2.5-pro",
+            "go/space-bunny",
+            "go/step-5-preview-free",
+            "go/longcat-2.5-preview-free",
+            "go/minimax-m3.1-flash-free",
+        ] {
+            assert!(
+                !ids.contains(&dead),
+                "{dead} is not servable and must not be offered"
+            );
+        }
         assert!(ids.iter().all(|id| id.starts_with(MODEL_PREFIX)));
     }
 
@@ -998,6 +993,27 @@ mod tests {
         ));
         assert!(matches!(
             backend.classify(402, "{}", &HeaderMap::new(), 1_000),
+            Outcome::QuotaExhausted { until_ms: 31_000 }
+        ));
+        // Go reports a model it currently cannot serve as 402 "Endpoint is unavailable". That is
+        // one model's outage, not the workspace's: cooling the account takes every other model out
+        // of rotation with it.
+        assert!(matches!(
+            backend.classify(
+                402,
+                r#"{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}"#,
+                &HeaderMap::new(),
+                1_000
+            ),
+            Outcome::ModelQuotaExhausted { until_ms: 31_000 }
+        ));
+        assert!(matches!(
+            backend.classify(
+                402,
+                r#"{"error":{"type":"server_error","message":"Upstream request failed: Insufficient account funds"}}"#,
+                &HeaderMap::new(),
+                1_000
+            ),
             Outcome::QuotaExhausted { until_ms: 31_000 }
         ));
         // The free tier's client gate, a model outside the plan, and a workspace with no Go
