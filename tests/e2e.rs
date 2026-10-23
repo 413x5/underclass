@@ -152,6 +152,20 @@ async fn mock_responses(
         )
             .into_response();
     }
+    // Go reports a model it cannot currently serve as 402 "Endpoint is unavailable", which is one
+    // model's outage and must not take the account out of rotation for every other model.
+    if bearer.starts_with("go-endpoint-") && requested_model == "kimi-k3" {
+        return (
+            axum::http::StatusCode::PAYMENT_REQUIRED,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            r#"{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}"#
+                .to_string(),
+        )
+            .into_response();
+    }
     // Go meters usage per model and reports the exhaustion as a rate limit on that model.
     if bearer.starts_with("go-quota-") && requested_model == "kimi-k3" {
         return (
@@ -2253,6 +2267,66 @@ async fn e2e_go_session_stays_pinned_to_its_account() {
     assert!(
         after.binding("go-session-other").is_some(),
         "the second conversation gets its own binding"
+    );
+}
+
+/// @cc [owner:ghuntley,label:pool] go-unavailable-endpoint-leaves-the-account-serving
+/// A Go `402` naming an unavailable endpoint MUST cool only the requested model: Go answers a model
+/// it cannot currently serve that way, and cooling the account would take every other model out of
+/// rotation for one model's outage.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let unavailable = model("go/kimi-k3");
+    let other = model("go/glm-5.3");
+    store.set_catalog(BackendId::Go, &[unavailable.clone(), other.clone()]);
+    store.upsert_account(&go_account("go-endpoint", "go-endpoint-1"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
+    let http = reqwest::Client::new();
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": unavailable.id, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    // With one Go account, the model-scoped cooldown leaves no eligible account for that model, so
+    // the pool fails fast. What matters is that the ACCOUNT is untouched: the next assertion shows
+    // its other models still serve.
+    assert_eq!(
+        response.status(),
+        429,
+        "the pool fails fast for the cooled model"
+    );
+    response.text().await.unwrap();
+
+    let account = store.get_account("go-endpoint").unwrap();
+    assert_eq!(
+        account.status,
+        AccountStatus::Healthy,
+        "one model's outage must not cool the whole account"
+    );
+    assert!(
+        pool.lock()
+            .unwrap()
+            .model_cooling_until("go-endpoint", "go/kimi-k3")
+            .is_some_and(|until| until > now_ms()),
+        "the unavailable model must cool"
+    );
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": other.id, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "another model on the same account must still serve"
     );
 }
 
