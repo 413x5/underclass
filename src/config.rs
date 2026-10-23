@@ -10,8 +10,13 @@ pub struct FileConfig {
     pub copilot_cooldown_secs: Option<u64>,
     pub cline_cooldown_secs: Option<u64>,
     pub cline_cooldown_ms: Option<u64>,
-    pub go_cooldown_secs: Option<u64>,
-    pub go_cooldown_ms: Option<u64>,
+    pub opencode_go_cooldown_secs: Option<u64>,
+    pub opencode_go_cooldown_ms: Option<u64>,
+    /// Outbound user agent for the fork's own backends. `user_agent` is the shared default and
+    /// the per-backend keys override it.
+    pub user_agent: Option<String>,
+    pub cline_user_agent: Option<String>,
+    pub opencode_go_user_agent: Option<String>,
     pub claude_cooldown_secs: Option<u64>,
     pub claude_cooldown_ms: Option<u64>,
     pub copilot_cooldown_ms: Option<u64>,
@@ -29,8 +34,12 @@ pub struct Config {
     pub auto_codex_resets: bool,
     pub copilot_cooldown_ms: i64,
     pub cline_cooldown_ms: i64,
-    pub go_cooldown_ms: i64,
+    pub opencode_go_cooldown_ms: i64,
     pub claude_cooldown_ms: i64,
+    /// The outbound user agent for Cline and OpenCode Go, already resolved through the per-backend
+    /// keys. `None` leaves each backend its default and forwards a client's own value.
+    pub cline_user_agent: Option<String>,
+    pub opencode_go_user_agent: Option<String>,
     pub stats_retention_days: i64,
     pub data_dir: PathBuf,
     #[allow(dead_code)]
@@ -39,6 +48,17 @@ pub struct Config {
 
 pub const DEFAULT_COOLDOWN_MS: i64 = 30 * 60 * 1000;
 pub const SYSTEM_MONITOR_SOCKET: &str = "/run/underclass/monitor.sock";
+
+/// The first configured value among `candidates`, in precedence order. A blank or whitespace-only
+/// value is not a configured identity: an environment variable exported empty (a service unit that
+/// sets `UNDERCLASS_USER_AGENT=`) MUST NOT shadow a value set in the config file, and the resolver
+/// would ignore the blank value anyway.
+fn first_configured(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+}
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -101,12 +121,12 @@ impl Config {
             .or(file_cfg.cline_cooldown_ms)
             .or(file_cfg.cline_cooldown_secs.map(|s| s * 1000))
             .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
-        let go_cooldown_ms = std::env::var("UNDERCLASS_GO_COOLDOWN_SECS")
+        let opencode_go_cooldown_ms = std::env::var("UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .map(|value| value.saturating_mul(1000))
-            .or(file_cfg.go_cooldown_ms)
-            .or(file_cfg.go_cooldown_secs.map(|s| s * 1000))
+            .or(file_cfg.opencode_go_cooldown_ms)
+            .or(file_cfg.opencode_go_cooldown_secs.map(|s| s * 1000))
             .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
         let claude_cooldown_ms = file_cfg
             .claude_cooldown_ms
@@ -126,6 +146,23 @@ impl Config {
             .unwrap_or(crate::stats::DEFAULT_RETENTION_DAYS)
             .max(1);
 
+        // `user_agent` is the shared default, so a per-backend key that is absent falls back to it
+        // rather than to the built-in default.
+        let shared_user_agent = first_configured([
+            std::env::var("UNDERCLASS_USER_AGENT").ok(),
+            file_cfg.user_agent,
+        ]);
+        let cline_user_agent = first_configured([
+            std::env::var("UNDERCLASS_CLINE_USER_AGENT").ok(),
+            file_cfg.cline_user_agent,
+            shared_user_agent.clone(),
+        ]);
+        let opencode_go_user_agent = first_configured([
+            std::env::var("UNDERCLASS_OPENCODE_GO_USER_AGENT").ok(),
+            file_cfg.opencode_go_user_agent,
+            shared_user_agent.clone(),
+        ]);
+
         Self {
             bind,
             proxy_key,
@@ -134,8 +171,10 @@ impl Config {
             auto_codex_resets,
             copilot_cooldown_ms,
             cline_cooldown_ms,
-            go_cooldown_ms,
+            opencode_go_cooldown_ms,
             claude_cooldown_ms,
+            cline_user_agent,
+            opencode_go_user_agent,
             stats_retention_days,
             data_dir,
             config_dir,
@@ -154,5 +193,31 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.data_dir.join("monitor.sock"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An environment variable that is exported but empty must not shadow a configured identity:
+    /// a service unit that sets `UNDERCLASS_USER_AGENT=` would otherwise silently discard the
+    /// `user_agent` in the file.
+    #[test]
+    fn a_blank_user_agent_does_not_shadow_a_configured_one() {
+        assert_eq!(
+            first_configured([Some(String::new()), Some("from-file/1".into())]).as_deref(),
+            Some("from-file/1")
+        );
+        assert_eq!(
+            first_configured([Some("   ".into()), Some("from-file/1".into())]).as_deref(),
+            Some("from-file/1")
+        );
+        // A real value still wins over the file, in precedence order.
+        assert_eq!(
+            first_configured([Some("from-env/2".into()), Some("from-file/1".into())]).as_deref(),
+            Some("from-env/2")
+        );
+        assert_eq!(first_configured([Some(String::new()), None]), None);
     }
 }

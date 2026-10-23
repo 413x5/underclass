@@ -8,7 +8,7 @@ pub enum BackendId {
     Copilot,
     Claude,
     Cline,
-    Go,
+    OpencodeGo,
 }
 
 impl BackendId {
@@ -18,7 +18,7 @@ impl BackendId {
             BackendId::Copilot => "copilot",
             BackendId::Claude => "claude",
             BackendId::Cline => "cline",
-            BackendId::Go => "go",
+            BackendId::OpencodeGo => "opencode_go",
         }
     }
 
@@ -28,21 +28,21 @@ impl BackendId {
             "copilot" => Some(BackendId::Copilot),
             "claude" => Some(BackendId::Claude),
             "cline" => Some(BackendId::Cline),
-            "go" => Some(BackendId::Go),
+            "opencode_go" => Some(BackendId::OpencodeGo),
             _ => None,
         }
     }
 
-    /// Every backend, in the order routing falls back through. `Go` is last: an unknown model
-    /// keeps landing on the first backend that serves the requested surface, so adding a backend
-    /// cannot move an existing model's fallback.
+    /// Every backend, in the order routing falls back through. `OpencodeGo` is last: an unknown
+    /// model keeps landing on the first backend that serves the requested surface, so adding a
+    /// backend cannot move an existing model's fallback.
     pub fn all() -> [BackendId; 5] {
         [
             BackendId::Codex,
             BackendId::Copilot,
             BackendId::Claude,
             BackendId::Cline,
-            BackendId::Go,
+            BackendId::OpencodeGo,
         ]
     }
 }
