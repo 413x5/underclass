@@ -45,6 +45,20 @@ struct MockState {
     user_agents: std::collections::HashMap<String, VecDeque<String>>,
 }
 
+/// The ClinePass models this mock's recommended-models feed publishes. The real feed is public and
+/// process-global, so the mock serves a fixed set rather than per-test state a parallel test could
+/// observe mid-assertion.
+const MOCK_CLINE_PASS_FEED: &[&str] = &[
+    "cline-pass/deepseek-v4.1-flash-1017",
+    "cline-pass/feed-only-model-e2e",
+];
+
+/// The free models this mock's feed publishes, which the listing omits just like the pass models.
+const MOCK_CLINE_FREE_FEED: &[&str] = &["reflection/beam-free"];
+
+/// The credit-based ids this mock's `/api/v1/models` listing carries.
+const MOCK_CLINE_LISTING: &[&str] = &["anthropic/claude-sonnet-4-6", "openai/gpt-5.4:batch"];
+
 async fn mock_responses(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: axum::http::HeaderMap,
@@ -58,6 +72,48 @@ async fn mock_responses(
         .unwrap_or("unknown")
         .to_string();
     let wants_stream = body.contains("\"stream\": true") || body.contains("\"stream\":true");
+    // Cline's recommended-models feed: the only published list of ClinePass models. Served without
+    // a credential, the way the real endpoint is.
+    if uri.path().ends_with("/ai/cline/recommended-models") {
+        let pass = MOCK_CLINE_PASS_FEED
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "name": id, "description": "", "tags": []}))
+            .collect::<Vec<_>>();
+        let free = MOCK_CLINE_FREE_FEED
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "name": "Beam", "description": "", "tags": []}))
+            .collect::<Vec<_>>();
+        return (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            serde_json::json!({
+                "recommended": [{"id": "anthropic/claude-sonnet-5.5"}],
+                "free": free,
+                "clinePass": pass,
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+    // Cline's public `/api/v1/models` listing, which carries no `cline-pass/` id at all.
+    if uri.path().ends_with("/api/v1/models") {
+        let data = MOCK_CLINE_LISTING
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "object": "model"}))
+            .collect::<Vec<_>>();
+        return (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            serde_json::json!({"object": "list", "data": data}).to_string(),
+        )
+            .into_response();
+    }
     state
         .lock()
         .unwrap()
@@ -660,6 +716,10 @@ async fn spawn_app_with_user_agent(
         .route(
             "/admin/api/catalog/{backend}",
             axum::routing::get(underclass::ui::get_catalog).put(underclass::ui::put_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh-cline",
+            axum::routing::post(underclass::ui::refresh_cline_catalog),
         )
         .route(
             "/admin/api/monitor",
@@ -2559,5 +2619,77 @@ async fn e2e_configured_user_agent_overrides_the_client_value() {
         upstream_user_agent("go-token-override", 0),
         "underclass-fleet/2",
         "the configured override must beat the client's own value"
+    );
+}
+
+/// The regression this closes: `GET /api/v1/models` lists neither Cline's ClinePass models nor its
+/// free models, so a catalog built from that listing alone answered "no subscriptions are configured
+/// for this model" for a model the subscription serves. A refresh must publish both from the public
+/// recommended-models feed, and the pool must then route them.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_catalog_refresh_publishes_feed_only_cline_models() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.upsert_account(&cline_account("cline-feed", "key-cline-feed"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    let response = http
+        .post(format!("{base}/admin/api/catalog/refresh-cline"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["refreshed_accounts"], 1,
+        "the refresh must succeed: {body}"
+    );
+
+    let catalog = store.catalog(BackendId::Cline);
+    let find = |id: &str| catalog.iter().find(|m| m.id == id);
+    // The listing's own entries survive the refresh.
+    assert!(find("cline/anthropic/claude-sonnet-4-6").is_some());
+    assert!(
+        !find("cline/openai/gpt-5.4:batch").is_some(),
+        "batch-only ids stay out of the catalog"
+    );
+    // The model this issue is about is routable, and bills against the subscription.
+    let pass = find("cline/cline-pass/deepseek-v4.1-flash-1017")
+        .expect("a feed-only ClinePass model must be published");
+    assert_eq!(pass.scope, "cline-pass");
+    let free =
+        find("cline/reflection/beam-free").expect("a feed-only free model must be published");
+    assert_eq!(
+        free.scope, "credits",
+        "a free model rides usage billing, not the subscription"
+    );
+    // A comment in the feed is not a model.
+    assert!(find("cline/cline-cloud/deepseek-v4.1-flash").is_none());
+
+    // And the published model is actually routable, not just listed.
+    let model = "cline/cline-pass/deepseek-v4.1-flash-1017";
+    assert!(
+        pool.lock().unwrap().serves(BackendId::Cline, model),
+        "the pool must serve a model the catalog publishes"
+    );
+    let served = http
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        served.status(),
+        200,
+        "a published subscription model must serve: {}",
+        served.text().await.unwrap_or_default()
+    );
+    let attempted = mock.lock().unwrap().models.clone();
+    assert!(
+        attempted.contains(&"cline-pass/deepseek-v4.1-flash-1017".to_string()),
+        "upstream must see the id without the pool namespace, got: {attempted:?}"
     );
 }
