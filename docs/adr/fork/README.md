@@ -51,3 +51,8 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   — Cline and OpenCode Go present the client's own user agent (with an operator override, and the
   upstream backends' behaviour untouched), and Go is renamed `opencode_go` in every identifier
   underclass owns, including the model namespace.
+
+- [Graceful Shutdown Drain on SIGTERM](graceful-shutdown-drain.md) — `underclass serve` reacts to
+  SIGINT/SIGTERM, drains in-flight requests for a bounded 5 seconds via `with_graceful_shutdown`
+  on both listeners, and lets `UsageFinish` record aborted streams as `client_closed` instead of
+  dropping them.
