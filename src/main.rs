@@ -112,6 +112,14 @@ fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::Error>
 /// The proxy API key and admin UI token MUST be minted on first run, persisted to the store, and
 /// reused on every subsequent start; an explicitly configured key/token MUST take precedence over
 /// minted ones. Key and token values MUST NOT be written to diagnostics.
+
+/// @cc [owner:ghuntley,label:proxy] graceful-shutdown-drain
+/// `async_serve` MUST install a signal handler for SIGINT and SIGTERM (and ctrl-c on non-Unix)
+/// and pass it to both the HTTP and monitor listeners via `with_graceful_shutdown`, so a restart
+/// drains in-flight requests instead of dropping them. The drain MUST be bounded to 5 seconds;
+/// after that window the remaining requests are aborted. `UsageFinish` MUST still run for any
+/// aborted stream, recording it as `client_closed` rather than vanishing from accounting.
+/// Out of scope: retrying started streams (ADR 0004).
 async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::Config::load();
     let store = Arc::new(store::Store::open(&cfg.db_path())?);
