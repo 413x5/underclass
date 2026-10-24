@@ -536,6 +536,7 @@ fn account(id: &str, backend: BackendId, token: &str) -> Account {
         enterprise_url: None,
         plan: None,
         scope_cooling: Default::default(),
+        disabled_reason: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
         created_at: ts,
