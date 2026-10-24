@@ -327,6 +327,53 @@ fn test_rotation_due_respects_interval_after_each_rotation(tc: TestCase) {
     assert!(!rotation_due(&copilot, now + ROTATION_INTERVAL_MS));
 }
 
+/// Applying whatever the plan gate asks for settles the account: a second pass asks for nothing.
+/// A free plan always ends disabled, a paid plan never ends up disabled by the gate, and an
+/// operator's disable of a paid account is never reverted.
+#[hegel::test]
+fn test_plan_gate_settles_and_respects_operator_disables(tc: TestCase) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use underclass::models::{FREE_PLAN_REASON, PlanGate};
+    let plans = ["free", "FREE", "plus", "pro", "promax", "business"];
+    let plan = plans[tc.draw(gs::integers::<usize>().max_value(plans.len() - 1))];
+    let statuses = [
+        AccountStatus::Healthy,
+        AccountStatus::Cooling,
+        AccountStatus::AuthError,
+        AccountStatus::Disabled,
+    ];
+    let mut a = account("acct", BackendId::Codex);
+    a.status = statuses[tc.draw(gs::integers::<usize>().max_value(3))];
+    a.disabled_reason = tc
+        .draw(gs::booleans())
+        .then(|| FREE_PLAN_REASON.to_string());
+    let claims = format!(r#"{{"chatgpt_plan_type":"{plan}"}}"#);
+    a.access_token = Some(format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims)));
+    let operator_disabled = a.status == AccountStatus::Disabled && a.disabled_reason.is_none();
+
+    match a.plan_gate() {
+        Some(PlanGate::Disable) => {
+            a.status = AccountStatus::Disabled;
+            a.disabled_reason = Some(FREE_PLAN_REASON.into());
+        }
+        Some(PlanGate::Enable) => {
+            a.status = AccountStatus::Healthy;
+            a.disabled_reason = None;
+        }
+        None => {}
+    }
+    assert_eq!(a.plan_gate(), None);
+    let free = plan.eq_ignore_ascii_case("free");
+    if free {
+        assert_eq!(a.status, AccountStatus::Disabled);
+    } else if operator_disabled {
+        assert_eq!(a.status, AccountStatus::Disabled);
+        assert_eq!(a.disabled_reason, None);
+    } else {
+        assert!(a.status != AccountStatus::Disabled || a.disabled_reason.is_none());
+    }
+}
+
 fn account(id: &str, backend: BackendId) -> Account {
     Account {
         id: id.into(),
@@ -340,6 +387,7 @@ fn account(id: &str, backend: BackendId) -> Account {
         residency: None,
         enterprise_url: None,
         plan: None,
+        disabled_reason: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
         scope_cooling: Default::default(),

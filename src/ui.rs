@@ -729,6 +729,8 @@ fn set_status(state: &Arc<AppState>, id: &str, status: AccountStatus, reset_at: 
     let mut pool = state.pool.lock().unwrap();
     pool.set_status(id, status, reset_at);
     state.store.update_account_status(id, status, reset_at);
+    // An operator decision supersedes any automatic disable, so the plan gate leaves it alone.
+    state.store.set_disabled_reason(id, None);
     StatusCode::NO_CONTENT.into_response()
 }
 

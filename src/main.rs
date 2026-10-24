@@ -246,6 +246,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
                     pool::BINDING_TTL_MS,
                     pool::DEFAULT_BINDING_CAP,
                 );
+                enforce_plan_gates(&state);
                 state.pool.lock().unwrap().sync_from_store(&store);
             }
         });
@@ -656,10 +657,6 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
     for account in accounts {
         let token = match state.tokens.access_token(&account).await {
             Ok(token) => token,
-            // A deferred refresh is skipped quietly and retried next tick. A definitive rejection
-            // (`invalid_grant` after a revoked grant) can only be fixed by re-login, so it marks
-            // the account auth_error - matching the request path - instead of re-posting the same
-            // dead token every 120 seconds forever.
             Err(crate::tokens::TokenError::RefreshFailed(e)) => {
                 tracing::warn!(error = %e, "claude.poll.refresh_rejected");
                 logging::log_account_state(
@@ -668,10 +665,6 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
                     "auth_error",
                     "refresh rejected",
                 );
-                // Transition and persist under one lock, as every other health writer does, and
-                // only from a selectable status: the account list predates the awaits above, so an
-                // operator may have disabled this account meanwhile, and overwriting `Disabled`
-                // with `AuthError` would both resurrect it and hide the UI's Enable button.
                 let mut pool = state.pool.lock().unwrap();
                 let selectable = pool.account(&account.id).is_some_and(|live| {
                     matches!(
@@ -689,10 +682,36 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
                 }
                 continue;
             }
-            Err(_) => continue,
+            Err(crate::tokens::TokenError::Transient(e)) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e,
+                );
+                continue;
+            }
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e.to_string(),
+                );
+                continue;
+            }
         };
-        let Ok(snapshot) = claude::fetch_usage(&state.client, &account, &token).await else {
-            continue;
+        let snapshot = match claude::fetch_usage(&state.client, &account, &token).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e.to_string(),
+                );
+                continue;
+            }
         };
         // The fetches above awaited, so the operator may have deleted the account meanwhile.
         // Re-inserting its observation here would leave an entry nothing ever reaps.
@@ -784,6 +803,64 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
 /// `is_generic_label` MUST report true for every backend's seeded fallback label, so the boot
 /// identity refresh can replace a placeholder with the profile's email or name. A fallback label
 /// reported as non-generic would stay ambiguous in logs and the UI forever.
+
+/// Disables accounts on a free plan and re-enables those it disabled once they are upgraded.
+///
+/// Codex plans come from the stored access token's claims, which the daily scheduled rotation
+/// keeps current even while the account is disabled.
+fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
+    for account in state.store.list_accounts() {
+        let (status, reason, event) = match account.plan_gate() {
+            Some(models::PlanGate::Disable) => (
+                models::AccountStatus::Disabled,
+                Some(models::FREE_PLAN_REASON),
+                "disabled",
+            ),
+            Some(models::PlanGate::Enable) => (models::AccountStatus::Healthy, None, "enabled"),
+            None => continue,
+        };
+        let plan = account.plan_label().unwrap_or_default();
+        // Re-check the live status under the pool lock before writing, so an operator disable
+        // (or any concurrent health transition) that landed in the window between the snapshot
+        // above and this write is not clobbered. The gate only acts on accounts whose live
+        // status still matches what the snapshot decided from.
+        let mut pool = state.pool.lock().unwrap();
+        let live_selectable = pool.account(&account.id).is_some_and(|live| {
+            match status {
+                models::AccountStatus::Disabled => {
+                    // Adopt an operator-disabled free account: a Disabled account with no reason
+                    // (operator disable) is still eligible for adoption into the free-plan gate.
+                    matches!(
+                        live.status,
+                        models::AccountStatus::Healthy
+                            | models::AccountStatus::Cooling
+                            | models::AccountStatus::Disabled
+                    ) && (live.status != models::AccountStatus::Disabled
+                        || live.disabled_reason.is_none())
+                }
+                models::AccountStatus::Healthy => {
+                    live.status == models::AccountStatus::Disabled
+                        && live.disabled_reason.as_deref() == Some(models::FREE_PLAN_REASON)
+                }
+                _ => false,
+            }
+        });
+        if !live_selectable {
+            continue;
+        }
+        state.store.update_account_status(&account.id, status, 0);
+        state.store.set_disabled_reason(&account.id, reason);
+        pool.set_status(&account.id, status, 0);
+        drop(pool);
+        logging::log_account_state(
+            &account.id,
+            Some(&account.label),
+            event,
+            &format!("subscription plan is {plan}"),
+        );
+    }
+}
+
 fn is_generic_label(label: &str) -> bool {
     matches!(
         label,

@@ -138,6 +138,7 @@ fn schema() -> &'static str {
         enterprise_url TEXT,
         plan TEXT,
         status TEXT NOT NULL DEFAULT 'healthy',
+        disabled_reason TEXT,
         reset_at INTEGER NOT NULL DEFAULT 0,
         scope_cooling TEXT NOT NULL DEFAULT '{}',
         created_at INTEGER NOT NULL,
@@ -242,6 +243,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE accounts ADD COLUMN scope_cooling TEXT NOT NULL DEFAULT '{}'",
             [],
         )?;
+    }
+    if !columns.iter().any(|c| c == "disabled_reason") {
+        conn.execute("ALTER TABLE accounts ADD COLUMN disabled_reason TEXT", [])?;
     }
     let mut stmt = conn.prepare("PRAGMA table_info(catalog)")?;
     let columns: Vec<String> = stmt
@@ -765,7 +769,7 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at, plan, scope_cooling
+                        token_refreshed_at, plan, scope_cooling, disabled_reason
                  FROM accounts ORDER BY created_at",
             )
             .expect("prepare accounts");
@@ -781,7 +785,7 @@ impl Store {
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
                         residency, enterprise_url, status, reset_at, created_at, updated_at,
-                        token_refreshed_at, plan, scope_cooling
+                        token_refreshed_at, plan, scope_cooling, disabled_reason
                  FROM accounts WHERE id = ?1",
             )
             .expect("prepare account");
@@ -795,12 +799,12 @@ impl Store {
         conn.execute(
             "INSERT INTO accounts (id, backend, label, refresh_token, access_token, expires_at, account_id,
                                    residency, enterprise_url, plan, status, reset_at, created_at, updated_at,
-                                   token_refreshed_at, scope_cooling)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                                   token_refreshed_at, scope_cooling, disabled_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
              ON CONFLICT(id) DO UPDATE SET
                 label=?3, refresh_token=?4, access_token=?5, expires_at=?6, account_id=?7,
                 residency=?8, enterprise_url=?9, plan=?10, status=?11, reset_at=?12, updated_at=?14,
-                token_refreshed_at=?15, scope_cooling=?16",
+                token_refreshed_at=?15, scope_cooling=?16, disabled_reason=?17",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -818,6 +822,7 @@ impl Store {
                 a.updated_at,
                 a.token_refreshed_at,
                 encode_scopes(&a.scope_cooling),
+                a.disabled_reason,
             ],
         )
         .expect("upsert account");
@@ -937,6 +942,17 @@ impl Store {
             ],
         )
         .expect("update account health");
+    }
+
+    /// Sets or clears why underclass disabled the account; `None` marks the status as the
+    /// operator's, which the plan gate never reverts.
+    pub fn set_disabled_reason(&self, id: &str, reason: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET disabled_reason = ?2 WHERE id = ?1",
+            params![id, reason],
+        )
+        .expect("update disabled reason");
     }
 
     /// @cc [owner:ghuntley,label:persistence] token-rotation-write-through
@@ -1095,6 +1111,7 @@ pub fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     let status: String = row.get(9)?;
     let plan: Option<String> = row.get(14)?;
     let scopes: String = row.get(15)?;
+    let disabled_reason: Option<String> = row.get(16)?;
     Ok(Account {
         id: row.get(0)?,
         backend: BackendId::parse(&backend).unwrap_or(BackendId::Codex),
@@ -1107,6 +1124,7 @@ pub fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         residency: row.get(7)?,
         enterprise_url: row.get(8)?,
         plan,
+        disabled_reason,
         status: parse_status(&status),
         reset_at: row.get(10)?,
         scope_cooling: decode_scopes(&scopes),

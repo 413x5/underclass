@@ -218,9 +218,12 @@ impl UsageSnapshot {
 /// Parses the account usage payload.
 pub fn parse_usage(body: &Value, now_ms: i64) -> UsageSnapshot {
     let window = |payload: Option<&Value>| UsageWindow {
+        // The usage API reports percent (`26.0`); everything downstream, like the unified
+        // rate-limit headers, works in fractions of the window.
         utilization: payload
             .and_then(|w| w.get("utilization"))
-            .and_then(Value::as_f64),
+            .and_then(Value::as_f64)
+            .map(|percent| percent / 100.0),
         resets_at_ms: payload
             .and_then(|w| w.get("resets_at"))
             .and_then(Value::as_str)
@@ -803,19 +806,24 @@ pub async fn exchange(
     Ok(resp.json().await?)
 }
 
+/// @cc [owner:ghuntley,label:auth] claude-refresh-keeps-granted-scopes
+/// `refresh_body` MUST NOT request a `scope`: the refresh grant keeps the scopes granted at
+/// login, and the token endpoint rejects the login scope list (`org:create_api_key` is never
+/// granted) with `invalid_scope`, which left accounts with an expired token.
+fn refresh_body(refresh_token: &str) -> Value {
+    json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    })
+}
+
 /// Refreshes an access token. The refresh token rotates, so the caller must persist the new one.
 pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenResponse, AuthError> {
     let resp = client
         .post(TOKEN_URL)
         .header("content-type", "application/json")
-        // No `scope`: the official client omits it on refresh, and RFC 6749 section 6 forbids
-        // asking for a scope that was not granted (the server never grants `org:create_api_key`),
-        // so sending the authorize-time set would be answered with `invalid_scope`.
-        .json(&json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-        }))
+        .json(&refresh_body(refresh_token))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -1462,9 +1470,9 @@ mod tests {
     fn account_usage_payload_is_parsed() {
         let body = json!({
             "plan_type": "max",
-            "five_hour": {"utilization": 0.07, "resets_at": "2026-10-20T13:00:00Z"},
-            "seven_day": {"utilization": 0.05, "resets_at": "2026-10-27T00:00:00Z"},
-            "seven_day_fable": {"utilization": 1.0, "resets_at": "2026-10-27T00:00:00Z"},
+            "five_hour": {"utilization": 7.0, "resets_at": "2026-10-20T13:00:00Z"},
+            "seven_day": {"utilization": 5.0, "resets_at": "2026-10-27T00:00:00Z"},
+            "seven_day_fable": {"utilization": 100.0, "resets_at": "2026-10-27T00:00:00Z"},
             "rate_limit_reset_credits": {"available_count": 2}
         });
         let snapshot = parse_usage(&body, 1_000);
@@ -1483,8 +1491,8 @@ mod tests {
     #[test]
     fn account_wide_windows_cool_until_the_last_one_resets() {
         let body = json!({
-            "five_hour": {"utilization": 1.0, "resets_at": "2026-10-20T13:00:00Z"},
-            "seven_day": {"utilization": 1.0, "resets_at": "2026-10-27T00:00:00Z"},
+            "five_hour": {"utilization": 100.0, "resets_at": "2026-10-20T13:00:00Z"},
+            "seven_day": {"utilization": 100.0, "resets_at": "2026-10-27T00:00:00Z"},
         });
         let snapshot = parse_usage(&body, 1_000);
         // The account serves only once both spent windows have reset, so the deadline is the
@@ -1494,6 +1502,25 @@ mod tests {
             Some(1_793_059_200_000),
             "the weekly reset outlasts the session window"
         );
+    }
+
+    #[test]
+    fn partly_used_windows_are_not_exhausted() {
+        // Observed in production: 2% and 26% used must not cool the account until the weekly reset.
+        let body = json!({
+            "five_hour": {"utilization": 2.0, "resets_at": "2026-10-22T06:59:59Z"},
+            "seven_day": {"utilization": 26.0, "resets_at": "2026-10-23T03:59:59Z"},
+        });
+        let snapshot = parse_usage(&body, 1_000);
+        assert_eq!(snapshot.seven_day.utilization, Some(0.26));
+        assert_eq!(snapshot.exhausted_reset_ms(), None);
+    }
+
+    #[test]
+    fn refresh_requests_no_scope() {
+        let body = refresh_body("refresh");
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert!(body.get("scope").is_none());
     }
 
     #[test]
