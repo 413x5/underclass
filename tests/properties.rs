@@ -1033,6 +1033,109 @@ fn test_cline_catalog_always_contains_subscription_models(tc: TestCase) {
     assert_eq!(actual, sorted, "merged catalog must stay sorted");
 }
 
+/// The feed is the only source of ClinePass and free models, so merging a listing with it must be
+/// monotonic: no listed model is dropped, every feed model survives, no id is duplicated, and every
+/// feed row keeps the billing scope its id derives (a free model must not inherit `cline-pass`).
+#[hegel::test]
+fn test_cline_feed_merge_is_monotonic_and_scoped(tc: TestCase) {
+    let listing_ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(15));
+    let feed_body = underclass::models::ModelInfo {
+        id: String::new(),
+        name: String::new(),
+        context: 0,
+        input: 0,
+        output: 0,
+        scope: String::new(),
+    };
+    let feed_ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(15));
+    let listing = listing_ids
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .map(|id| underclass::models::ModelInfo {
+            id: underclass::cline::pool_model_id(&id),
+            name: id,
+            ..feed_body.clone()
+        })
+        .collect::<Vec<_>>();
+    let feed = feed_ids
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .map(|id| underclass::models::ModelInfo {
+            scope: underclass::cline::quota_scope(&id).to_string(),
+            id: underclass::cline::pool_model_id(&id),
+            name: id,
+            ..feed_body.clone()
+        })
+        .collect::<Vec<_>>();
+
+    let merged = underclass::cline::merge_discovered_models(listing.clone(), &feed);
+
+    for listed in &listing {
+        assert!(
+            merged.iter().any(|model| model.id == listed.id),
+            "merging the feed dropped listed model {}",
+            listed.id
+        );
+    }
+    for discovered in &feed {
+        assert!(
+            merged.iter().any(|model| model.id == discovered.id),
+            "merging dropped feed model {}",
+            discovered.id
+        );
+        let row = merged
+            .iter()
+            .find(|model| model.id == discovered.id)
+            .unwrap();
+        assert_eq!(
+            row.scope,
+            underclass::cline::quota_scope(underclass::cline::upstream_model_id(&row.id)),
+            "{} must bill against the surface its id names",
+            row.id
+        );
+    }
+    let ids = merged
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let mut unique = ids.clone();
+    unique.dedup();
+    assert_eq!(ids, unique, "merged catalog must hold one row per id");
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "merged catalog must stay sorted");
+
+    // Whatever the feed carries, the parser returns namespaced rows that always name a surface -
+    // never an empty scope, which would silently make a model account-wide.
+    let body = serde_json::json!({
+        "clinePass": feed.iter().map(|m| serde_json::json!({"id": underclass::cline::upstream_model_id(&m.id)})).collect::<Vec<_>>(),
+        "free": feed.iter().map(|m| serde_json::json!({"id": underclass::cline::upstream_model_id(&m.id)})).collect::<Vec<_>>(),
+    });
+    for model in underclass::cline::parse_recommended_models(&body) {
+        assert!(
+            model.id.starts_with(underclass::cline::MODEL_PREFIX),
+            "{} must be namespaced",
+            model.id
+        );
+        assert_eq!(
+            underclass::cline::pool_model_id(underclass::cline::upstream_model_id(&model.id)),
+            model.id,
+            "the pool namespace must round-trip"
+        );
+        assert_eq!(
+            model.scope,
+            underclass::cline::quota_scope(underclass::cline::upstream_model_id(&model.id)),
+            "{} must name a billing surface",
+            model.id
+        );
+        assert!(
+            !model.scope.is_empty(),
+            "{} must not be account-wide",
+            model.id
+        );
+    }
+}
+
 /// Builds a chat-completions SSE payload from ordered text deltas plus a finish reason, ending with
 /// the `[DONE]` sentinel only when `sentinel` is set.
 fn chat_sse(

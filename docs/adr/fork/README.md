@@ -24,6 +24,10 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 
 ## Fork decisions
 
+- [Cline Catalog from the Recommended-Models Feed](cline-catalog-from-the-recommended-models-feed.md)
+  — the catalog's ClinePass and free models come from Cline's public recommended-models feed
+  (`clinePass` and `free` buckets), which supersedes the hand-maintained-table decision in the
+  record below; the table degrades to a fallback and a source of display names.
 - [Cline Backend with Responses Translation](cline-backend-responses-translation.md) — third
   backend (API-key onboarding, `cline/` model namespace, ClinePass subscription models) plus
   Responses-to-Chat-Completions translation for Chat-Completions-only upstreams.

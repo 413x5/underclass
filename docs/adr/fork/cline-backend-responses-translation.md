@@ -4,7 +4,10 @@
 
 Accepted. This is a fork-local ADR: it deliberately carries no upstream number so a future
 `git pull` from `main` cannot collide with a newer upstream `NNNN` record. See
-[README](README.md).
+[README](README.md). Its catalog decision - the hand-maintained ClinePass table merged into every
+refresh - is superseded by
+[Cline Catalog from the Recommended-Models Feed](cline-catalog-from-the-recommended-models-feed.md);
+the rest of this record stands.
 
 ## Context
 
