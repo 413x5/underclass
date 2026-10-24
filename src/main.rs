@@ -425,10 +425,80 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     let monitor_socket = bind_monitor_socket(&cfg.monitor_socket_path())?;
     println!("underclass listening on http://{bind_addr}");
     println!("web ui: http://{bind_addr}/");
-    tokio::try_join!(
-        axum::serve(listener, app),
-        axum::serve(monitor_socket, local_app)
-    )?;
+
+    // Graceful shutdown: react to SIGINT/SIGTERM and drain in-flight requests for a bounded
+    // window before aborting the remainder, so streaming bodies are not cut mid-flight and
+    // `UsageFinish` still records an interrupted attempt instead of vanishing from accounting.
+    const DRAIN_SECS: u64 = 5;
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    let _ = signal_tx.send(true);
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = signal_tx.send(true);
+    });
+
+    let mut rx_http = shutdown_tx.subscribe();
+    let shutdown_http = async move {
+        while !*rx_http.borrow() {
+            if rx_http.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+    let mut rx_mon = shutdown_tx.subscribe();
+    let shutdown_mon = async move {
+        while !*rx_mon.borrow() {
+            if rx_mon.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+    let mut rx_timer = shutdown_tx.subscribe();
+    let abort_timer = async move {
+        while !*rx_timer.borrow() {
+            if rx_timer.changed().await.is_err() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(DRAIN_SECS)).await;
+    };
+
+    let serve_fut = async {
+        tokio::try_join!(
+            axum::serve(listener, app).with_graceful_shutdown(shutdown_http),
+            axum::serve(monitor_socket, local_app).with_graceful_shutdown(shutdown_mon)
+        )
+    };
+
+    tokio::select! {
+        res = serve_fut => {
+            if let Err(e) = res {
+                return Err(e.into());
+            }
+        }
+        _ = abort_timer => {
+            tracing::warn!("drain window elapsed; aborting remaining in-flight requests");
+        }
+    }
     Ok(())
 }
 
