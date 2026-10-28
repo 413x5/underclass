@@ -483,6 +483,10 @@ async fn spawn_app(
             "/admin/api/accounts/{id}/enable",
             axum::routing::post(underclass::ui::enable_account),
         )
+        .route(
+            "/admin/api/accounts/{id}/refresh",
+            axum::routing::post(underclass::ui::refresh_account),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             underclass::ui::require_ui_token,
@@ -1073,6 +1077,62 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     assert_eq!(
         cooling.reset_at, deadline,
         "enable must preserve an upstream quota deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_failed_manual_refresh_leaves_account_state_alone() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.upsert_account(&copilot_account("acct-copilot", "tok-copilot"));
+    // No stored refresh token makes the refresh fail before it reaches any issuer.
+    let mut codex = codex_account("acct-codex", "tok-codex");
+    codex.refresh_token = None;
+    store.upsert_account(&codex);
+    let deadline = now_ms() + 3_600_000;
+    store.update_account_status("acct-codex", AccountStatus::Cooling, deadline);
+    let (base, _logs) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    let refresh = |id: &str| {
+        let http = http.clone();
+        let base = base.clone();
+        let id = id.to_string();
+        async move {
+            let response = http
+                .post(format!("{base}/admin/api/accounts/{id}/refresh"))
+                .header("Authorization", "Bearer unused")
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            (status, body)
+        }
+    };
+
+    let (status, body) = refresh("no-such-account").await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "unknown_account");
+
+    // A Copilot token is never exchanged, so a "refresh" would prove nothing about it.
+    store.update_account_status("acct-copilot", AccountStatus::AuthError, 0);
+    let (status, body) = refresh("acct-copilot").await;
+    assert_eq!(status, 409);
+    assert_eq!(body["error"], "not_refreshable");
+    assert_eq!(
+        store.get_account("acct-copilot").unwrap().status,
+        AccountStatus::AuthError
+    );
+
+    let (status, body) = refresh("acct-codex").await;
+    assert_eq!(status, 502);
+    assert_eq!(body["error"], "refresh_failed");
+    let after = store.get_account("acct-codex").unwrap();
+    assert_eq!(after.status, AccountStatus::Cooling);
+    assert_eq!(
+        after.reset_at, deadline,
+        "a failed refresh must keep the quota deadline"
     );
 }
 

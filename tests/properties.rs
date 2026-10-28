@@ -9,7 +9,9 @@ use underclass::resets::{
 use underclass::stats::{self, Dim};
 use underclass::store::UpstreamEvent;
 use underclass::store::{Store, UsageQuery, UsageRecord};
-use underclass::tokens::{ROTATION_INTERVAL_MS, rotation_due};
+use underclass::tokens::{
+    ROTATION_INTERVAL_MS, refreshes_with_issuer, rotation_due, status_after_manual_refresh,
+};
 use underclass::usage::{StreamEnd, TokenCounts, UsageDialect, UsageTap};
 
 /// The surfaces the property tests route over: the OpenAI-shaped ones.
@@ -355,6 +357,62 @@ fn test_plan_gate_settles_and_respects_operator_disables(tc: TestCase) {
         assert_eq!(a.disabled_reason, None);
     } else {
         assert!(a.status != AccountStatus::Disabled || a.disabled_reason.is_none());
+    }
+}
+
+/// A successful manual refresh readmits only a credential-rejected account, and only when the
+/// refresh was real and the plan gate would not immediately disable it again. Quota cooldowns and
+/// disables are never touched, and the readmitted state is one the plan gate leaves alone.
+#[hegel::test]
+fn test_manual_refresh_only_recovers_auth_errors(tc: TestCase) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use underclass::models::FREE_PLAN_REASON;
+    let backends = [BackendId::Codex, BackendId::Copilot, BackendId::Claude];
+    let statuses = [
+        AccountStatus::Healthy,
+        AccountStatus::Cooling,
+        AccountStatus::AuthError,
+        AccountStatus::Disabled,
+    ];
+    let plans = [
+        None,
+        Some("free"),
+        Some("FREE"),
+        Some("plus"),
+        Some("pro"),
+        Some("max"),
+    ];
+    let backend = backends[tc.draw(gs::integers::<usize>().max_value(backends.len() - 1))];
+    let mut a = account("acct", backend);
+    a.status = statuses[tc.draw(gs::integers::<usize>().max_value(statuses.len() - 1))];
+    a.reset_at = tc.draw(
+        gs::integers::<i64>()
+            .min_value(0)
+            .max_value(1_000_000_000_000),
+    );
+    a.disabled_reason = tc
+        .draw(gs::booleans())
+        .then(|| FREE_PLAN_REASON.to_string());
+    let plan = plans[tc.draw(gs::integers::<usize>().max_value(plans.len() - 1))];
+    if let Some(plan) = plan {
+        let claims = format!(r#"{{"chatgpt_plan_type":"{plan}"}}"#);
+        a.access_token = Some(format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims)));
+        a.plan = Some(plan.to_string());
+    }
+
+    match status_after_manual_refresh(&a) {
+        Some(next) => {
+            assert_eq!(next, AccountStatus::Healthy);
+            assert_eq!(a.status, AccountStatus::AuthError);
+            assert!(refreshes_with_issuer(a.backend));
+            a.status = next;
+            assert_eq!(a.plan_gate(), None);
+        }
+        None => assert!(
+            a.status != AccountStatus::AuthError
+                || !refreshes_with_issuer(a.backend)
+                || plan.is_some_and(|p| p.eq_ignore_ascii_case("free"))
+        ),
     }
 }
 

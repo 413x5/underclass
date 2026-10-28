@@ -263,6 +263,7 @@ async function loadState() {
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
           ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">Re-login</button>` : ''}
+          ${a.backend !== 'copilot' ? `<button onclick="refreshToken('${a.id}')">Refresh token</button>` : ''}
           ${a.backend === 'codex' && a.usage && a.usage.available_resets > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           ${a.backend === 'claude' && a.observation && a.observation.reset_credits > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
@@ -570,6 +571,16 @@ async function relogin(id) {
     document.getElementById('flowPending').style.display = 'block';
     pollFlow(data.flow_id);
   }
+}
+async function refreshToken(id) {
+  const res = await api('/admin/api/accounts/' + id + '/refresh', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    alert(`${data.label}: token refreshed; account is now ${data.status}.`);
+  } else {
+    alert('Refresh failed: ' + (data.message || data.error || res.status));
+  }
+  loadState();
 }
 async function useReset(id, force = false) {
   if (!force && !confirm('Redeem one banked Codex reset for this account now?')) return;
