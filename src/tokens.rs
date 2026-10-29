@@ -27,6 +27,28 @@ pub fn rotation_due(account: &Account, now_ms: i64) -> bool {
         && now_ms.saturating_sub(account.token_refreshed_at) >= ROTATION_INTERVAL_MS
 }
 
+/// Reports whether `force_refresh` actually exchanges `backend`'s credential with its issuer.
+///
+/// Copilot's GitHub OAuth token never expires and `force_refresh` returns it verbatim, so a
+/// "refresh" there proves nothing about the credential.
+pub fn refreshes_with_issuer(backend: crate::models::BackendId) -> bool {
+    backend != crate::models::BackendId::Copilot
+}
+
+/// @cc [owner:ghuntley,label:auth] manual-refresh-recovers-auth-error
+/// `status_after_manual_refresh` MUST be evaluated on the account as stored after a successful
+/// operator-requested refresh. It MUST return `Some(Healthy)` only for an `AuthError` account whose
+/// backend `refreshes_with_issuer` and whose `plan_gate` does not ask to disable it, and MUST return
+/// `None` (leave the status alone) for every other status, so a refresh never readmits a `Cooling`
+/// account before its upstream deadline or overrides a `Disabled` one. No I/O is permitted.
+pub fn status_after_manual_refresh(account: &Account) -> Option<crate::models::AccountStatus> {
+    use crate::models::{AccountStatus, PlanGate};
+    (account.status == AccountStatus::AuthError
+        && refreshes_with_issuer(account.backend)
+        && account.plan_gate() != Some(PlanGate::Disable))
+    .then_some(AccountStatus::Healthy)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error("account has no stored credential")]

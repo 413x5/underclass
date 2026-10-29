@@ -54,6 +54,11 @@ enum Command {
         #[clap(flatten)]
         args: cli::ResetArgs,
     },
+    /// force a token refresh for one account (or `--all`) via the running server
+    Refresh {
+        #[clap(flatten)]
+        args: cli::RefreshArgs,
+    },
     /// show token, session, concurrency, capacity, and refusal statistics from the running server
     Stats {
         #[clap(flatten)]
@@ -65,7 +70,10 @@ fn main() {
     let cli = Cli::parse();
     if !matches!(
         cli.command,
-        Some(Command::Top { .. }) | Some(Command::Reset { .. }) | Some(Command::Stats { .. })
+        Some(Command::Top { .. })
+            | Some(Command::Reset { .. })
+            | Some(Command::Refresh { .. })
+            | Some(Command::Stats { .. })
     ) {
         logging::init(cli.log_format);
     }
@@ -87,6 +95,12 @@ fn main() {
         }
         Some(Command::Reset { args }) => {
             if let Err(e) = cli::reset(&args) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Refresh { args }) => {
+            if let Err(e) = cli::refresh(&args) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -395,6 +409,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/accounts/{id}/relogin",
             axum::routing::post(ui::relogin_account),
+        )
+        .route(
+            "/admin/api/accounts/{id}/refresh",
+            axum::routing::post(ui::refresh_account),
         )
         .route(
             "/admin/api/accounts/{id}/reset",

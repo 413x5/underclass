@@ -40,6 +40,20 @@ pub struct ResetArgs {
     pub url: Option<String>,
 }
 
+#[derive(Parser, Debug)]
+pub struct RefreshArgs {
+    #[arg(
+        help = "account label (email/username), account id, or unique id prefix",
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    pub account: Option<String>,
+    #[arg(long, help = "refresh every ChatGPT/Codex and Claude Code account")]
+    pub all: bool,
+    #[arg(long, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
+    pub url: Option<String>,
+}
+
 /// One row of the admin state's account list, as much as the CLI needs to pick a target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRef {
@@ -114,29 +128,49 @@ fn account_refs(state: &Value) -> Vec<AccountRef> {
         .unwrap_or_default()
 }
 
+/// An authenticated client for the running server's admin API.
+struct AdminApi {
+    client: reqwest::blocking::Client,
+    url: String,
+    token: String,
+}
+
+impl AdminApi {
+    fn connect(url: Option<String>) -> Result<Self, String> {
+        let config = crate::config::Config::load();
+        let (url, token) = crate::top::admin_http_target(&config, url)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        Ok(Self { client, url, token })
+    }
+
+    fn accounts(&self) -> Result<Vec<AccountRef>, String> {
+        let state: Value = self
+            .client
+            .get(format!("{}/admin/api/state", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| format!("cannot reach {}: {e}", self.url))?
+            .error_for_status()
+            .map_err(|e| format!("admin state request failed: {e}"))?
+            .json()
+            .map_err(|e| format!("admin state response: {e}"))?;
+        Ok(account_refs(&state))
+    }
+}
+
 /// @cc [owner:ghuntley,label:cli] reset-cli-via-admin-api
 /// `reset` MUST act only through the running server's authenticated admin API (resolve the
 /// account from `/admin/api/state`, then POST `/admin/api/accounts/{id}/reset`), MUST NOT read
 /// credentials from or write to the local database, and MUST surface the server's `message` on
 /// a non-2xx response instead of a bare status code.
 pub fn reset(args: &ResetArgs) -> Result<(), String> {
-    let config = crate::config::Config::load();
-    let (url, token) = crate::top::admin_http_target(&config, args.url.clone())?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let state: Value = client
-        .get(format!("{url}/admin/api/state"))
-        .bearer_auth(&token)
-        .send()
-        .map_err(|e| format!("cannot reach {url}: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("admin state request failed: {e}"))?
-        .json()
-        .map_err(|e| format!("admin state response: {e}"))?;
-    let accounts = account_refs(&state);
+    let admin = AdminApi::connect(args.url.clone())?;
+    let (client, url, token) = (&admin.client, &admin.url, &admin.token);
+    let accounts = admin.accounts()?;
     let account = match_account(&accounts, &args.account)?;
     if !matches!(account.backend.as_str(), "codex" | "claude") {
         return Err(format!(
@@ -149,7 +183,7 @@ pub fn reset(args: &ResetArgs) -> Result<(), String> {
             "{url}/admin/api/accounts/{}/reset?force={}",
             account.id, args.force
         ))
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .send()
         .map_err(|e| format!("reset request failed: {e}"))?;
     let status = response.status();
@@ -174,6 +208,74 @@ pub fn reset(args: &ResetArgs) -> Result<(), String> {
             account.label,
             status.as_u16()
         ))
+    }
+}
+
+/// @cc [owner:ghuntley,label:cli] refresh-cli-via-admin-api
+/// `refresh` MUST act only through the running server's authenticated admin API (resolve accounts
+/// from `/admin/api/state`, then POST `/admin/api/accounts/{id}/refresh`) and MUST NOT read
+/// credentials from or write to the local database. A single account MUST be resolved with
+/// `match_account`; `--all` MUST target every account whose backend refreshes with its issuer.
+/// It MUST print one line per account, surfacing the server's `message` on a non-2xx response, and
+/// MUST fail when any targeted refresh failed.
+pub fn refresh(args: &RefreshArgs) -> Result<(), String> {
+    let admin = AdminApi::connect(args.url.clone())?;
+    let accounts = admin.accounts()?;
+    let targets: Vec<&AccountRef> = match &args.account {
+        Some(selector) => vec![match_account(&accounts, selector)?],
+        None => accounts
+            .iter()
+            .filter(|a| {
+                crate::models::BackendId::parse(&a.backend)
+                    .is_some_and(crate::tokens::refreshes_with_issuer)
+            })
+            .collect(),
+    };
+    if targets.is_empty() {
+        return Err("no refreshable accounts".into());
+    }
+    let mut failed = 0;
+    for account in targets {
+        let response = admin
+            .client
+            .post(format!(
+                "{}/admin/api/accounts/{}/refresh",
+                admin.url, account.id
+            ))
+            .bearer_auth(&admin.token)
+            .send()
+            .map_err(|e| format!("refresh request failed: {e}"))?;
+        let status = response.status();
+        let body: Value = response.json().unwrap_or(Value::Null);
+        if status.is_success() {
+            let expires = body["expires_at"]
+                .as_i64()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "?".into());
+            let before = body["previous_status"].as_str().unwrap_or("unknown");
+            let after = body["status"].as_str().unwrap_or("unknown");
+            let transition = if before == after {
+                after.to_string()
+            } else {
+                format!("{before} -> {after}")
+            };
+            println!(
+                "{}: refreshed; account is {transition}, token expires {expires}",
+                account.label
+            );
+        } else {
+            failed += 1;
+            let message = body["message"]
+                .as_str()
+                .or_else(|| body["error"].as_str())
+                .unwrap_or("request failed");
+            eprintln!("{}: {message} (HTTP {})", account.label, status.as_u16());
+        }
+    }
+    match failed {
+        0 => Ok(()),
+        n => Err(format!("{n} refresh(es) failed")),
     }
 }
 
