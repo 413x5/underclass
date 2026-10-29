@@ -555,6 +555,63 @@ pub async fn enable_account(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// @cc [owner:ghuntley,label:auth] manual-refresh-endpoint
+/// `refresh_account` MUST return 404 for an unknown account id and 409 `not_refreshable` for a
+/// backend that does not `refreshes_with_issuer`. Otherwise it MUST call `force_refresh` exactly
+/// once. On failure it MUST return 502 `refresh_failed` and MUST NOT change the account's status,
+/// pool state, or cooldown. On success it MUST apply `status_after_manual_refresh` to both store and
+/// pool, and MUST respond with the resulting status and token expiry but never any credential.
+pub async fn refresh_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(account) = state.store.get_account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown_account", "message": "unknown account" })),
+        )
+            .into_response();
+    };
+    if !crate::tokens::refreshes_with_issuer(account.backend) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "not_refreshable",
+                "message": format!("{} tokens do not expire or refresh", account.backend.as_str()),
+            })),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.tokens.force_refresh(&id).await {
+        crate::logging::log_token_rotation(&id, &account.label, "rotation_failed", &e.to_string());
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "refresh_failed", "message": e.to_string() })),
+        )
+            .into_response();
+    }
+    crate::logging::log_token_rotation(&id, &account.label, "rotated", "manual");
+    let refreshed = state.store.get_account(&id).unwrap_or(account);
+    let status = match crate::tokens::status_after_manual_refresh(&refreshed) {
+        Some(next) => {
+            state.store.update_account_status(&id, next, 0);
+            state.pool.lock().unwrap().set_status(&id, next, 0);
+            next
+        }
+        None => refreshed.status,
+    };
+    Json(json!({
+        "account_id": refreshed.id,
+        "label": refreshed.label,
+        "backend": refreshed.backend.as_str(),
+        "outcome": "refreshed",
+        "previous_status": refreshed.status,
+        "status": status,
+        "expires_at": refreshed.expires_at,
+    }))
+    .into_response()
+}
+
 pub async fn relogin_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
