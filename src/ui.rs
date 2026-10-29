@@ -809,6 +809,26 @@ pub async fn get_catalog(
         .into_response()
 }
 
+pub async fn get_aliases(State(state): State<Arc<AppState>>) -> Response {
+    let aliases: serde_json::Map<String, serde_json::Value> = state
+        .pool
+        .lock()
+        .unwrap()
+        .aliases
+        .iter()
+        .map(|(alias, concretes)| {
+            (
+                alias.clone(),
+                json!(concretes
+                    .iter()
+                    .map(|(b, m)| json!({"backend": b.as_str(), "model": m}))
+                    .collect::<Vec<_>>()),
+            )
+        })
+        .collect();
+    Json(json!({ "aliases": aliases })).into_response()
+}
+
 pub async fn put_catalog(
     State(state): State<Arc<AppState>>,
     Path(backend): Path<String>,
@@ -825,6 +845,7 @@ pub async fn put_catalog(
     }
     state.store.set_catalog(backend, &models);
     state.pool.lock().unwrap().set_catalog(backend, &models);
+    state.pool.lock().unwrap().rebuild_aliases(&state.store);
     Json(json!({ "backend": backend.as_str(), "models": state.store.catalog(backend) }))
         .into_response()
 }
@@ -922,6 +943,7 @@ pub async fn refresh_copilot_catalog(State(state): State<Arc<AppState>>) -> Resp
                     .lock()
                     .unwrap()
                     .set_catalog(BackendId::Copilot, &models);
+                state.pool.lock().unwrap().rebuild_aliases(&state.store);
                 refreshed += 1;
             }
             Ok(_) => {}

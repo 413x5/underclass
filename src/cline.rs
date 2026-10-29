@@ -445,6 +445,7 @@ pub async fn refresh_catalog(
     carry_forward_limits(&mut models, &previous);
     store.set_catalog(BackendId::Cline, &models);
     pool.lock().unwrap().set_catalog(BackendId::Cline, &models);
+    pool.lock().unwrap().rebuild_aliases(store);
     Ok(models)
 }
 

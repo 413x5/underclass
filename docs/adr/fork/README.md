@@ -23,6 +23,9 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 - Add new records to the list below.
 
 ## Fork decisions
+- [Model Aliases: Subscription vs Credits Routing](model-aliases.md) — derived,
+  config-driven virtual model ids (`subscription/...`, `credits/...`) that route a request
+  through only accounts of the matching billing kind, with no DB schema change.
 
 - [Cline Catalog from the Recommended-Models Feed](cline-catalog-from-the-recommended-models-feed.md)
   — the catalog's ClinePass and free models come from Cline's public recommended-models feed

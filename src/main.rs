@@ -1,6 +1,6 @@
 use underclass::provider::BackendMap;
 use underclass::{
-    claude, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api,
+    aliases, claude, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api,
     store, tokens, top, ui,
 };
 
@@ -184,6 +184,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::OpencodeGo,
         underclass::opencode_go::default_catalog(),
     );
+    // (alias table built after pool creation)
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -233,6 +234,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
 
     let core = pool::PoolCore::new(&store, surfaces);
     let pool = Arc::new(Mutex::new(core));
+    // Alias config is stored on the pool; table built by refresh_aliases_on_boot below.
 
     let state = Arc::new(proxy::AppState {
         store: store.clone(),
@@ -270,6 +272,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
                 );
                 enforce_plan_gates(&state);
                 state.pool.lock().unwrap().sync_from_store(&store);
+                state.pool.lock().unwrap().rebuild_aliases(&store);
             }
         });
     }
@@ -302,6 +305,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     refresh_claude_catalogs_on_boot(&state).await;
     refresh_cline_catalogs_on_boot(&state).await;
     refresh_opencode_go_catalogs_on_boot(&state).await;
+    refresh_aliases_on_boot(&state, &cfg).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -421,6 +425,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/{backend}",
             axum::routing::get(ui::get_catalog).put(ui::put_catalog),
+        )
+        .route(
+            "/admin/api/aliases",
+            axum::routing::get(ui::get_aliases),
         )
         .route(
             "/admin/api/catalog/refresh-copilot",
@@ -625,6 +633,7 @@ async fn refresh_copilot_catalogs_on_boot(state: &Arc<proxy::AppState>) {
                     .lock()
                     .unwrap()
                     .set_catalog(models::BackendId::Copilot, &catalog);
+                state.pool.lock().unwrap().rebuild_aliases(&state.store);
             }
         }
     }
@@ -721,6 +730,7 @@ async fn refresh_claude_catalogs_on_boot(state: &Arc<proxy::AppState>) {
                 .lock()
                 .unwrap()
                 .set_catalog(models::BackendId::Claude, &catalog);
+            state.pool.lock().unwrap().rebuild_aliases(&state.store);
         }
     }
 }
@@ -988,6 +998,17 @@ async fn rotate_due_tokens(state: &Arc<proxy::AppState>) {
             ),
         }
     }
+}
+
+async fn refresh_aliases_on_boot(state: &Arc<proxy::AppState>, cfg: &config::Config) {
+    let mut catalogs = std::collections::HashMap::new();
+    for b in models::BackendId::all() {
+        catalogs.insert(b, state.store.catalog(b));
+    }
+    let cfg_alias = aliases::AliasConfig::from_config(cfg.model_alias_kinds.clone(), cfg.model_alias_default_kind.clone());
+    let table = aliases::build_alias_table(&catalogs, &cfg_alias);
+    state.pool.lock().unwrap().set_alias_config(cfg_alias);
+    state.pool.lock().unwrap().set_aliases(table);
 }
 
 async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {

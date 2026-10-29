@@ -349,6 +349,7 @@ pub async fn refresh_catalog(
     pool.lock()
         .unwrap()
         .set_catalog(BackendId::OpencodeGo, &models);
+    pool.lock().unwrap().rebuild_aliases(store);
     Ok(models)
 }
 
