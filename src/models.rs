@@ -18,7 +18,7 @@ impl BackendId {
             BackendId::Copilot => "copilot",
             BackendId::Claude => "claude",
             BackendId::Cline => "cline",
-            BackendId::OpencodeGo => "opencode_go",
+            BackendId::OpencodeGo => "opencode-go",
         }
     }
 
@@ -28,7 +28,7 @@ impl BackendId {
             "copilot" => Some(BackendId::Copilot),
             "claude" => Some(BackendId::Claude),
             "cline" => Some(BackendId::Cline),
-            "opencode_go" => Some(BackendId::OpencodeGo),
+            "opencode_go" | "opencode-go" => Some(BackendId::OpencodeGo),
             _ => None,
         }
     }
