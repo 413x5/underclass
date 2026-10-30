@@ -493,14 +493,22 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
     }
 
     let api_key = resolve_api_key(args, underclass_store)?;
-    let mut all_models = underclass_store.catalog(crate::models::BackendId::Codex);
-    let mut seen: std::collections::HashSet<String> =
-        all_models.iter().map(|m| m.id.clone()).collect();
+    // Only models an account can serve are offered to the client, the same rule `GET /v1/models`
+    // applies. The stored catalogs stay untouched so re-adding an account restores its models.
+    let servable = crate::listing::backends_with_accounts(&underclass_store.list_accounts());
+    let mut all_models = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
     for backend in [
+        crate::models::BackendId::Codex,
         crate::models::BackendId::Copilot,
         crate::models::BackendId::Cline,
         crate::models::BackendId::OpencodeGo,
     ] {
+        // The Anthropic surface is not OpenAI-shaped, so Claude models do not belong in an
+        // OpenAI-compatible provider block.
+        if !servable.contains(&backend) {
+            continue;
+        }
         for m in underclass_store.catalog(backend) {
             if seen.insert(m.id.clone()) {
                 all_models.push(m);
@@ -508,8 +516,16 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
         }
     }
     if all_models.is_empty() {
-        eprintln!("warning: proxy catalog is empty; run the server and add accounts first");
-        all_models = crate::codex::default_catalog();
+        // The built-in defaults are only offered while a Codex account exists to serve them;
+        // otherwise an empty block tells the truth until accounts are added.
+        if servable.contains(&crate::models::BackendId::Codex) {
+            eprintln!("warning: the Codex catalog is empty; writing the built-in defaults");
+            all_models = crate::codex::default_catalog();
+        } else {
+            eprintln!(
+                "warning: no account backs a model right now; add accounts, then rerun connect"
+            );
+        }
     }
 
     let config_path = config_path_for(args);

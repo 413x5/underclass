@@ -9,6 +9,7 @@ pub mod correlation;
 pub mod flows;
 pub mod health;
 pub mod jwt;
+pub mod listing;
 pub mod logging;
 pub mod models;
 pub mod monitor;

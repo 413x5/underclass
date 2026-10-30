@@ -44,7 +44,8 @@ in the request id, so clients cannot express "subscription only" vs "credits onl
   `auto_stream_usage`, body model mutation, and `prepare_body`. Usage records store the
   concrete model id; the alias is shown in the request ring buffer / admin UI.
 - **`/v1/models`** includes alias entries (id = alias, limits merged by max,
-  `owned_by = "underclass-alias"`).
+  `owned_by = "underclass-alias"`), filtered per concrete model to the aliases at least one
+  account-backed backend serves. See [Only Account-Backed Models Are Advertised](account-backed-model-advertisement.md).
 - **Admin endpoint** `GET /admin/api/aliases` returns the derived alias table.
 - Alias validity is validated: `default_kind` must name a configured kind.
 

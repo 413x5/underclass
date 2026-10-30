@@ -12,7 +12,7 @@ Earlier iterations considered provider-prefixed URLs (`/openai/v1/...`, `/codex/
 
 ## Decision
 
-- Single OpenAI-shaped surface: `/v1/responses`, `/v1/chat/completions`, `/v1/models` - indistinguishable from pointing at the OpenAI API.
+- Single OpenAI-shaped surface: `/v1/responses`, `/v1/chat/completions`, `/v1/models` - indistinguishable from pointing at the OpenAI API. `/v1/models` advertises only models a configured account can serve: the fork filters each backend's stored catalog to the backends that have an account, so it never offers an id the pool cannot route. See [the fork record](fork/account-backed-model-advertisement.md).
 - Backends are invisible to clients. Backend selection is **model-eligibility-driven**: the requested model is served by any healthy account whose backend catalog contains it; all such accounts compete in one **flat pool** ordered by least-in-flight.
 - Models absent from every catalog pass through to the codex backend (ADR 0007).
 - Sticky bindings bind to `(backend, account)`; rebinds prefer the same backend (ADR 0003).

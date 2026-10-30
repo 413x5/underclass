@@ -142,6 +142,7 @@
       <option value="cline">cline</option>
       <option value="opencode-go">OpenCode Go</option>
     </select>
+    <p id="catalogNote" class="muted"></p>
     <label>models (JSON array of {id, name, context, input, output})</label>
     <textarea id="catalogEditor" rows="10"></textarea>
     <div class="row" style="margin-top:8px">
@@ -283,6 +284,8 @@ async function loadState() {
   try {
     const res = await api('/admin/api/state');
     const data = await res.json();
+    stateCache = data;
+    catalogNote();
     const tbody = document.querySelector('#accounts tbody');
     tbody.innerHTML = '';
     for (const a of data.accounts) {
@@ -505,11 +508,25 @@ function snippet(catalog) {
 function esc(s) { const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
 
 let catalogCache = [];
+let stateCache = {};
+// The catalog editor deliberately shows every stored row, including a backend that currently has
+// no account: it is how an operator inspects and edits what the backend published, and those rows
+// survive a removed account so re-adding one restores its models. The note states when the rows on
+// screen are stored but not advertised; the opencode snippet above is the advertised view.
+function catalogNote() {
+  const note = document.getElementById('catalogNote');
+  const served = new Set(stateCache.catalog_backends || []);
+  const backend = document.getElementById('catalogBackend').value;
+  note.textContent = served.has(backend)
+    ? ''
+    : 'no account for this backend — these rows are stored but not advertised by /v1/models';
+}
 async function loadCatalog() {
   const backend = document.getElementById('catalogBackend').value;
   const res = await api('/admin/api/catalog/' + backend);
   const data = await res.json();
   document.getElementById('catalogEditor').value = JSON.stringify(data.models, null, 2);
+  catalogNote();
 }
 async function saveCatalog() {
   const backend = document.getElementById('catalogBackend').value;
@@ -517,7 +534,7 @@ async function saveCatalog() {
   try { models = JSON.parse(document.getElementById('catalogEditor').value); }
   catch (e) { document.getElementById('catalogMsg').textContent = 'invalid JSON: ' + e.message; return; }
   const res = await api('/admin/api/catalog/' + backend, { method: 'PUT', body: JSON.stringify({ models }) });
-  if (res.ok) { document.getElementById('catalogMsg').textContent = 'saved'; loadState(); }
+  if (res.ok) { document.getElementById('catalogMsg').textContent = 'saved'; loadState().then(catalogNote); }
 }
 
 let pendingReplace = null;
@@ -708,8 +725,8 @@ function copySnippet() {
 }
 
 if (!token()) document.getElementById('tokenDialog').showModal();
-loadState();
-loadCatalog().then(() => loadState());
+// The catalog editor needs the served-backend set from `/admin/api/state`, so load that first.
+loadState().then(() => loadCatalog());
 setInterval(loadState, 5000);
 </script>
 </body>

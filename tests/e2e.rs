@@ -1405,7 +1405,6 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     );
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_failed_manual_refresh_leaves_account_state_alone() {
     let _mock = mock_upstream();
@@ -2750,4 +2749,92 @@ async fn e2e_catalog_refresh_publishes_feed_only_cline_models() {
         attempted.contains(&"cline-pass/deepseek-v4.1-flash-1017".to_string()),
         "upstream must see the id without the pool namespace, got: {attempted:?}"
     );
+}
+
+/// `GET /v1/models` must advertise only models a configured account can serve: a catalog left over
+/// from a removed account is stored but not listed, and an alias survives while one of its
+/// concrete models is still served.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_models_lists_only_account_backed_models() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(
+        BackendId::OpencodeGo,
+        &[model("opencode-go/grok-4.7"), model("opencode-go/kimi-k3")],
+    );
+    store.set_catalog(BackendId::Copilot, &[model("grok-4.6"), model("grok-4.7")]);
+    store.set_catalog(BackendId::Codex, &underclass::codex::default_catalog());
+    store.set_catalog(BackendId::Claude, &underclass::claude::default_catalog());
+    store.upsert_account(&go_account("go-1", "go-key"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 400).await;
+    pool.lock().unwrap().rebuild_aliases(&store);
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["object"], "list");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+
+    assert!(ids.contains(&"opencode-go/grok-4.7"));
+    assert!(
+        ids.contains(&"subscriptions/grok-4.7"),
+        "the alias still routes to the Go account, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"grok-4.7") && !ids.contains(&"grok-4.6"),
+        "copilot rows must not be advertised without a copilot account, got {ids:?}"
+    );
+    for stale in ["gpt-5.5", "claude-sonnet-5-5"] {
+        assert!(
+            !ids.contains(&stale),
+            "{stale} has no codex/claude account behind it, got {ids:?}"
+        );
+    }
+    // The stored rows themselves are untouched: the filter is a read-time view, so the editor (and
+    // a later account) still see every catalog.
+    assert!(
+        store
+            .catalog(BackendId::Copilot)
+            .iter()
+            .any(|m| m.id == "grok-4.7"),
+        "an unadvertised row must stay stored"
+    );
+
+    // Re-adding an account restores its stored rows with no catalog rewrite, and an account that
+    // is cooling rather than healthy still means those models are routable ids.
+    let mut cooling = copilot_account("cop-1", "cop-token");
+    cooling.status = AccountStatus::Cooling;
+    cooling.reset_at = now_ms() + 60_000;
+    store.upsert_account(&cooling);
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"grok-4.6") && ids.contains(&"grok-4.7"),
+        "the stored copilot rows come back with its account, got {ids:?}"
+    );
+    assert!(ids.contains(&"opencode-go/grok-4.7"), "got {ids:?}");
 }

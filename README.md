@@ -153,7 +153,7 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `POST /v1/messages` | proxy key | Anthropic Messages API (Claude Code clients) |
 | `POST /v1/messages/count_tokens` | proxy key | Anthropic token counting, same |
 | `POST /messages` | proxy key | Messages API alias, for clients whose base URL already ends in `/v1` |
-| `GET /v1/models` | proxy key | union catalog with merged limits |
+| `GET /v1/models` | proxy key | union catalog of account-backed backends, with merged limits and derived aliases |
 | `GET /` | none | web UI |
 | `GET /admin/api/state` | admin token | accounts, catalog, last 200 requests |
 | `GET /admin/api/usage` | admin token | token totals grouped by `group_by=model,account_id,cache_key` (any subset) |
@@ -184,6 +184,8 @@ Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase.
 ## Models
 
 The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, Cline's `cline/` + `cline/cline-pass/` IDs (refreshed from Cline's recommended-models feed), and OpenCode Go's `opencode-go/` IDs. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
+
+`GET /v1/models`, the UI's opencode snippet, and `underclass connect` list only the catalogs of backends that have an account, so every advertised id is one the pool can route. Stored rows are never pruned when an account is removed - re-adding it advertises its models again - and the catalog editor still shows every stored row, marking a backend with no account. See [Only Account-Backed Models Are Advertised](docs/adr/fork/account-backed-model-advertisement.md).
 
 ## Nix flake
 
