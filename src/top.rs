@@ -407,10 +407,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 /// percentages: a percentage gives `ACCOUNT` and `QUOTA LEFT` the same share whether they hold four
 /// characters or forty, which squeezed `STATE` and clipped the cooling scope and deadline.
 ///
-/// Each column is first sized to its content (`ACCOUNT`, `PLAN`, and `QUOTA LEFT` shrink to what
-/// they actually hold, so an empty `PLAN` costs two cells, not twelve). The leftover width is then
-/// shared out by [`WEIGHT`], so a wider terminal widens every column instead of leaving dead space
-/// on the right - `Table` defaults to `Flex::Start`, which would pad the right edge only.
+/// Each column is first sized to its content (`ACCOUNT`, `PLAN`, `BACKEND`, and `QUOTA LEFT`
+/// shrink to what they actually hold, so an empty `PLAN` costs two cells, not twelve). `BACKEND` is
+/// measured from the backends being shown, floored at its header width and capped at
+/// [`MAX_BACKEND_WIDTH`]. The leftover width is then shared out by [`WEIGHT`], so a wider terminal
+/// widens every column instead of leaving dead space on the right - `Table` defaults to
+/// `Flex::Start`, which would pad the right edge only.
 fn account_columns(
     snapshot: &MonitorSnapshot,
     compact: bool,
@@ -438,6 +440,15 @@ fn account_columns(
         snapshot.accounts.iter().map(plan_text).collect(),
         "PLAN",
         MAX_PLAN_WIDTH,
+    );
+    let backend_width = widest(
+        snapshot
+            .accounts
+            .iter()
+            .map(|a| a.backend.as_str().to_string())
+            .collect(),
+        "BACKEND",
+        MAX_BACKEND_WIDTH as usize,
     );
     let status_width = widest(
         snapshot
@@ -488,7 +499,7 @@ fn account_columns(
         vec![
             label_width,
             plan_width,
-            display_width("BACKEND") as u16,
+            backend_width,
             status_width,
             display_width("LIVE") as u16,
             display_width("SESS") as u16,
@@ -615,11 +626,14 @@ fn status_text(account: &MonitorAccount, now: i64) -> String {
 }
 
 /// Caps that stop one unusually long value from squeezing every other column. `STATE` allows for
-/// `cooling <scope> <deadline> +N`, the longest string this table renders.
+/// `cooling <scope> <deadline> +N`, the longest string this table renders. `MAX_BACKEND_WIDTH` is
+/// derived from the widest [`BackendId`] instead of a literal, so adding or renaming a backend
+/// cannot silently clip the column again.
 const MAX_LABEL_WIDTH: usize = 20;
 const MAX_PLAN_WIDTH: usize = 12;
 const MAX_STATUS_WIDTH: usize = 34;
 const MAX_QUOTA_WIDTH: usize = 30;
+const MAX_BACKEND_WIDTH: u16 = BackendId::max_str_width() as u16;
 
 fn draw_accounts(
     frame: &mut ratatui::Frame<'_>,
@@ -766,8 +780,15 @@ fn account_detail(account: &MonitorAccount, now_ms: i64) -> String {
 /// Recent-outcomes widths. This table has no header row, so every column is measured from the
 /// values it will draw: `MODEL` is the widest in practice (`cline/cline-pass/deepseek-v4.1-flash`
 /// is 41 cells) and takes the largest share, while the fixed-shape columns (`HH:MM:SS`, the status
-/// code, `<n> ms`) are sized so they never truncate. The total is clamped to the panel's inner
-/// width, so a narrow pane shrinks `MODEL`/`ACCOUNT` instead of spilling past the border.
+/// code, `<n> ms`) are sized so they never truncate. `BACKEND` is measured from the backend ids in
+/// the rows and capped at [`MAX_BACKEND_WIDTH`], the same cap the accounts table uses. The total is
+/// clamped to the panel's inner width, so a narrow pane shrinks `MODEL`/`ACCOUNT` instead of
+/// spilling past the border.
+///
+/// @cc [owner:ghuntley,label:cli] recent-columns-measure-backend
+/// `BACKEND` MUST be measured from the backend values in `snapshot.recent` and capped at
+/// `MAX_BACKEND_WIDTH`, never from a literal width, and the returned widths plus the five
+/// inter-column gaps MUST NOT exceed `area_width - 2`.
 fn recent_columns(area_width: u16, snapshot: &MonitorSnapshot) -> Vec<Constraint> {
     let inner = area_width.saturating_sub(2); // the panel's borders
     let spacing = 5u16; // five gaps between six columns
@@ -815,8 +836,8 @@ fn recent_columns(area_width: u16, snapshot: &MonitorSnapshot) -> Vec<Constraint
             .iter()
             .filter_map(|r| r.backend.clone())
             .collect(),
-        5,
-        10,
+        display_width("—") as u16,
+        MAX_BACKEND_WIDTH,
     );
 
     let rest = available.saturating_sub(time + status + duration + backend);
@@ -826,7 +847,8 @@ fn recent_columns(area_width: u16, snapshot: &MonitorSnapshot) -> Vec<Constraint
     let mut widths = vec![time, model, backend, account, status, duration];
 
     // A narrow panel can still exceed the inner width; take it out of the widest columns first so
-    // the fixed-shape ones keep their exact value.
+    // the fixed-shape ones keep their exact value. `BACKEND` is measured, not guessed, so it is
+    // only clipped once `MODEL` and `ACCOUNT` have already given up their cells.
     let mut total: u16 = widths.iter().sum();
     while total > available {
         let Some((i, _)) = widths
@@ -1373,6 +1395,132 @@ mod width_tests {
             "STATE must keep the scope name at 110 columns:\n{screen}"
         );
     }
+
+    /// A snapshot whose longest backend id is `opencode-go`, the widest a [`BackendId`] can be
+    /// today; both the accounts and the recent-outcomes table have to draw it in full.
+    fn opencode_snapshot() -> MonitorSnapshot {
+        let account = |label: &str, backend| MonitorAccount {
+            id: label.into(),
+            label: label.into(),
+            backend,
+            plan: None,
+            status: AccountStatus::Healthy,
+            reset_at: 0,
+            cooling_scopes: Default::default(),
+            inflight: 0,
+            sticky_sessions: 0,
+            month: Counters::default(),
+            quota: None,
+            observation: None,
+        };
+        MonitorSnapshot {
+            recent: vec![crate::monitor::MonitorRequest {
+                ts: 0,
+                model: "cline/cline-pass/deepseek-v4.1-flash".into(),
+                backend: Some(BackendId::OpencodeGo.as_str().into()),
+                label: Some("alex4ndrus".into()),
+                status: 200,
+                duration_ms: 1_234,
+            }],
+            accounts: vec![
+                account("alex4ndrus", BackendId::OpencodeGo),
+                account("413x5", BackendId::Cline),
+            ],
+            ..snap(&[])
+        }
+    }
+
+    fn opencode_render(width: u16) -> String {
+        let mut app = App {
+            snapshot: Some(opencode_snapshot()),
+            ..Default::default()
+        };
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_widest_backend_id_is_drawn_in_full_at_realistic_widths() {
+        let widest = BackendId::OpencodeGo.as_str();
+        assert_eq!(widest, "opencode-go");
+        let snap = opencode_snapshot();
+        for width in [120u16, 132, 134, 160] {
+            let screen = opencode_render(width);
+            assert!(
+                screen.matches(widest).count() >= 2,
+                "`{widest}` must appear in both the accounts and the recent table at {width} columns:\n{screen}"
+            );
+            assert!(
+                !screen.contains("opencode-g "),
+                "`{widest}` must not be clipped at {width} columns:\n{screen}"
+            );
+            // Widening the backend must not come out of the model column's dominance or the fit.
+            let widths: Vec<u16> = recent_columns(width, &snap)
+                .into_iter()
+                .map(|c| match c {
+                    Constraint::Length(n) => n,
+                    other => panic!("expected Length, got {other:?}"),
+                })
+                .collect();
+            assert!(
+                widths[1] >= widths[3],
+                "MODEL ({}) should be at least as wide as ACCOUNT ({}) at {width}",
+                widths[1],
+                widths[3]
+            );
+            assert!(
+                widths.iter().sum::<u16>() + 5 <= width - 2,
+                "recent {widths:?} must fit the {}-cell inner area at {width}",
+                width - 2
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_panel_still_fits_the_table_it_clips() {
+        // Below this the table cannot hold every value; the content must still stay inside the
+        // border rather than overflow it, and rendering must not panic.
+        let snap = opencode_snapshot();
+        for area in [30u16, 40, 50] {
+            let widths: Vec<u16> = recent_columns(area, &snap)
+                .into_iter()
+                .map(|c| match c {
+                    Constraint::Length(n) => n,
+                    other => panic!("expected Length, got {other:?}"),
+                })
+                .collect();
+            let total: u16 = widths.iter().sum::<u16>() + 5;
+            assert!(
+                total <= area - 2,
+                "recent {widths:?} total {total} must fit the {}-cell inner area",
+                area - 2
+            );
+        }
+        // The fixed-shape columns keep their exact widths even when the ids no longer fit.
+        let widths: Vec<u16> = recent_columns(60, &snap)
+            .into_iter()
+            .map(|c| match c {
+                Constraint::Length(n) => n,
+                other => panic!("expected Length, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(widths[0], 8, "TIME stays HH:MM:SS");
+        assert_eq!(widths[4], 3, "STATUS stays three digits");
+        assert!(widths[5] >= 7, "`<n> ms` keeps its digits: {}", widths[5]);
+        for width in [60u16, 80, 99] {
+            assert!(
+                !opencode_render(width).is_empty(),
+                "the dashboard must still render at {width} columns"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1479,6 +1627,66 @@ mod fit_tests {
                 widths[3]
             );
         }
+    }
+
+    #[test]
+    fn the_backend_cap_follows_the_widest_backend_id() {
+        // The cap is derived, so a backend rename or addition moves it instead of clipping.
+        let widest = BackendId::all()
+            .iter()
+            .map(|b| display_width(b.as_str()))
+            .max()
+            .unwrap();
+        assert_eq!(usize::from(MAX_BACKEND_WIDTH), widest);
+    }
+
+    #[test]
+    fn the_accounts_backend_column_fits_its_longest_value() {
+        let mut snap = snapshot();
+        for account in &mut snap.accounts {
+            account.backend = BackendId::OpencodeGo;
+        }
+        let (_, widths, _) = account_columns(&snap, false);
+        assert_eq!(
+            widths[2],
+            display_width(BackendId::OpencodeGo.as_str()) as u16,
+            "BACKEND starts at the longest backend id, not just its header"
+        );
+        // The header is still the floor when every account holds a shorter id.
+        let mut snap = snapshot();
+        for account in &mut snap.accounts {
+            account.backend = BackendId::Cline;
+        }
+        assert_eq!(
+            account_columns(&snap, false).1[2],
+            display_width("BACKEND") as u16
+        );
+    }
+
+    #[test]
+    fn the_recent_backend_column_fits_its_longest_value() {
+        let mut snap = snapshot();
+        snap.recent = vec![crate::monitor::MonitorRequest {
+            ts: 0,
+            model: "cline/cline-pass/deepseek-v4.1-flash".into(),
+            backend: Some(BackendId::OpencodeGo.as_str().into()),
+            label: Some("alex4ndrus".into()),
+            status: 200,
+            duration_ms: 1_234,
+        }];
+        let widths: Vec<u16> = recent_columns(160, &snap)
+            .into_iter()
+            .map(|c| match c {
+                Constraint::Length(n) => n,
+                other => panic!("expected Length, got {other:?}"),
+            })
+            .collect();
+        assert!(
+            widths[2] >= display_width(BackendId::OpencodeGo.as_str()) as u16,
+            "BACKEND is {} cells, needs {}",
+            widths[2],
+            display_width(BackendId::OpencodeGo.as_str())
+        );
     }
 
     #[test]

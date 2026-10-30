@@ -12,7 +12,7 @@ pub enum BackendId {
 }
 
 impl BackendId {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             BackendId::Codex => "codex",
             BackendId::Copilot => "copilot",
@@ -36,7 +36,7 @@ impl BackendId {
     /// Every backend, in the order routing falls back through. `OpencodeGo` is last: an unknown
     /// model keeps landing on the first backend that serves the requested surface, so adding a
     /// backend cannot move an existing model's fallback.
-    pub fn all() -> [BackendId; 5] {
+    pub const fn all() -> [BackendId; 5] {
         [
             BackendId::Codex,
             BackendId::Copilot,
@@ -44,6 +44,28 @@ impl BackendId {
             BackendId::Cline,
             BackendId::OpencodeGo,
         ]
+    }
+
+    /// Terminal cells the longest id occupies, so a UI column can be sized from the ids instead of
+    /// a hardcoded guess: adding a backend or renaming one moves this with it. Counted in bytes,
+    /// which equal cells because every id is ASCII (`BackendId::all().map(as_str)` is asserted so).
+    ///
+    /// @cc [owner:ghuntley,label:cli] backend-id-width-derived
+    /// The value MUST be computed from `BackendId::all()` rather than written as a literal, so that
+    /// adding a backend or renaming one changes the width instead of leaving a column cap that clips
+    /// the new id.
+    pub const fn max_str_width() -> usize {
+        let ids = Self::all();
+        let mut widest = 0;
+        let mut i = 0;
+        while i < ids.len() {
+            let width = ids[i].as_str().len();
+            if width > widest {
+                widest = width;
+            }
+            i += 1;
+        }
+        widest
     }
 }
 
@@ -269,6 +291,28 @@ pub fn now_ms() -> i64 {
 
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod backend_id_tests {
+    use super::*;
+
+    #[test]
+    fn max_str_width_is_the_widest_ascii_id() {
+        for id in BackendId::all() {
+            assert!(
+                id.as_str().is_ascii(),
+                "`{}` must stay ASCII so its byte length is its terminal width",
+                id.as_str()
+            );
+        }
+        let widest = BackendId::all()
+            .iter()
+            .map(|id| id.as_str().len())
+            .max()
+            .unwrap();
+        assert_eq!(BackendId::max_str_width(), widest);
+    }
 }
 
 #[cfg(test)]
