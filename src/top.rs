@@ -42,6 +42,105 @@ impl Drop for TerminalGuard {
 enum Update {
     Snapshot(MonitorSnapshot),
     Error(String),
+    Notice(Notice),
+}
+
+/// Outcome of an operator action, shown in the footer until it expires.
+struct Notice {
+    text: String,
+    ok: bool,
+    at: Instant,
+}
+
+impl Notice {
+    const TTL: Duration = Duration::from_secs(6);
+
+    fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: true,
+            at: Instant::now(),
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: false,
+            at: Instant::now(),
+        }
+    }
+
+    fn visible(&self) -> bool {
+        self.at.elapsed() < Self::TTL
+    }
+}
+
+/// An enable/disable the operator has asked for and not yet confirmed.
+struct Confirm {
+    id: String,
+    label: String,
+    enable: bool,
+}
+
+impl Confirm {
+    fn verb(&self) -> &'static str {
+        if self.enable { "Enable" } else { "Disable" }
+    }
+}
+
+/// The admin API used for the one write this dashboard can make. It is deliberately separate from
+/// [`MonitorTarget`]: the monitor socket is read-only, so an operator action always goes over
+/// authenticated HTTP even when the snapshot arrives over the socket.
+#[derive(Clone)]
+struct Admin {
+    client: reqwest::blocking::Client,
+    url: String,
+    token: String,
+}
+
+impl Admin {
+    fn connect(config: &Config, url_override: Option<String>) -> Result<Self, String> {
+        let (url, token) = admin_http_target(config, url_override)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("HTTP client: {e}"))?;
+        Ok(Self { client, url, token })
+    }
+
+    fn set_enabled(&self, id: &str, enable: bool) -> Result<(), String> {
+        let url = action_url(&self.url, id, enable)?;
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| format!("cannot reach {}: {e}", self.url))?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => Err("admin token rejected (401)".into()),
+            reqwest::StatusCode::NOT_FOUND => Err("account no longer exists".into()),
+            status => Err(format!("server returned {status}")),
+        }
+    }
+}
+
+/// @cc [owner:ghuntley,label:security] account-id-is-one-path-segment
+/// `action_url` MUST reject an account id that is empty or contains anything other than ASCII
+/// alphanumerics, `-`, or `_`, so an id cannot add a path segment, a query, or a traversal to the
+/// admin URL.
+fn action_url(base: &str, id: &str, enable: bool) -> Result<String, String> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("account id is not a single path segment".into());
+    }
+    let action = if enable { "enable" } else { "disable" };
+    Ok(format!("{base}/admin/api/accounts/{id}/{action}"))
 }
 
 enum MonitorTarget {
@@ -118,15 +217,26 @@ pub fn admin_http_target(
 }
 
 /// @cc [owner:ghuntley,label:cli] top-observes-only
-/// `run` MUST obtain dashboard data only through GET requests to the local monitor socket or
-/// authenticated HTTP, MUST leave the local SQLite database untouched, and MUST restore terminal
-/// state on every normal exit or error.
+/// Dashboard data MUST be obtained only through GET requests to the local monitor socket or
+/// authenticated HTTP, and `run` MUST leave the local SQLite database untouched and restore
+/// terminal state on every normal exit or error.
+///
+/// @cc [owner:ghuntley,label:cli] top-operator-toggle
+/// The only write `top` MAY perform is an operator's confirmed enable/disable of the selected
+/// account, and it MUST go through the running server's authenticated admin API
+/// (`POST /admin/api/accounts/{id}/enable|disable`) - never through the monitor socket, which
+/// stays read-only, and never by touching the database. A request MUST be issued only after an
+/// explicit `y` confirmation, and `n`/`Esc` MUST cancel it without contacting the server.
 pub fn run(url_override: Option<String>) -> Result<(), String> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err("underclass top requires an interactive terminal".into());
     }
     let config = Config::load();
-    let target = monitor_target(&config, url_override)?;
+    let target = monitor_target(&config, url_override.clone())?;
+    // Built once so the key binding can report a missing token immediately instead of at the
+    // moment the operator asks for it. It stays separate from the read-only monitor target above:
+    // over HTTP they share an origin and token, over the socket only this side is authenticated.
+    let admin = Admin::connect(&config, url_override);
     let mut client_builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .redirect(reqwest::redirect::Policy::none());
@@ -137,6 +247,7 @@ pub fn run(url_override: Option<String>) -> Result<(), String> {
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
     let (tx, rx) = mpsc::channel();
+    let action_tx = tx.clone();
     let worker_url = match &target {
         MonitorTarget::Socket(_) => "http://localhost/monitor".to_string(),
         MonitorTarget::Http { url, .. } => format!("{url}/admin/api/monitor"),
@@ -183,26 +294,58 @@ pub fn run(url_override: Option<String>) -> Result<(), String> {
                     app.last_seen = Some(Instant::now());
                 }
                 Update::Error(error) => app.error = Some(error),
+                Update::Notice(notice) => app.notice = Some(notice),
             }
+        }
+        if app.notice.as_ref().is_some_and(|notice| !notice.visible()) {
+            app.notice = None;
         }
         if let Err(error) = terminal.draw(|frame| draw(frame, &mut app)) {
             break Err(format!("terminal draw: {error}"));
         }
         match event::poll(Duration::from_millis(100)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break Ok(());
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    if let Some(confirm) = app.confirm.take() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => match admin.as_ref() {
+                                Ok(admin) => app.run_toggle(&confirm, admin, &action_tx),
+                                Err(error) => app.notice = Some(Notice::error(error.clone())),
+                            },
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.notice = Some(Notice::ok(format!(
+                                    "kept {} {}",
+                                    confirm.label,
+                                    if confirm.enable {
+                                        "disabled"
+                                    } else {
+                                        "enabled"
+                                    }
+                                )));
+                            }
+                            _ => app.confirm = Some(confirm),
+                        }
+                        continue;
                     }
-                    KeyCode::Down | KeyCode::Char('j') => app.down(),
-                    KeyCode::Up | KeyCode::Char('k') => app.up(),
-                    KeyCode::PageDown => app.page(10),
-                    KeyCode::PageUp => app.page(-10),
-                    KeyCode::Home => app.selected = 0,
-                    KeyCode::End => app.selected = app.account_count().saturating_sub(1),
-                    _ => {}
-                },
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break Ok(());
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => app.down(),
+                        KeyCode::Up | KeyCode::Char('k') => app.up(),
+                        KeyCode::PageDown => app.page(10),
+                        KeyCode::PageUp => app.page(-10),
+                        KeyCode::Home => app.selected = 0,
+                        KeyCode::End => app.selected = app.account_count().saturating_sub(1),
+                        KeyCode::Char('d') | KeyCode::Char('e') => {
+                            if let Err(error) = app.ask_toggle(key.code == KeyCode::Char('e')) {
+                                app.notice = Some(Notice::error(error));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 Ok(_) => {}
                 Err(error) => break Err(format!("terminal input: {error}")),
             },
@@ -236,6 +379,8 @@ struct App {
     error: Option<String>,
     last_seen: Option<Instant>,
     selected: usize,
+    notice: Option<Notice>,
+    confirm: Option<Confirm>,
 }
 
 impl App {
@@ -253,6 +398,58 @@ impl App {
             .selected
             .saturating_add_signed(delta)
             .min(self.account_count().saturating_sub(1));
+    }
+    fn selected_account(&self) -> Option<&MonitorAccount> {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.accounts.get(self.selected))
+    }
+    /// Queue the enable/disable prompt for the selected account. `e` on an enabled account and `d`
+    /// on a disabled one are no-ops with a notice: re-enabling an enabled account would clear a
+    /// quota deadline the operator never asked to clear, so the action is only offered when it
+    /// changes the state the operator can see.
+    fn ask_toggle(&mut self, enable: bool) -> Result<(), String> {
+        let Some(account) = self.selected_account() else {
+            return Err("no account selected".into());
+        };
+        let disabled = matches!(
+            account.status,
+            AccountStatus::Disabled | AccountStatus::AuthError
+        );
+        if enable != disabled {
+            return Err(format!(
+                "{} is already {}",
+                account.label,
+                if enable { "enabled" } else { "disabled" }
+            ));
+        }
+        self.confirm = Some(Confirm {
+            id: account.id.clone(),
+            label: account.label.clone(),
+            enable,
+        });
+        Ok(())
+    }
+    /// Perform a confirmed toggle. The admin call runs on its own thread so a slow or wedged server
+    /// cannot freeze the dashboard; the result arrives as an [`Update::Notice`].
+    fn run_toggle(&mut self, confirm: &Confirm, admin: &Admin, tx: &mpsc::Sender<Update>) {
+        let admin = admin.clone();
+        let tx = tx.clone();
+        let id = confirm.id.clone();
+        let enable = confirm.enable;
+        let label = confirm.label.clone();
+        let verb = confirm.verb();
+        self.notice = Some(Notice::ok(format!("{verb} {label}…")));
+        std::thread::spawn(move || {
+            let notice = match admin.set_enabled(&id, enable) {
+                Ok(()) => Notice::ok(format!(
+                    "{verb} {label}: {}",
+                    if enable { "enabled" } else { "disabled" }
+                )),
+                Err(error) => Notice::error(format!("{verb} {label} failed: {error}")),
+            };
+            let _ = tx.send(Update::Notice(notice));
+        });
     }
 }
 
@@ -392,14 +589,67 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             sections[3],
         );
     }
-    let help = if compact {
-        " q quit  ↑/↓ scroll  PgUp/PgDn page  ·  counts: upstream attempts"
+    let notice = app.notice.as_ref().filter(|notice| notice.visible());
+    let help = if let Some(notice) = notice {
+        Line::from(Span::styled(
+            format!(" {} ", notice.text),
+            Style::default()
+                .fg(if notice.ok { GREEN } else { RED })
+                .bg(BACKGROUND)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if compact {
+        Line::from(Span::styled(
+            " q quit  ↑/↓ scroll  d/e disable/enable  ·  counts: upstream attempts",
+            Style::default().fg(MUTED).bg(BACKGROUND),
+        ))
     } else {
-        " q quit  ↑/↓ or j/k scroll  PgUp/PgDn page  ·  upstream attempts; unknown tokens excluded from totals"
+        Line::from(Span::styled(
+            " q quit  ↑/↓ or j/k scroll  PgUp/PgDn page  d disable  e enable  ·  upstream attempts; unknown tokens excluded from totals",
+            Style::default().fg(MUTED).bg(BACKGROUND),
+        ))
     };
+    frame.render_widget(Paragraph::new(help), sections[5]);
+    if let Some(confirm) = &app.confirm {
+        draw_confirm(frame, area, confirm);
+    }
+}
+
+/// The confirmation prompt. It names the account and the action, so a mistyped `y` cannot disable a
+/// different account than the one the operator was looking at, and it is the only path to a write.
+fn draw_confirm(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, confirm: &Confirm) {
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{} {}?", confirm.verb(), display_text(&confirm.label)),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y confirm · n/Esc cancel",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    // Three lines plus two borders; the width is bounded by the panel so a long label wraps rather
+    // than pushing the popup past the terminal edge.
+    let width = area.width.saturating_sub(4).clamp(24, 52).min(area.width);
+    let height = 5u16.min(area.height);
+    let popup = ratatui::layout::Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = panel()
+        .title(" confirm ")
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .border_style(Style::default().fg(if confirm.enable { GREEN } else { YELLOW }));
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(MUTED).bg(BACKGROUND)),
-        sections[5],
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        popup,
     );
 }
 
@@ -1754,5 +2004,237 @@ mod fit_tests {
                 "cooling credits 12m +1".len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+    use crate::monitor::{Counters, MonitorAccount, MonitorSnapshot};
+    use ratatui::backend::TestBackend;
+
+    fn snapshot(statuses: &[(&str, AccountStatus)]) -> MonitorSnapshot {
+        MonitorSnapshot {
+            now_ms: 1_000_000,
+            month_start_ms: 0,
+            accounts: statuses
+                .iter()
+                .map(|(label, status)| MonitorAccount {
+                    id: format!("id-{label}"),
+                    label: (*label).into(),
+                    backend: BackendId::Cline,
+                    plan: None,
+                    status: *status,
+                    reset_at: 0,
+                    cooling_scopes: Default::default(),
+                    inflight: 0,
+                    sticky_sessions: 0,
+                    month: Counters::default(),
+                    quota: None,
+                    observation: None,
+                })
+                .collect(),
+            month: Counters::default(),
+            last_minute: Counters::default(),
+            minute_bins: vec![0; 60],
+            recent: vec![],
+        }
+    }
+
+    fn app(statuses: &[(&str, AccountStatus)]) -> App {
+        App {
+            snapshot: Some(snapshot(statuses)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_the_visible_state_change_is_offered() {
+        let mut enabled = app(&[("alex4ndrus", AccountStatus::Healthy)]);
+        assert!(enabled.ask_toggle(true).is_err(), "already enabled");
+        assert!(enabled.confirm.is_none(), "a refused ask must not prompt");
+        enabled.ask_toggle(false).unwrap();
+        let confirm = enabled.confirm.as_ref().unwrap();
+        assert_eq!(confirm.id, "id-alex4ndrus");
+        assert_eq!(confirm.label, "alex4ndrus");
+        assert!(!confirm.enable);
+
+        let mut disabled = app(&[("413x5", AccountStatus::Disabled)]);
+        assert!(disabled.ask_toggle(false).is_err(), "already disabled");
+        disabled.ask_toggle(true).unwrap();
+        assert!(disabled.confirm.as_ref().unwrap().enable);
+
+        // `AuthError` is recoverable through the same enable path the admin API exposes.
+        let mut failed = app(&[("b", AccountStatus::AuthError)]);
+        failed.ask_toggle(true).unwrap();
+        assert!(failed.confirm.is_some());
+    }
+
+    #[test]
+    fn a_cooling_account_is_still_enabled() {
+        // Cooling is upstream quota, not an operator disable: offering enable would let a keypress
+        // clear a deadline the operator did not ask to clear.
+        let mut cooling = app(&[("c", AccountStatus::Cooling)]);
+        assert!(cooling.ask_toggle(true).is_err());
+        cooling.ask_toggle(false).unwrap();
+    }
+
+    #[test]
+    fn the_prompt_follows_the_selection() {
+        let mut app = app(&[
+            ("alex4ndrus", AccountStatus::Healthy),
+            ("413x5", AccountStatus::Healthy),
+        ]);
+        app.selected = 1;
+        app.ask_toggle(false).unwrap();
+        assert_eq!(app.confirm.as_ref().unwrap().label, "413x5");
+        // A move while the prompt is open does not retarget it.
+        app.down();
+        assert_eq!(app.confirm.as_ref().unwrap().label, "413x5");
+    }
+
+    #[test]
+    fn an_empty_snapshot_prompts_nothing() {
+        let mut empty = App::default();
+        assert!(empty.ask_toggle(false).is_err());
+        assert!(empty.confirm.is_none());
+    }
+
+    #[test]
+    fn action_url_is_one_path_segment() {
+        assert_eq!(
+            action_url("http://127.0.0.1:8080", "ab-12_cd", true).unwrap(),
+            "http://127.0.0.1:8080/admin/api/accounts/ab-12_cd/enable"
+        );
+        assert_eq!(
+            action_url("http://127.0.0.1:8080", "ab", false).unwrap(),
+            "http://127.0.0.1:8080/admin/api/accounts/ab/disable"
+        );
+        for bad in ["", "..", "a/b", "a?x=1", "a b", "a#f", "%2e%2e"] {
+            assert!(
+                action_url("http://127.0.0.1:8080", bad, true).is_err(),
+                "{bad:?} must not reach the admin URL"
+            );
+        }
+    }
+
+    #[test]
+    fn the_confirmation_prompt_names_the_account_and_action() {
+        let mut app = app(&[("alex4ndrus", AccountStatus::Healthy)]);
+        app.ask_toggle(false).unwrap();
+        app.notice = Some(Notice::ok("Disable alex4ndrus…"));
+        let screen = render(&mut app, 134);
+        assert!(
+            screen.contains("Disable alex4ndrus?"),
+            "the prompt must name the action and the account:\n{screen}"
+        );
+        assert!(
+            screen.contains("y confirm"),
+            "the prompt must say how to confirm"
+        );
+        assert!(
+            screen.contains("Disable alex4ndrus…"),
+            "the footer shows the notice"
+        );
+    }
+
+    /// Stand up a one-shot HTTP server that records the request line and headers, so the toggle can
+    /// be checked against the wire the server actually receives rather than against its own helpers.
+    fn one_shot_server(status: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap() == 0 {
+                    break;
+                }
+                let done = line == "\r\n";
+                request.push_str(&line);
+                if done {
+                    break;
+                }
+            }
+            use std::io::Write;
+            let _ = stream.write_all(
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .as_bytes(),
+            );
+            request
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    fn admin(base: String) -> Admin {
+        Admin {
+            client: reqwest::blocking::Client::builder().build().unwrap(),
+            url: base,
+            token: "secret-token".into(),
+        }
+    }
+
+    #[test]
+    fn a_confirmed_toggle_posts_to_the_admin_api_with_the_token() {
+        for (enable, action) in [(false, "disable"), (true, "enable")] {
+            let (base, server) = one_shot_server("204 No Content");
+            admin(base).set_enabled("ab-12", enable).unwrap();
+            let request = server.join().unwrap();
+            assert!(
+                request.starts_with(&format!("POST /admin/api/accounts/ab-12/{action} HTTP/1.1")),
+                "{request}"
+            );
+            let lowered = request.to_ascii_lowercase();
+            assert!(
+                lowered.contains("authorization: bearer secret-token"),
+                "the admin token must authenticate the write:\n{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_toggle_reports_the_status() {
+        let (base, server) = one_shot_server("401 Unauthorized");
+        let error = admin(base).set_enabled("ab", true).unwrap_err();
+        let _ = server.join();
+        assert!(error.contains("401"), "{error}");
+
+        let (base, server) = one_shot_server("404 Not Found");
+        let error = admin(base).set_enabled("ab", true).unwrap_err();
+        let _ = server.join();
+        assert!(error.contains("no longer exists"), "{error}");
+    }
+
+    #[test]
+    fn an_unsafe_id_never_reaches_the_network() {
+        // No server is listening on this port: a request attempt would fail differently.
+        let admin = admin("http://127.0.0.1:1".into());
+        let error = admin.set_enabled("../secrets", true).unwrap_err();
+        assert!(error.contains("path segment"), "{error}");
+    }
+
+    #[test]
+    fn a_notice_expires() {
+        let notice = Notice::ok("done");
+        assert!(notice.visible());
+        let stale = Notice {
+            at: Instant::now() - Notice::TTL - Duration::from_secs(1),
+            ..notice
+        };
+        assert!(!stale.visible());
+    }
+
+    fn render(app: &mut App, width: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 }
