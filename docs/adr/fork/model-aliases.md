@@ -24,7 +24,7 @@ in the request id, so clients cannot express "subscription only" vs "credits onl
   a config-driven classification. The DB stays as close to upstream as possible.
 - **Config** (`~/.config/underclass/config.toml`, `[model_aliases]`): maps alias kind →
   list of catalog-id prefixes. Default:
-  - `subscription = ["cline/cline-pass/", "opencode_go/"]`
+  - `subscription = ["cline/cline-pass/", "opencode-go/"]`
   - `credits = ["cline/"]`
   - `default_kind = "subscription"`
   Operator overrides merge per-kind over defaults, so a partial config never drops other
@@ -33,7 +33,7 @@ in the request id, so clients cannot express "subscription only" vs "credits onl
   subscription, `credits` → credits. Other backends match configured prefixes (longest
   prefix wins); unmatched → default kind.
 - **Base name = last path segment** of the model id. `cline/openai/gpt-5.2` →
-  `credits/gpt-5.2`; `opencode_go/deepseek-v4.1-flash` → `subscription/deepseek-v4.1-flash`.
+  `credits/gpt-5.2`; `opencode-go/deepseek-v4.1-flash` → `subscription/deepseek-v4.1-flash`.
 - **Alias table** is an in-memory `HashMap<String, Vec<(BackendId, concrete_model_id)>>`
   built on boot and rebuilt when any catalog changes (periodic sync + explicit refresh).
 - **PoolCore** gains `aliases` + `alias_config` and alias-aware `serves`, `declared_scope`,

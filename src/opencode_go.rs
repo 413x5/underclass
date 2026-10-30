@@ -28,7 +28,7 @@ use std::sync::Mutex;
 pub const DEFAULT_UPSTREAM: &str = "https://opencode.ai/inference/go";
 /// The Console API, used to verify a key and learn who it belongs to.
 pub const DEFAULT_CONSOLE: &str = "https://opencode.ai/console";
-pub const MODEL_PREFIX: &str = "opencode_go/";
+pub const MODEL_PREFIX: &str = "opencode-go/";
 /// Go asks a client to identify itself with its own user agent rather than a generic SDK name, so
 /// the client's own value travels upstream when it sent one. See `crate::user_agent`.
 pub const USER_AGENT: &str = crate::user_agent::DEFAULT;
@@ -66,13 +66,27 @@ pub enum Wire {
     Responses,
 }
 
-/// Strips the pool-facing `opencode_go/` namespace, yielding the id Go expects upstream.
+/// Strips the pool-facing `opencode-go/` namespace, yielding the id Go expects upstream.
+pub const LEGACY_MODEL_PREFIX: &str = "opencode_go/";
+
 pub fn upstream_model_id(model: &str) -> &str {
-    model.strip_prefix(MODEL_PREFIX).unwrap_or(model)
+    model
+        .strip_prefix(MODEL_PREFIX)
+        .or_else(|| model.strip_prefix(LEGACY_MODEL_PREFIX))
+        .unwrap_or(model)
 }
 
 pub fn pool_model_id(upstream: &str) -> String {
     format!("{MODEL_PREFIX}{upstream}")
+}
+
+/// Normalize a client-facing or persisted model id to the current `MODEL_PREFIX` namespace,
+/// accepting the legacy `opencode_go/` prefix. Unprefixed ids pass through.
+pub fn normalize_model_id(model: &str) -> String {
+    if let Some(rest) = model.strip_prefix(LEGACY_MODEL_PREFIX) {
+        return format!("{MODEL_PREFIX}{rest}");
+    }
+    model.to_string()
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-wire-family
@@ -235,7 +249,7 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-catalog-namespaced
-/// `default_catalog` MUST expose every routable entry under the `opencode_go/` prefix, MUST take the
+/// `default_catalog` MUST expose every routable entry under the `opencode-go/` prefix, MUST take the
 /// limits recorded for it here, MUST leave `scope` empty so a `402` cools the account rather than
 /// an invented billing surface, and MUST NOT include an id whose wire family is unknown, so
 /// nothing the backend cannot route is ever advertised to a client.
@@ -699,8 +713,8 @@ mod tests {
 
     #[test]
     fn namespace_round_trips() {
-        assert_eq!(pool_model_id("kimi-k3"), "opencode_go/kimi-k3");
-        assert_eq!(upstream_model_id("opencode_go/kimi-k3"), "kimi-k3");
+        assert_eq!(pool_model_id("kimi-k3"), "opencode-go/kimi-k3");
+        assert_eq!(upstream_model_id("opencode-go/kimi-k3"), "kimi-k3");
         // An unprefixed id is passed through, so a hand-written catalog entry still routes.
         assert_eq!(upstream_model_id("kimi-k3"), "kimi-k3");
     }
@@ -712,9 +726,9 @@ mod tests {
             assert!(wire_for(id).is_some(), "{id} must declare a wire family");
         }
         assert_eq!(wire_for("grok-4.7"), Some(Wire::Responses));
-        assert_eq!(wire_for("opencode_go/gpt-6-luna"), Some(Wire::Responses));
+        assert_eq!(wire_for("opencode-go/gpt-6-luna"), Some(Wire::Responses));
         assert_eq!(wire_for("glm-5.3"), Some(Wire::Chat));
-        assert_eq!(wire_for("opencode_go/glm-5.3"), Some(Wire::Chat));
+        assert_eq!(wire_for("opencode-go/glm-5.3"), Some(Wire::Chat));
         // Anthropic/Gemini-only ids and ids this build has never seen are not routable here.
         assert_eq!(wire_for("claude-haiku-5-5"), None);
         assert_eq!(wire_for("qwen3.8-max"), None);
@@ -726,19 +740,19 @@ mod tests {
     fn catalog_omits_models_this_surface_cannot_reach() {
         let catalog = default_catalog();
         let ids: Vec<&str> = catalog.iter().map(|model| model.id.as_str()).collect();
-        assert!(ids.contains(&"opencode_go/kimi-k3"));
-        assert!(ids.contains(&"opencode_go/gpt-6-luna"));
-        assert!(!ids.contains(&"opencode_go/claude-haiku-5-5"));
-        assert!(!ids.contains(&"opencode_go/minimax-m3"));
-        assert!(!ids.contains(&"opencode_go/gemini-4-argon-contributor"));
+        assert!(ids.contains(&"opencode-go/kimi-k3"));
+        assert!(ids.contains(&"opencode-go/gpt-6-luna"));
+        assert!(!ids.contains(&"opencode-go/claude-haiku-5-5"));
+        assert!(!ids.contains(&"opencode-go/minimax-m3"));
+        assert!(!ids.contains(&"opencode-go/gemini-4-argon-contributor"));
         // Ids Go advertises but does not serve for this plan are not offered either: routing a
         // client to one produces a refusal the client can only retry.
         for dead in [
-            "opencode_go/mimo-v2.5-pro",
-            "opencode_go/space-bunny",
-            "opencode_go/step-5-preview-free",
-            "opencode_go/longcat-2.5-preview-free",
-            "opencode_go/minimax-m3.1-flash-free",
+            "opencode-go/mimo-v2.5-pro",
+            "opencode-go/space-bunny",
+            "opencode-go/step-5-preview-free",
+            "opencode-go/longcat-2.5-preview-free",
+            "opencode-go/minimax-m3.1-flash-free",
         ] {
             assert!(
                 !ids.contains(&dead),
@@ -762,7 +776,7 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert_eq!(ids, vec!["opencode_go/glm-5.3", "opencode_go/kimi-k3"]);
+        assert_eq!(ids, vec!["opencode-go/glm-5.3", "opencode-go/kimi-k3"]);
         assert!(parse_models_response(&json!({})).is_empty());
         assert!(parse_models_response(&json!({"data": "nope"})).is_empty());
     }
@@ -778,7 +792,7 @@ mod tests {
     #[test]
     fn operator_limits_survive_a_refresh() {
         let stored = vec![ModelInfo {
-            id: "opencode_go/kimi-k3".into(),
+            id: "opencode-go/kimi-k3".into(),
             name: "Kimi K3".into(),
             context: 42,
             input: 41,
@@ -801,7 +815,7 @@ mod tests {
     #[test]
     fn a_blank_stored_name_keeps_the_recorded_one() {
         let stored = vec![ModelInfo {
-            id: "opencode_go/kimi-k3".into(),
+            id: "opencode-go/kimi-k3".into(),
             name: "  ".into(),
             context: 0,
             input: 0,
@@ -816,7 +830,7 @@ mod tests {
     #[test]
     fn an_unknown_id_never_inherits_another_models_limits() {
         let stored = vec![ModelInfo {
-            id: "opencode_go/kimi-k3".into(),
+            id: "opencode-go/kimi-k3".into(),
             name: "Kimi K3".into(),
             context: 42,
             input: 41,
@@ -824,7 +838,7 @@ mod tests {
             scope: String::new(),
         }];
         let mut fetched = vec![ModelInfo {
-            id: "opencode_go/kimi-k3-preview".into(),
+            id: "opencode-go/kimi-k3-preview".into(),
             name: String::new(),
             context: 0,
             input: 0,
@@ -855,19 +869,19 @@ mod tests {
         let account = account();
         // The client's own path is irrelevant: Go serves each model over one API.
         assert_eq!(
-            backend.rewrite_url("/v1/responses", "opencode_go/gpt-6-luna", &account),
+            backend.rewrite_url("/v1/responses", "opencode-go/gpt-6-luna", &account),
             format!("{}/openai/v1/responses", upstream_base())
         );
         assert_eq!(
-            backend.rewrite_url("/v1/chat/completions", "opencode_go/grok-4.7", &account),
+            backend.rewrite_url("/v1/chat/completions", "opencode-go/grok-4.7", &account),
             format!("{}/openai/v1/responses", upstream_base())
         );
         assert_eq!(
-            backend.rewrite_url("/v1/responses", "opencode_go/kimi-k3", &account),
+            backend.rewrite_url("/v1/responses", "opencode-go/kimi-k3", &account),
             format!("{}/openai/v1/chat/completions", upstream_base())
         );
         assert_eq!(
-            backend.rewrite_url("/v1/chat/completions", "opencode_go/kimi-k3", &account),
+            backend.rewrite_url("/v1/chat/completions", "opencode-go/kimi-k3", &account),
             format!("{}/openai/v1/chat/completions", upstream_base())
         );
     }
@@ -875,14 +889,14 @@ mod tests {
     #[test]
     fn only_chat_family_models_translate_a_responses_request() {
         let backend = backend();
-        assert!(backend.responses_via_chat("opencode_go/kimi-k3"));
-        assert!(!backend.responses_via_chat("opencode_go/gpt-6-luna"));
+        assert!(backend.responses_via_chat("opencode-go/kimi-k3"));
+        assert!(!backend.responses_via_chat("opencode-go/gpt-6-luna"));
         // An id this build cannot classify reaches the chat endpoint, so it must be translated
         // too: the path and the body shape are two views of one decision.
-        assert_eq!(upstream_wire("opencode_go/never-heard-of-it"), Wire::Chat);
-        assert!(backend.responses_via_chat("opencode_go/never-heard-of-it"));
+        assert_eq!(upstream_wire("opencode-go/never-heard-of-it"), Wire::Chat);
+        assert!(backend.responses_via_chat("opencode-go/never-heard-of-it"));
         assert_eq!(
-            backend.rewrite_url("/v1/responses", "opencode_go/never-heard-of-it", &account()),
+            backend.rewrite_url("/v1/responses", "opencode-go/never-heard-of-it", &account()),
             format!("{}/openai/v1/chat/completions", upstream_base())
         );
     }
@@ -890,7 +904,7 @@ mod tests {
     #[test]
     fn the_model_namespace_is_stripped_before_the_upstream_call() {
         let backend = backend();
-        let mut body = json!({"model": "opencode_go/kimi-k3", "messages": []});
+        let mut body = json!({"model": "opencode-go/kimi-k3", "messages": []});
         backend.prepare_body(&mut body);
         assert_eq!(body["model"], "kimi-k3");
     }
@@ -979,20 +993,20 @@ mod tests {
     #[test]
     fn chat_streams_ask_for_usage_and_responses_do_not() {
         let backend = backend();
-        let mut chat = json!({"model": "opencode_go/kimi-k3", "messages": [], "stream": true});
+        let mut chat = json!({"model": "opencode-go/kimi-k3", "messages": [], "stream": true});
         assert!(backend.auto_stream_usage("/v1/chat/completions", &mut chat));
         assert_eq!(chat["stream_options"], json!({"include_usage": true}));
 
         // A Responses-family model reaches the Responses API even from the chat path, so it must
         // not gain a chat-only parameter.
         let mut responses =
-            json!({"model": "opencode_go/gpt-6-luna", "messages": [], "stream": true});
+            json!({"model": "opencode-go/gpt-6-luna", "messages": [], "stream": true});
         assert!(!backend.auto_stream_usage("/v1/chat/completions", &mut responses));
         assert!(responses.get("stream_options").is_none());
 
         // A client that already chose stays untouched.
         let mut chosen = json!({
-            "model": "opencode_go/kimi-k3",
+            "model": "opencode-go/kimi-k3",
             "messages": [],
             "stream": true,
             "stream_options": {"include_usage": false, "other": 1}
@@ -1004,7 +1018,7 @@ mod tests {
         );
 
         // A non-streaming request is left alone.
-        let mut plain = json!({"model": "opencode_go/kimi-k3", "messages": []});
+        let mut plain = json!({"model": "opencode-go/kimi-k3", "messages": []});
         assert!(!backend.auto_stream_usage("/v1/chat/completions", &mut plain));
         assert!(plain.get("stream_options").is_none());
     }

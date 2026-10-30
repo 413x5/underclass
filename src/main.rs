@@ -675,8 +675,8 @@ async fn refresh_cline_catalogs_on_boot(state: &Arc<proxy::AppState>) {
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-catalog-refreshed-on-boot
-/// On boot, every Go account holding a key MUST refresh the Go catalog, and a successful non-empty
-/// response MUST replace the stored and routable catalog so a model Go has published since the
+/// On boot, every OpenCode Go account holding a key MUST refresh the OpenCode Go catalog, and a successful non-empty
+/// response MUST replace the stored and routable catalog so a model OpenCode Go has published since the
 /// last build becomes routable without a restart.
 async fn refresh_opencode_go_catalogs_on_boot(state: &Arc<proxy::AppState>) {
     let accounts: Vec<models::Account> = state

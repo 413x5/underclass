@@ -34,7 +34,7 @@ struct MockState {
     /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
     /// credential rejection that a token refresh clears.
     forbidden: std::collections::HashMap<String, u32>,
-    /// The paths Go requests arrived on, in order, so a test can assert that a model was sent to
+    /// The paths OpenCode Go requests arrived on, in order, so a test can assert that a model was sent to
     /// the upstream API its family requires rather than the path the client used.
     go_paths: VecDeque<String>,
     /// The `x-opencode-session` value per request, in order.
@@ -225,7 +225,7 @@ async fn mock_responses(
         )
             .into_response();
     }
-    // Go reports a model it cannot currently serve as 402 "Endpoint is unavailable", which is one
+    // OpenCode Go reports a model it cannot currently serve as 402 "Endpoint is unavailable", which is one
     // model's outage and must not take the account out of rotation for every other model.
     if bearer.starts_with("go-endpoint-") && requested_model == "kimi-k3" {
         return (
@@ -239,7 +239,7 @@ async fn mock_responses(
         )
             .into_response();
     }
-    // Go meters usage per model and reports the exhaustion as a rate limit on that model.
+    // OpenCode Go meters usage per model and reports the exhaustion as a rate limit on that model.
     if bearer.starts_with("go-quota-") && requested_model == "kimi-k3" {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -247,7 +247,7 @@ async fn mock_responses(
                 axum::http::header::CONTENT_TYPE,
                 "application/json".to_string(),
             )],
-            r#"{"error":{"type":"server_error","message":"Upstream request failed: Go usage limit reached for this model"}}"#
+            r#"{"error":{"type":"server_error","message":"Upstream request failed: OpenCode Go usage limit reached for this model"}}"#
                 .to_string(),
         )
             .into_response();
@@ -562,7 +562,7 @@ fn scoped_model(id: &str, scope: &str) -> ModelInfo {
     }
 }
 
-/// Go holds a static Console API key in the same column as Cline's.
+/// OpenCode Go holds a static Console API key in the same column as Cline's.
 fn go_account(id: &str, token: &str) -> Account {
     let mut a = account(id, BackendId::OpencodeGo, "unused-access");
     a.refresh_token = Some(token.to_string());
@@ -2274,7 +2274,7 @@ async fn e2e_translated_overload_replay_is_a_responses_stream() {
 }
 
 /// @cc [owner:ghuntley,label:proxy] opencode-go-routes-by-model-family
-/// A Go request MUST reach the upstream path its model's family requires, whatever path the
+/// A OpenCode Go request MUST reach the upstream path its model's family requires, whatever path the
 /// client used, and MUST carry a session id. The client's own path is not the family: a
 /// Chat-Completions model asked for over `/v1/responses` must still go upstream as chat (and be
 /// translated), and a Responses-family model asked for over `/v1/chat/completions` must still go
@@ -2283,8 +2283,8 @@ async fn e2e_translated_overload_replay_is_a_responses_stream() {
 async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
     let mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let chat_model = model("opencode_go/kimi-k3");
-    let responses_model = model("opencode_go/gpt-6-luna");
+    let chat_model = model("opencode-go/kimi-k3");
+    let responses_model = model("opencode-go/gpt-6-luna");
     store.set_catalog(
         BackendId::OpencodeGo,
         &[chat_model.clone(), responses_model.clone()],
@@ -2339,7 +2339,7 @@ async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
             .iter()
             .all(|path| path.ends_with("/openai/v1/chat/completions")
                 || path.ends_with("/openai/v1/responses")),
-        "Go requests must use its OpenAI surface: {paths:?}"
+        "OpenCode Go requests must use its OpenAI surface: {paths:?}"
     );
     assert!(
         paths.iter().any(|p| p.ends_with("/chat/completions")),
@@ -2350,7 +2350,7 @@ async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
         "the Responses-family model must go upstream as responses: {paths:?}"
     );
     assert!(
-        attempted.iter().all(|m| !m.starts_with("opencode_go/")),
+        attempted.iter().all(|m| !m.starts_with("opencode-go/")),
         "the pool namespace must not reach Go: {attempted:?}"
     );
     assert!(
@@ -2359,19 +2359,19 @@ async fn e2e_go_routes_each_model_to_its_own_upstream_api() {
     );
     assert!(
         sessions.iter().all(|s| !s.is_empty()),
-        "every request needs a session id or Go refuses it: {sessions:?}"
+        "every request needs a session id or OpenCode Go refuses it: {sessions:?}"
     );
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-session-pinned-to-one-account
-/// A session that starts on a Go account MUST keep reaching that same account while it is eligible,
+/// A session that starts on a OpenCode Go account MUST keep reaching that same account while it is eligible,
 /// so Go's prompt cache stays warm, and MUST only move when that account can no longer serve. A
 /// second account in the pool MUST NOT attract the session, however idle it is.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_go_session_stays_pinned_to_its_account() {
     mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let model = model("opencode_go/kimi-k3");
+    let model = model("opencode-go/kimi-k3");
     store.set_catalog(BackendId::OpencodeGo, std::slice::from_ref(&model));
     // Two accounts so a non-sticky choice has somewhere else to go.
     store.upsert_account(&go_account("go-pin-a", "go-pin-a"));
@@ -2449,15 +2449,15 @@ async fn e2e_go_session_stays_pinned_to_its_account() {
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-unavailable-endpoint-leaves-the-account-serving
-/// A Go `402` naming an unavailable endpoint MUST cool only the requested model: Go answers a model
+/// A Go `402` naming an unavailable endpoint MUST cool only the requested model: OpenCode Go answers a model
 /// it cannot currently serve that way, and cooling the account would take every other model out of
 /// rotation for one model's outage.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let unavailable = model("opencode_go/kimi-k3");
-    let other = model("opencode_go/glm-5.3");
+    let unavailable = model("opencode-go/kimi-k3");
+    let other = model("opencode-go/glm-5.3");
     store.set_catalog(BackendId::OpencodeGo, &[unavailable.clone(), other.clone()]);
     store.upsert_account(&go_account("opencode-go-endpoint", "go-endpoint-1"));
     let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
@@ -2470,7 +2470,7 @@ async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
         .send()
         .await
         .unwrap();
-    // With one Go account, the model-scoped cooldown leaves no eligible account for that model, so
+    // With one OpenCode Go account, the model-scoped cooldown leaves no eligible account for that model, so
     // the pool fails fast. What matters is that the ACCOUNT is untouched: the next assertion shows
     // its other models still serve.
     assert_eq!(
@@ -2489,7 +2489,7 @@ async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
     assert!(
         pool.lock()
             .unwrap()
-            .model_cooling_until("opencode-go-endpoint", "opencode_go/kimi-k3")
+            .model_cooling_until("opencode-go-endpoint", "opencode-go/kimi-k3")
             .is_some_and(|until| until > now_ms()),
         "the unavailable model must cool"
     );
@@ -2508,14 +2508,14 @@ async fn e2e_go_unavailable_endpoint_leaves_the_account_serving() {
     );
 }
 
-/// Go meters usage per model, so a 429 must cool the requested model on that account and leave the
+/// OpenCode Go meters usage per model, so a 429 must cool the requested model on that account and leave the
 /// rest of its catalog servable.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_go_rate_limit_cools_only_the_model() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    let limited = model("opencode_go/kimi-k3");
-    let other = model("opencode_go/glm-5.3");
+    let limited = model("opencode-go/kimi-k3");
+    let other = model("opencode-go/glm-5.3");
     store.set_catalog(BackendId::OpencodeGo, &[limited.clone(), other.clone()]);
     store.upsert_account(&go_account("opencode-go-quota", "go-quota-1"));
     let (base, _logs, pool) = spawn_app(store.clone(), 3_600_000).await;
@@ -2545,7 +2545,7 @@ async fn e2e_go_rate_limit_cools_only_the_model() {
     let cooling = pool
         .lock()
         .unwrap()
-        .model_cooling_until("opencode-go-quota", "opencode_go/kimi-k3");
+        .model_cooling_until("opencode-go-quota", "opencode-go/kimi-k3");
     assert!(
         cooling.is_some_and(|until| until > now_ms()),
         "the limited model must cool"
@@ -2574,7 +2574,7 @@ async fn e2e_fork_backends_forward_the_client_user_agent() {
     mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
     store.set_catalog(BackendId::Cline, &[model(CLINE_TEST_MODEL)]);
-    store.set_catalog(BackendId::OpencodeGo, &[model("opencode_go/kimi-k3")]);
+    store.set_catalog(BackendId::OpencodeGo, &[model("opencode-go/kimi-k3")]);
     store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
     store.upsert_account(&cline_account("cline-ua", "cline-token-ua"));
     store.upsert_account(&go_account("go-ua", "go-token-ua"));
@@ -2605,7 +2605,7 @@ async fn e2e_fork_backends_forward_the_client_user_agent() {
         "Cline must present the client's own user agent"
     );
 
-    let go = post("/v1/chat/completions", "opencode_go/kimi-k3").await;
+    let go = post("/v1/chat/completions", "opencode-go/kimi-k3").await;
     assert_eq!(go.status(), 200);
     assert_eq!(
         upstream_user_agent("go-token-ua", 0),
@@ -2632,7 +2632,7 @@ async fn e2e_fork_backends_forward_the_client_user_agent() {
 async fn e2e_fork_backends_default_user_agent_when_the_client_sends_none() {
     mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    store.set_catalog(BackendId::OpencodeGo, &[model("opencode_go/kimi-k3")]);
+    store.set_catalog(BackendId::OpencodeGo, &[model("opencode-go/kimi-k3")]);
     store.upsert_account(&go_account("go-ua-default", "go-token-default"));
     let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
     let http = reqwest::Client::new();
@@ -2640,7 +2640,7 @@ async fn e2e_fork_backends_default_user_agent_when_the_client_sends_none() {
     let response = http
         .post(format!("{base}/v1/chat/completions"))
         .header("Authorization", concat!("Bear", "er ", "test-key"))
-        .json(&serde_json::json!({"model": "opencode_go/kimi-k3", "messages": []}))
+        .json(&serde_json::json!({"model": "opencode-go/kimi-k3", "messages": []}))
         .send()
         .await
         .unwrap();
@@ -2658,7 +2658,7 @@ async fn e2e_fork_backends_default_user_agent_when_the_client_sends_none() {
 async fn e2e_configured_user_agent_overrides_the_client_value() {
     mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
-    store.set_catalog(BackendId::OpencodeGo, &[model("opencode_go/kimi-k3")]);
+    store.set_catalog(BackendId::OpencodeGo, &[model("opencode-go/kimi-k3")]);
     store.upsert_account(&go_account("go-ua-override", "go-token-override"));
     let (base, _logs, _pool) =
         spawn_app_with_user_agent(store.clone(), 400, Some("underclass-fleet/2")).await;
@@ -2668,7 +2668,7 @@ async fn e2e_configured_user_agent_overrides_the_client_value() {
         .post(format!("{base}/v1/chat/completions"))
         .header("Authorization", concat!("Bear", "er ", "test-key"))
         .header("User-Agent", "opencode/1.17.0")
-        .json(&serde_json::json!({"model": "opencode_go/kimi-k3", "messages": []}))
+        .json(&serde_json::json!({"model": "opencode-go/kimi-k3", "messages": []}))
         .send()
         .await
         .unwrap();
