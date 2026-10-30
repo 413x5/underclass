@@ -1,6 +1,17 @@
 # underclass
 
-**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, Cline, and OpenCode Go subscriptions behind one endpoint.**
+**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, ClinePass, and OpenCode Go subscriptions behind one endpoint.**
+
+## Fork features
+
+- **Virtual models (model aliases).** Request `subscriptions/<model>`, `credits/<model>`, or `free/<model>`, for routing by billing surface, or to free models, across all configured and enabled accounts. Free models never cool a billing surface.
+- **OpenCode Go backend.** Pools OpenCode Go subscriptions, `x-opencode-session` sticky header, per-model `429`/`402` cooling, client user-agent forwarding, dynamic catalog from models.dev + Go's `/v1/models` listing.
+- **ClinePass + ClineFree + Cline Usage-Billing backend.** Chat Completions translation for `/v1/responses`, models feed discovery, client user-agent forwarding, per-billing-surface quota cooling.
+
+Architecture decision records: [`docs/adr/fork`](docs/adr/fork/README.md).
+
+---
+
 
 ```
                        ┌────────────────────────────────────┐
@@ -17,10 +28,10 @@
   live request feed)   │  per-surface quota cooling         │       OAuth paste-back)
                        │                                    │────► api.cline.bot
                        │                                    │      (J API keys,
-                       │                                    │       Cline + ClinePass)
+                       │                                    │       ClinePass subs + Cline Credits)
                        │                                    │────► opencode.ai/inference/go
                        └────────────────────────────────────┘      (I API keys,
-                                                                     OpenCode Go)
+                                                                     OpenCode Go subs)
 ```
 
 One subscription runs out of quota? It leaves rotation until its window resets — and comes back on its own. Sessions stay pinned to one subscription so upstream prompt caches stay warm. When *everything* is exhausted, the proxy fails fast with the earliest reset time instead of hanging.
@@ -53,7 +64,7 @@ never writes them to diagnostics. Open the web UI and paste the value supplied a
 `UNDERCLASS_UI_TOKEN`.
 
 1. Open the web UI and paste the configured admin token.
-2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, or *Claude Code (Anthropic)* → follow the flow, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys, or pick *OpenCode Go (API key)* and paste a key from [opencode.ai/console](https://opencode.ai/console) → Account → Personal API keys. Accounts are labeled automatically with the account's email, username, or Go workspace.
+2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, or *Claude Code (Anthropic)* → follow the flow, or pick *Cline (API key)* and paste a key from [app.cline.bot](https://app.cline.bot) → Settings → API Keys, or pick *OpenCode Go (API key)* and paste a key from [opencode.ai/console](https://opencode.ai/console) → Account → Personal API keys. Accounts are labeled automatically with the account's email, username, or OpenCode workspace.
 3. Repeat for every subscription you want in the pool.
 4. Point opencode at the pool:
 
@@ -105,9 +116,9 @@ Optional `~/.config/underclass/config.toml`:
 | `claude_cooldown_secs` | `1800` | same, for Claude Code accounts |
 | `cline_cooldown_secs` | `1800` | same, for Cline (applied on `402`, scoped to the model's billing surface) |
 | `opencode_go_cooldown_secs` | `1800` | same, for OpenCode Go (applied on `429`, scoped to the requested model) |
-| `user_agent` | unset | outbound user agent for the fork's backends (Cline and OpenCode Go); unset forwards the client's own |
-| `cline_user_agent` | `user_agent` | per-backend override for Cline |
-| `opencode_go_user_agent` | `user_agent` | per-backend override for OpenCode Go |
+| `user_agent` | `unset` | outbound user agent for Cline and OpenCode Go; unset forwards the client's own |
+| `cline_user_agent` | `unset` | per-backend override for Cline |
+| `opencode_go_user_agent` | `unset` | per-backend override for OpenCode Go |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
 Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`, `UNDERCLASS_USER_AGENT`, `UNDERCLASS_CLINE_USER_AGENT`, `UNDERCLASS_OPENCODE_GO_USER_AGENT`. `UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS` overrides the OpenCode Go cooldown. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM`, `UNDERCLASS_GO_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`, and the OpenCode Go base is `https://opencode.ai/inference/go`). Set `UNDERCLASS_GO_UPSTREAM=https://opencode.ai/inference` to pool a pay-as-you-go Console key instead of a Go subscription; `UNDERCLASS_GO_CONSOLE` points key verification at a different Console.
@@ -153,9 +164,9 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `POST /admin/api/flows` | admin token | start onboarding (device flow, or a Cline / OpenCode Go API key via `api_key`) |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
 | `POST /admin/api/flows/{id}/code` | admin token | finish a Claude Code paste-back flow |
-| `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |
+| `POST /admin/api/accounts/{id}/enable [disable][relogin]` | admin token | account controls |
 | `DELETE /admin/api/accounts/{id}` | admin token | remove from pool |
-| `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog (`codex`, `copilot`, `claude`, `cline`, `go`) |
+| `GET[PUT] /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog (`codex`, `copilot`, `claude`, `cline`, `go`) |
 | `GET /admin/api/client-key` | admin token | retrieve the proxy key for `connect` |
 
 Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log-format json|pretty`) and each request logs the account (label) that served it.
