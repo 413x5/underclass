@@ -90,16 +90,21 @@ pub fn normalize_model_id(model: &str) -> String {
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-wire-family
-/// `wire_for` MUST report the wire API `model` is served over on Go's OpenAI surface, and MUST
-/// report `None` for an id Go serves only over its Anthropic or Gemini paths and for an id this
-/// backend has not classified. A model whose family is unknown MUST NOT be advertised or routed:
-/// guessing sends the request to the wrong upstream path, which Go answers with an error the
-/// client cannot act on.
+/// `wire_for` MUST report the wire API `model` is served over on Go's OpenAI surface, MUST report
+/// `None` for an id Go serves only over its Anthropic or Gemini paths, and MUST default to
+/// `Responses` for an id this build has never classified, so a model published after this build
+/// stays routable (Go translates between its APIs).
 pub fn wire_for(model: &str) -> Option<Wire> {
-    WIRE_FAMILY
-        .iter()
-        .find(|(id, _)| *id == upstream_model_id(model))
-        .and_then(|(_, wire)| *wire)
+    let upstream = upstream_model_id(model);
+    if let Some((_, wire)) = WIRE_FAMILY.iter().find(|(id, _)| *id == upstream) {
+        // Explicitly classified (including Anthropic/Gemini-only -> None).
+        return *wire;
+    }
+    // A model this build has never heard of (e.g. one Go published after this build) still
+    // needs a wire family to be routable. Go translates between its APIs, so default to the
+    // Responses path the operator prefers; a wrong guess is corrected by the per-model cooldown
+    // when the request fails.
+    Some(Wire::Responses)
 }
 
 /// @cc [owner:ghuntley,label:proxy] opencode-go-upstream-wire-agrees-with-translation
@@ -120,10 +125,10 @@ fn upstream_wire(model: &str) -> Wire {
 /// each row came from.
 const WIRE_FAMILY: &[(&str, Option<Wire>)] = &[
     // Responses family: the AI SDK's OpenAI package against `/openai/v1/responses`.
-    ("grok-4.6", Some(Wire::Responses)),
-    ("grok-4.7", Some(Wire::Responses)),
     ("gpt-5.6-luna", Some(Wire::Responses)),
     ("gpt-6-luna", Some(Wire::Responses)),
+    ("grok-4.6", Some(Wire::Responses)),
+    ("grok-4.7", Some(Wire::Responses)),
     ("muse-spark-1.2-contributor", Some(Wire::Responses)),
     ("muse-spark-1.3-contributor", Some(Wire::Responses)),
     // Chat Completions family: the openai-compatible package against `/openai/v1/chat/completions`.
@@ -137,24 +142,31 @@ const WIRE_FAMILY: &[(&str, Option<Wire>)] = &[
     ("glm-5.3-flash", Some(Wire::Chat)),
     ("hy3", Some(Wire::Chat)),
     ("hy4-preview", Some(Wire::Chat)),
+    ("iceman-contributor-free", Some(Wire::Chat)),
     ("kimi-k2.6", Some(Wire::Chat)),
     ("kimi-k2.7-code", Some(Wire::Chat)),
     ("kimi-k3", Some(Wire::Chat)),
+    ("kimi-k3.1-pro", Some(Wire::Chat)),
     ("longcat-2.0", Some(Wire::Chat)),
+    ("longcat-2.5-preview-free", Some(Wire::Chat)),
     ("mimo-v2.5", Some(Wire::Chat)),
+    ("mimo-v2.5-pro", Some(Wire::Chat)),
     ("mimo-v2.6-flash", Some(Wire::Chat)),
     ("mimo-v2.6-pro", Some(Wire::Chat)),
+    ("minimax-m3.1-flash", Some(Wire::Chat)),
+    ("minimax-m3.1-flash-free", Some(Wire::Chat)),
+    ("space-bunny", Some(Wire::Chat)),
     ("step-5-preview", Some(Wire::Chat)),
-    // Anthropic Messages or Gemini only, so no OpenAI path serves them. They are listed rather
-    // than omitted so a reader can tell "Go does not offer this over OpenAI" from "this build has
-    // never heard of it" - the catalog and the refresh treat both as unroutable.
+    ("step-5-preview-free", Some(Wire::Chat)),
+    // Anthropic Messages or Gemini only, so no OpenAI path serves them over this backend.
     ("claude-haiku-5-5", None),
+    ("gemini-4-argon", None),
+    ("gemini-4-argon-contributor", None),
+    ("minimax-m2.7", None),
+    ("minimax-m3", None),
     ("qwen3.7-plus", None),
     ("qwen3.8-flash", None),
     ("qwen3.8-max", None),
-    ("minimax-m2.7", None),
-    ("minimax-m3", None),
-    ("gemini-4-argon-contributor", None),
 ];
 
 /// Model metadata for the Go lineup, from the Console/Go endpoint tables and models.dev (which is
@@ -162,97 +174,53 @@ const WIRE_FAMILY: &[(&str, Option<Wire>)] = &[
 fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
     &[
         ("beam-free", "Beam Free", 1_048_576, 1_048_576, 131_072),
-        (
-            "cat-jam-free",
-            "Cat Jam Free",
-            1_048_576,
-            1_048_576,
-            131_072,
-        ),
-        (
-            "deepseek-v4-pro",
-            "DeepSeek V4 Pro",
-            1_000_000,
-            1_000_000,
-            384_000,
-        ),
-        (
-            "deepseek-v4.1-flash",
-            "DeepSeek V4.1 Flash",
-            1_000_000,
-            1_000_000,
-            384_000,
-        ),
+        ("cat-jam-free", "Cat Jam Free", 1_048_576, 0, 131_072),
+        ("claude-haiku-5-5", "Claude Haiku 5.5", 1_000_000, 0, 128_000),
+        ("deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000, 0, 384_000),
+        ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1_000_000, 0, 384_000),
+        ("gemini-4-argon", "Gemini 4 Argon", 1_048_576, 0, 65_536),
+        ("gemini-4-argon-contributor", "Gemini 4 Argon Contributor", 1_048_576, 0, 65_536),
         ("glm-5.1", "GLM-5.1", 204_800, 204_800, 131_072),
         ("glm-5.2", "GLM-5.2", 1_000_000, 1_000_000, 131_072),
         ("glm-5.3", "GLM-5.3", 1_000_000, 1_000_000, 131_072),
-        (
-            "glm-5.3-flash",
-            "GLM-5.3-Flash",
-            1_000_000,
-            1_000_000,
-            131_072,
-        ),
+        ("glm-5.3-flash", "GLM-5.3-Flash", 1_000_000, 0, 131_072),
         ("gpt-5.6-luna", "GPT-5.6 Luna", 1_050_000, 922_000, 128_000),
         ("gpt-6-luna", "GPT-6 Luna", 1_050_000, 922_000, 128_000),
         ("grok-4.6", "Grok 4.6", 500_000, 500_000, 500_000),
         ("grok-4.7", "Grok 4.7", 500_000, 500_000, 500_000),
         ("hy3", "Hy3", 256_000, 192_000, 128_000),
         ("hy4-preview", "Hy4 preview", 1_024_000, 1_024_000, 64_000),
+        ("iceman-contributor-free", "Iceman Contributor Free", 262_144, 0, 131_072),
         ("kimi-k2.6", "Kimi K2.6", 262_144, 262_144, 65_536),
-        (
-            "kimi-k2.7-code",
-            "Kimi K2.7 Code",
-            262_144,
-            262_144,
-            262_144,
-        ),
+        ("kimi-k2.7-code", "Kimi K2.7 Code", 262_144, 0, 262_144),
         ("kimi-k3", "Kimi K3", 1_048_576, 1_048_576, 131_072),
+        ("kimi-k3.1-pro", "Kimi K3.1 Pro", 1_048_576, 0, 131_072),
         ("longcat-2.0", "LongCat-2.0", 1_000_000, 1_000_000, 131_072),
-        ("mimo-v2.5", "MiMo-V2.5", 1_000_000, 1_000_000, 128_000),
-        (
-            "mimo-v2.6-flash",
-            "MiMo-V2.6-Flash",
-            1_048_576,
-            1_048_576,
-            131_072,
-        ),
-        (
-            "mimo-v2.6-pro",
-            "MiMo-V2.6-Pro",
-            1_048_576,
-            1_048_576,
-            131_072,
-        ),
-        (
-            "muse-spark-1.2-contributor",
-            "Muse Spark 1.2 Contributor",
-            1_048_576,
-            1_048_576,
-            131_072,
-        ),
-        (
-            "muse-spark-1.3-contributor",
-            "Muse Spark 1.3 Contributor",
-            1_048_576,
-            1_048_576,
-            131_072,
-        ),
-        (
-            "step-5-preview",
-            "Step 5 Preview",
-            1_000_000,
-            1_000_000,
-            65_536,
-        ),
+        ("longcat-2.5-preview-free", "LongCat 2.5 Preview Free", 1_000_000, 0, 131_072),
+        ("mimo-v2.5", "MiMo V2.5", 1_000_000, 1_000_000, 128_000),
+        ("mimo-v2.5-pro", "MiMo V2.5 Pro", 1_048_576, 0, 128_000),
+        ("mimo-v2.6-flash", "MiMo-V2.6-Flash", 1_048_576, 0, 131_072),
+        ("mimo-v2.6-pro", "MiMo-V2.6-Pro", 1_048_576, 0, 131_072),
+        ("minimax-m2.7", "MiniMax-M2.7", 204_800, 0, 131_072),
+        ("minimax-m3", "MiniMax-M3", 1_000_000, 0, 131_072),
+        ("minimax-m3.1-flash", "MiniMax M3.1 Flash", 1_000_000, 0, 512_000),
+        ("minimax-m3.1-flash-free", "MiniMax M3.1 Flash Free", 1_000_000, 0, 512_000),
+        ("muse-spark-1.2-contributor", "Muse Spark 1.2 Contributor", 1_048_576, 0, 131_072),
+        ("muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor", 1_048_576, 0, 131_072),
+        ("qwen3.7-plus", "Qwen3.7 Plus", 1_000_000, 0, 65_536),
+        ("qwen3.8-flash", "Qwen3.8 Flash", 1_000_000, 0, 131_072),
+        ("qwen3.8-max", "Qwen3.8 Max", 1_000_000, 0, 131_072),
+        ("space-bunny", "Space Bunny", 1_048_576, 0, 524_288),
+        ("step-5-preview", "Step 5 Preview", 1_000_000, 0, 65_536),
+        ("step-5-preview-free", "Step 5 Preview Free", 1_000_000, 0, 65_536),
     ]
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-catalog-namespaced
-/// `default_catalog` MUST expose every routable entry under the `opencode-go/` prefix, MUST take the
-/// limits recorded for it here, MUST leave `scope` empty so a `402` cools the account rather than
-/// an invented billing surface, and MUST NOT include an id whose wire family is unknown, so
-/// nothing the backend cannot route is ever advertised to a client.
+/// `default_catalog` MUST expose every entry whose wire family is known under the `opencode-go/`
+/// prefix, MUST take the limits recorded for it here, and MUST leave `scope` empty so a `402`
+/// cools the account rather than an invented billing surface. Anthropic/Gemini-only ids are
+/// excluded (no OpenAI path).
 pub fn default_catalog() -> Vec<ModelInfo> {
     let mut out: Vec<ModelInfo> = catalog_entries()
         .iter()
@@ -286,6 +254,10 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
         let Some(id) = item.get("id").and_then(Value::as_str) else {
             continue;
         };
+        if id.is_empty() {
+            continue;
+        }
+        // Anthropic/Gemini-only ids are not servable over this backend's OpenAI surface.
         if wire_for(id).is_none() {
             continue;
         }
@@ -293,8 +265,8 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
         match known.iter().find(|model| model.id == id) {
             Some(model) => out.push(model.clone()),
             None => out.push(ModelInfo {
-                id,
-                name: String::new(),
+                id: id.clone(),
+                name: upstream_model_id(&id).to_string(),
                 context: 0,
                 input: 0,
                 output: 0,
@@ -328,13 +300,12 @@ fn carry_forward_limits(fetched: &mut [ModelInfo], previous: &[ModelInfo]) {
     }
 }
 
-/// @cc [owner:ghuntley,label:pool] opencode-go-refresh-never-shrinks
-/// `refresh_catalog` MUST publish exactly `default_catalog()` - this build's servable set - with the
-/// stored name and limits carried forward, and MUST persist it to the store and the pool. Go's
-/// listing MUST NOT add or remove an entry: it is not an authority in either direction, omitting ids
-/// OpenCode Go still serves and carrying ids OpenCode Go refuses for this plan. A refresh that reaches upstream
-/// therefore leaves the routable set unchanged, which is what makes a transient listing failure
-/// harmless.
+/// @cc [owner:ghuntley,label:pool] opencode-go-refresh-discovers-listed-models
+/// `refresh_catalog` MUST publish the union of Go's `/v1/models` listing and this build's
+/// `default_catalog()` floor, so a model Go publishes after this build becomes routable without a
+/// restart, while a failed or empty listing leaves the stored catalog untouched (never-shrink).
+/// Limits previously stored for a still-listed model MUST be carried forward by
+/// `carry_forward_limits` so an operator's catalog edit survives the refresh.
 pub async fn refresh_catalog(
     client: &Client,
     store: &Store,
@@ -354,11 +325,15 @@ pub async fn refresh_catalog(
     if !resp.status().is_success() {
         return Err(AuthError::Status(resp.status().as_u16()));
     }
-    // The body is read so a malformed answer is an error rather than a silent no-op, but the
-    // listing itself decides nothing: see the contract above.
-    let _body: Value = resp.json().await?;
-    let mut models = default_catalog();
-    carry_forward_limits(&mut models, &store.catalog(BackendId::OpencodeGo));
+    let body: Value = resp.json().await?;
+    let listing = parse_models_response(&body);
+    let previous = store.catalog(BackendId::OpencodeGo);
+    if listing.is_empty() {
+        // Never-shrink: a transient empty listing leaves the stored catalog untouched.
+        return Ok(Vec::new());
+    }
+    let mut models = crate::cline::merge_discovered_models(listing, &default_catalog());
+    carry_forward_limits(&mut models, &previous);
     store.set_catalog(BackendId::OpencodeGo, &models);
     pool.lock()
         .unwrap()
@@ -729,11 +704,12 @@ mod tests {
         assert_eq!(wire_for("opencode-go/gpt-6-luna"), Some(Wire::Responses));
         assert_eq!(wire_for("glm-5.3"), Some(Wire::Chat));
         assert_eq!(wire_for("opencode-go/glm-5.3"), Some(Wire::Chat));
-        // Anthropic/Gemini-only ids and ids this build has never seen are not routable here.
+        // Anthropic/Gemini-only ids are not routable over this backend's OpenAI surface.
         assert_eq!(wire_for("claude-haiku-5-5"), None);
         assert_eq!(wire_for("qwen3.8-max"), None);
         assert_eq!(wire_for("gemini-4-argon-contributor"), None);
-        assert_eq!(wire_for("omen-alpha"), None);
+        // An unknown id defaults to Responses so a newly published model stays routable.
+        assert_eq!(wire_for("omen-alpha"), Some(Wire::Responses));
     }
 
     #[test]
@@ -745,20 +721,8 @@ mod tests {
         assert!(!ids.contains(&"opencode-go/claude-haiku-5-5"));
         assert!(!ids.contains(&"opencode-go/minimax-m3"));
         assert!(!ids.contains(&"opencode-go/gemini-4-argon-contributor"));
-        // Ids Go advertises but does not serve for this plan are not offered either: routing a
-        // client to one produces a refusal the client can only retry.
-        for dead in [
-            "opencode-go/mimo-v2.5-pro",
-            "opencode-go/space-bunny",
-            "opencode-go/step-5-preview-free",
-            "opencode-go/longcat-2.5-preview-free",
-            "opencode-go/minimax-m3.1-flash-free",
-        ] {
-            assert!(
-                !ids.contains(&dead),
-                "{dead} is not servable and must not be offered"
-            );
-        }
+        assert!(ids.contains(&"opencode-go/mimo-v2.5-pro"));
+        assert!(ids.contains(&"opencode-go/step-5-preview-free"));
         assert!(ids.iter().all(|id| id.starts_with(MODEL_PREFIX)));
     }
 
@@ -776,7 +740,7 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert_eq!(ids, vec!["opencode-go/glm-5.3", "opencode-go/kimi-k3"]);
+        assert_eq!(ids, vec!["opencode-go/glm-5.3", "opencode-go/kimi-k3", "opencode-go/omen-alpha"]);
         assert!(parse_models_response(&json!({})).is_empty());
         assert!(parse_models_response(&json!({"data": "nope"})).is_empty());
     }
@@ -891,13 +855,13 @@ mod tests {
         let backend = backend();
         assert!(backend.responses_via_chat("opencode-go/kimi-k3"));
         assert!(!backend.responses_via_chat("opencode-go/gpt-6-luna"));
-        // An id this build cannot classify reaches the chat endpoint, so it must be translated
-        // too: the path and the body shape are two views of one decision.
-        assert_eq!(upstream_wire("opencode-go/never-heard-of-it"), Wire::Chat);
-        assert!(backend.responses_via_chat("opencode-go/never-heard-of-it"));
+        // An id this build cannot classify defaults to the Responses path the operator prefers,
+        // so it is not translated: the path and the body shape are two views of one decision.
+        assert_eq!(upstream_wire("opencode-go/never-heard-of-it"), Wire::Responses);
+        assert!(!backend.responses_via_chat("opencode-go/never-heard-of-it"));
         assert_eq!(
             backend.rewrite_url("/v1/responses", "opencode-go/never-heard-of-it", &account()),
-            format!("{}/openai/v1/chat/completions", upstream_base())
+            format!("{}/openai/v1/responses", upstream_base())
         );
     }
 

@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted. This is a fork-local ADR: it deliberately carries no upstream number so a future
+Superseded in part by `model-catalog-from-upstream-listing.md`: the routable set is now the
+union of Go's `/v1/models` listing and this build's `default_catalog()` floor, and models Go
+publishes after this build (including free/promotional ones) become routable without a release.
+Decisions #2 (402 scoping) and the per-model cooldown remain in force. This is a fork-local ADR: it deliberately carries no upstream number so a future
 `git pull` from `main` cannot collide with a newer upstream `NNNN` record. See [README](README.md).
 It corrects two decisions of [OpenCode Go Backend over Go's OpenAI Surface](opencode-go-backend.md).
 That record's body is left unedited; only its `## Status` gained a pointer here, which the fork

@@ -14,7 +14,7 @@ impl AliasConfig {
     pub fn default_config() -> Self {
         let mut kinds = BTreeMap::new();
         kinds.insert(
-            "subscription".to_string(),
+            "subscriptions".to_string(),
             vec![
                 "cline/cline-pass/".to_string(),
                 "opencode-go/".to_string(),
@@ -23,15 +23,15 @@ impl AliasConfig {
         kinds.insert("credits".to_string(), vec!["cline/".to_string()]);
         AliasConfig {
             kinds,
-            default_kind: "subscription".to_string(),
+            default_kind: "subscriptions".to_string(),
         }
     }
     pub fn billing_kind(&self, backend: BackendId, model_id: &str, scope: &str) -> String {
         if backend == BackendId::Cline {
             match scope {
                 "cline-pass" => {
-                    if self.kinds.contains_key("subscription") {
-                        return "subscription".to_string();
+                    if self.kinds.contains_key("subscriptions") {
+                        return "subscriptions".to_string();
                     }
                 }
                 "credits" => {
@@ -73,6 +73,29 @@ pub fn base_name(model_id: &str) -> &str {
     model_id.rsplit('/').next().unwrap_or(model_id)
 }
 
+/// Whether `s` contains "free" as a delimited token (case-insensitive): the substring must be
+/// bounded by a non-alphanumeric character or the string boundary on both sides, so "freedom"
+/// and "freemium" do not match but "beam-free", "free-tier", "Beam Free" and ":free" do.
+fn contains_free_token(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let needle = b"free";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if bytes[i..i + needle.len()] == *needle {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let right_idx = i + needle.len();
+            let right_ok = right_idx == bytes.len()
+                || !bytes[right_idx].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn build_alias_table(
     catalogs: &std::collections::HashMap<BackendId, Vec<ModelInfo>>,
     config: &AliasConfig,
@@ -86,6 +109,21 @@ pub fn build_alias_table(
                 .entry(alias)
                 .or_default()
                 .push((*backend, m.id.clone()));
+            // A model is also available as free/<base> when "free" appears as a delimited
+            // token in its id or display name (case-insensitive), e.g. "beam-free", "free-tier",
+            // "Beam Free", or ":free" - but not when "free" is merely a substring of a larger
+            // word such as "freedom" or "freemium". The operator may override this by defining a
+            // kind literally named "free" in [model_aliases], which then owns the namespace.
+            let operator_owns_free = config.kinds.contains_key("free");
+            let is_free = !operator_owns_free
+                && (contains_free_token(&m.id) || contains_free_token(&m.name));
+            if is_free {
+                let free_alias = format!("free/{}", base_name(&m.id));
+                table
+                    .entry(free_alias)
+                    .or_default()
+                    .push((*backend, m.id.clone()));
+            }
         }
     }
     for v in table.values_mut() {
@@ -138,7 +176,7 @@ mod tests {
         let cfg = AliasConfig::default_config();
         assert_eq!(
             cfg.billing_kind(BackendId::Cline, "cline/cline-pass/deepseek-v4.1-flash", "cline-pass"),
-"subscription"
+"subscriptions"
         );
         assert_eq!(
             cfg.billing_kind(BackendId::Cline, "cline/openai/gpt-5.2", "credits"),
@@ -162,7 +200,54 @@ mod tests {
         );
         let cfg = AliasConfig::default_config();
         let table = build_alias_table(&catalogs, &cfg);
-        assert!(table.contains_key("subscription/deepseek-v4.1-flash"));
+        assert!(table.contains_key("subscriptions/deepseek-v4.1-flash"));
         assert!(table.contains_key("credits/gpt-5.2"));
+    }
+
+    #[test]
+    fn free_alias_for_id_or_name_containing_free() {
+        let mut catalogs = std::collections::HashMap::new();
+        catalogs.insert(
+            BackendId::Cline,
+            vec![
+                // free only in id
+                model("cline/openai/beam-free", "credits"),
+                // free only in name, id has no "free"
+                ModelInfo {
+                    id: "cline/openai/solar-mini4".to_string(),
+                    name: "Solar Mini Free".to_string(),
+                    context: 0,
+                    input: 0,
+                    output: 0,
+                    scope: "credits".to_string(),
+                },
+                // not free
+                model("cline/openai/gpt-5.2", "credits"),
+            ],
+        );
+        catalogs.insert(
+            BackendId::OpencodeGo,
+            vec![model("opencode-go/beam-free", "")],
+        );
+        let cfg = AliasConfig::default_config();
+        let table = build_alias_table(&catalogs, &cfg);
+        assert!(table.contains_key("free/beam-free"));
+        assert!(table.contains_key("free/solar-mini4"));
+        assert!(!table.contains_key("free/gpt-5.2"));
+        // Delimited token only: "freedom"/"freemium" must not match.
+        let mut catalogs2 = std::collections::HashMap::new();
+        catalogs2.insert(
+            BackendId::Cline,
+            vec![
+                model("cline/openai/freedom-4", "credits"),
+                model("cline/openai/freemium-pro", "credits"),
+            ],
+        );
+        let t2 = build_alias_table(&catalogs2, &AliasConfig::default_config());
+        assert!(!t2.contains_key("free/freedom-4"));
+        assert!(!t2.contains_key("free/freemium-pro"));
+        // free alias groups across backends
+        let concretes = table.get("free/beam-free").unwrap();
+        assert_eq!(concretes.len(), 2);
     }
 }

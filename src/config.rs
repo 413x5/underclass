@@ -5,6 +5,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ModelAliasesFile {
     #[serde(default)]
+    pub subscriptions: Option<Vec<String>>,
+    /// Legacy key name (pre-rename). Accepted for backward compatibility.
+    #[serde(default)]
     pub subscription: Option<Vec<String>>,
     #[serde(default)]
     pub credits: Option<Vec<String>>,
@@ -168,8 +171,11 @@ impl Config {
         // config therefore never silently drops the default classification of other kinds.
         let mut model_alias_kinds = crate::aliases::AliasConfig::default_config().kinds;
         if let Some(ma) = &file_cfg.model_aliases {
-            if let Some(v) = &ma.subscription {
-                model_alias_kinds.insert("subscription".to_string(), v.clone());
+            if let Some(v) = &ma.subscriptions {
+                model_alias_kinds.insert("subscriptions".to_string(), v.clone());
+            } else if let Some(v) = &ma.subscription {
+                model_alias_kinds.insert("subscriptions".to_string(), v.clone());
+                eprintln!("warning: model_aliases.subscription is deprecated; use subscriptions");
             }
             if let Some(v) = &ma.credits {
                 model_alias_kinds.insert("credits".to_string(), v.clone());
@@ -182,21 +188,21 @@ impl Config {
             .model_aliases
             .as_ref()
             .and_then(|m| m.default_kind.clone())
-            .unwrap_or_else(|| "subscription".to_string());
+            .unwrap_or_else(|| "subscriptions".to_string());
         // Validate against configured kinds (and the built-in defaults).
         if !model_alias_kinds.contains_key(&model_alias_default_kind) {
             eprintln!(
-                "warning: model_aliases.default_kind {:?} is not a configured kind; falling back to 'subscription'",
+                "warning: model_aliases.default_kind {:?} is not a configured kind; falling back to 'subscriptions'",
                 model_alias_default_kind
             );
             // Preserve operator-configured kinds; only fix the default.
-            if model_alias_kinds.contains_key("subscription") {
-                model_alias_default_kind = "subscription".to_string();
+            if model_alias_kinds.contains_key("subscriptions") {
+                model_alias_default_kind = "subscriptions".to_string();
             } else if let Some(first) = model_alias_kinds.keys().next().cloned() {
                 model_alias_default_kind = first;
             } else {
                 model_alias_kinds = crate::aliases::AliasConfig::default_config().kinds;
-                model_alias_default_kind = "subscription".to_string();
+                model_alias_default_kind = "subscriptions".to_string();
             }
         }
 
