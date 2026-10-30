@@ -12,7 +12,7 @@ A single account can serve models that draw on different billing surfaces: a Cli
 serves both ClinePass subscription models (`cline/cline-pass/...`) and credit-based models
 (`cline/...`). The operator wants to route a request through only subscription accounts or
 only credits accounts for the same model family, using a request id such as
-`subscription/deepseek-v4.1-flash` or `credits/deepseek-v4.1-flash`.
+`subscriptions/deepseek-v4.1-flash` or `credits/deepseek-v4.1-flash`.
 
 The existing routing model (ADR 0010) is model-eligibility-driven: a model id is served by
 any healthy account whose backend catalog contains it. There is no notion of "billing kind"
@@ -24,16 +24,16 @@ in the request id, so clients cannot express "subscription only" vs "credits onl
   a config-driven classification. The DB stays as close to upstream as possible.
 - **Config** (`~/.config/underclass/config.toml`, `[model_aliases]`): maps alias kind →
   list of catalog-id prefixes. Default:
-  - `subscription = ["cline/cline-pass/", "opencode-go/"]`
+  - `subscriptions = ["cline/cline-pass/", "opencode-go/"]`
   - `credits = ["cline/"]`
-  - `default_kind = "subscription"`
+  - `default_kind = "subscriptions"`
   Operator overrides merge per-kind over defaults, so a partial config never drops other
   kinds.
 - **Cline's `scope` column is authoritative** for Cline accounts: `cline-pass` →
-  subscription, `credits` → credits. Other backends match configured prefixes (longest
+  subscriptions, `credits` → credits. Other backends match configured prefixes (longest
   prefix wins); unmatched → default kind.
 - **Base name = last path segment** of the model id. `cline/openai/gpt-5.2` →
-  `credits/gpt-5.2`; `opencode-go/deepseek-v4.1-flash` → `subscription/deepseek-v4.1-flash`.
+  `credits/gpt-5.2`; `opencode-go/deepseek-v4.1-flash` → `subscriptions/deepseek-v4.1-flash`.
 - **Alias table** is an in-memory `HashMap<String, Vec<(BackendId, concrete_model_id)>>`
   built on boot and rebuilt when any catalog changes (periodic sync + explicit refresh).
 - **PoolCore** gains `aliases` + `alias_config` and alias-aware `serves`, `declared_scope`,
@@ -50,7 +50,7 @@ in the request id, so clients cannot express "subscription only" vs "credits onl
 
 ## Consequences
 
-- Clients can request `subscription/<model>` or `credits/<model>` to restrict routing to
+- Clients can request `subscriptions/<model>` or `credits/<model>` to restrict routing to
   accounts of that billing kind. Direct concrete ids keep working unchanged.
 - No DB migration; aliases live in memory and are rebuilt from catalogs + config.
 - Mixed, subscription-only, and credits-only accounts all work without special-casing:
