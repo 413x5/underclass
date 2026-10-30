@@ -1053,8 +1053,14 @@ impl Store {
             .expect("prepare catalog");
         let rows = stmt
             .query_map(params![backend.as_str()], |row| {
+                let mut id: String = row.get(0)?;
+                if backend == crate::models::BackendId::OpencodeGo
+                    && id.starts_with("opencode_go/")
+                {
+                    id = format!("opencode-go/{}", &id["opencode_go/".len()..]);
+                }
                 Ok(ModelInfo {
-                    id: row.get(0)?,
+                    id,
                     name: row.get(1)?,
                     context: row.get(2)?,
                     input: row.get(3)?,

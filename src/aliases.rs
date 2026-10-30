@@ -17,7 +17,7 @@ impl AliasConfig {
             "subscription".to_string(),
             vec![
                 "cline/cline-pass/".to_string(),
-                "opencode_go/".to_string(),
+                "opencode-go/".to_string(),
             ],
         );
         kinds.insert("credits".to_string(), vec!["cline/".to_string()]);
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn base_name_last_segment() {
         assert_eq!(base_name("cline/openai/gpt-5.2"), "gpt-5.2");
-        assert_eq!(base_name("opencode_go/deepseek-v4.1-flash"), "deepseek-v4.1-flash");
+        assert_eq!(base_name("opencode-go/deepseek-v4.1-flash"), "deepseek-v4.1-flash");
         assert_eq!(base_name("grok-4.7"), "grok-4.7");
     }
 
@@ -158,7 +158,7 @@ mod tests {
         );
         catalogs.insert(
             BackendId::OpencodeGo,
-            vec![model("opencode_go/deepseek-v4.1-flash", "")],
+            vec![model("opencode-go/deepseek-v4.1-flash", "")],
         );
         let cfg = AliasConfig::default_config();
         let table = build_alias_table(&catalogs, &cfg);

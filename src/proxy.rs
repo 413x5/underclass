@@ -467,7 +467,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         .unwrap_or_default();
     let requested_model = match surface {
         Surface::Anthropic => crate::claude::canonical_model(raw_model),
-        Surface::OpenAI => crate::models::normalize_model_name(raw_model),
+        Surface::OpenAI => crate::opencode_go::normalize_model_id(&crate::models::normalize_model_name(raw_model)),
     };
     // Exact concrete match takes precedence over an alias: if the requested id exists in any
     // backend catalog, treat it as a concrete model, not an alias.
