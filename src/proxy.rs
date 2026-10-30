@@ -1718,57 +1718,23 @@ fn push_log(
 }
 
 pub async fn models(State(state): State<Arc<AppState>>) -> Response {
-    let mut merged: std::collections::BTreeMap<String, Value> = Default::default();
-    for backend in BackendId::all() {
-        for m in state.store.catalog(backend) {
-            let entry = serde_json::json!({
-                "id": m.id,
-                "object": "model",
-                "name": m.name,
-                "context_window": m.context,
-                "max_input_tokens": m.input,
-                "max_output_tokens": m.output,
-                "owned_by": format!("underclass-{}", backend.as_str()),
-            });
-            merged
-                .entry(m.id)
-                .and_modify(|existing| {
-                    if m.context > existing["context_window"].as_i64().unwrap_or(0) {
-                        *existing = entry.clone();
-                    }
-                })
-                .or_insert(entry);
-        }
-    }
-    // Derived model aliases.
-    if let Ok(pool) = state.pool.lock() {
-        // Fetch each backend's catalog once.
-        let catalogs: std::collections::HashMap<BackendId, Vec<_>> =
-            BackendId::all().iter().map(|b| (*b, state.store.catalog(*b))).collect();
-        for (alias, concretes) in &pool.aliases {
-            let mut ctx = 0i64; let mut inp = 0i64; let mut out = 0i64;
-            for (_, cid) in concretes {
-                for cat in catalogs.values() {
-                    if let Some(m) = cat.iter().find(|m| m.id == *cid) {
-                        ctx = ctx.max(m.context);
-                        inp = inp.max(m.input);
-                        out = out.max(m.output);
-                    }
-                }
-            }
-            let entry = serde_json::json!({
-                "id": alias,
-                "object": "model",
-                "name": alias,
-                "context_window": ctx,
-                "max_input_tokens": inp,
-                "max_output_tokens": out,
-                "owned_by": "underclass-alias",
-            });
-            merged.entry(alias.clone()).or_insert(entry);
-        }
-    }
-    let data: Vec<Value> = merged.into_values().collect();
+    let catalogs: std::collections::HashMap<BackendId, Vec<_>> = BackendId::all()
+        .iter()
+        .map(|b| (*b, state.store.catalog(*b)))
+        .collect();
+    let servable = crate::listing::backends_with_accounts(&state.store.list_accounts());
+    // A poisoned pool lock keeps the listing alive with no aliases, the same tolerance the handler
+    // had before the merge moved out: a panic elsewhere must not take model discovery down.
+    let aliases = state
+        .pool
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .aliases
+        .clone();
+    let data: Vec<Value> = crate::listing::advertised_models(&catalogs, &servable, &aliases)
+        .iter()
+        .map(crate::listing::AdvertisedModel::to_json)
+        .collect();
     axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 

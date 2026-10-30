@@ -1627,3 +1627,89 @@ fn test_model_cooldown_scopes_one_model(tc: TestCase) {
         "the cooldown expires on its own"
     );
 }
+
+/// `/v1/models` is the account-backed view of the stored catalogs: a backend's rows appear only
+/// while it has an account, an alias appears exactly while one of its concrete models does, and
+/// the catalogs themselves are never mutated (so re-adding an account restores its models).
+#[hegel::test]
+fn test_model_listing_is_the_account_backed_view(tc: TestCase) {
+    let backends = BackendId::all();
+    // Derived from the backend list, so a new backend is drawn instead of being unreachable.
+    let mask: u32 = tc.draw(gs::integers::<u32>().max_value((1 << backends.len()) - 1));
+    let servable: std::collections::HashSet<BackendId> = backends
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, b)| *b)
+        .collect();
+
+    let mut catalogs: std::collections::HashMap<BackendId, Vec<underclass::models::ModelInfo>> =
+        Default::default();
+    for backend in backends {
+        catalogs.insert(
+            backend,
+            catalog_of(&[&format!("{}/m", backend.as_str()), "common"]),
+        );
+    }
+    let mut aliases: underclass::aliases::AliasTable = Default::default();
+    for backend in backends {
+        aliases.insert(
+            format!("a/{}", backend.as_str()),
+            vec![(backend, format!("{}/m", backend.as_str()))],
+        );
+    }
+    aliases.insert(
+        "a/common".into(),
+        backends
+            .iter()
+            .map(|b| (*b, "common".to_string()))
+            .collect(),
+    );
+
+    let ids_of =
+        |cats: &std::collections::HashMap<BackendId, Vec<underclass::models::ModelInfo>>| {
+            let mut ids: Vec<(BackendId, Vec<String>)> = cats
+                .iter()
+                .map(|(b, m)| (*b, m.iter().map(|m| m.id.clone()).collect()))
+                .collect();
+            ids.sort_by_key(|(b, _)| b.as_str());
+            ids
+        };
+    let before = ids_of(&catalogs);
+    let listed: Vec<String> =
+        underclass::listing::advertised_models(&catalogs, &servable, &aliases)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+    assert_eq!(
+        ids_of(&catalogs),
+        before,
+        "the listing must not mutate the catalogs"
+    );
+
+    for backend in backends {
+        let has = servable.contains(&backend);
+        assert_eq!(
+            listed.contains(&format!("{}/m", backend.as_str())),
+            has,
+            "{} rows follow the account set",
+            backend.as_str()
+        );
+        assert_eq!(
+            listed.contains(&format!("a/{}", backend.as_str())),
+            has,
+            "{} alias follows its only concrete model",
+            backend.as_str()
+        );
+    }
+    assert_eq!(
+        listed.contains(&"common".to_string()),
+        !servable.is_empty(),
+        "a model on several backends survives while any of them has an account"
+    );
+    assert_eq!(
+        listed.contains(&"a/common".to_string()),
+        !servable.is_empty(),
+        "an alias grouping several backends follows the same rule"
+    );
+}

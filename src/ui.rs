@@ -89,21 +89,31 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
 
 pub async fn state(State(state): State<Arc<AppState>>) -> Response {
     let now = now_ms();
-    let accounts: Vec<serde_json::Value> = state
-        .store
-        .list_accounts()
-        .iter()
-        .map(|a| account_view(&state, a))
-        .collect();
+    let accounts = state.store.list_accounts();
+    let servable = crate::listing::backends_with_accounts(&accounts);
+    let accounts: Vec<serde_json::Value> =
+        accounts.iter().map(|a| account_view(&state, a)).collect();
     let requests: Vec<RequestLogEntry> = state.logs.lock().unwrap().iter().rev().cloned().collect();
-    let catalog: serde_json::Map<String, serde_json::Value> = BackendId::all()
-        .iter()
-        .map(|b| (b.as_str().to_string(), json!(state.store.catalog(*b))))
-        .collect();
+    // Only account-backed backends are advertised, so the opencode snippet built from this map
+    // matches `GET /v1/models`. The catalog editor reads `/admin/api/catalog/{backend}` instead and
+    // still sees every stored row, including a backend that has no accounts.
+    let mut catalog = serde_json::Map::new();
+    let mut catalog_backends = Vec::new();
+    for backend in BackendId::all() {
+        if !servable.contains(&backend) {
+            continue;
+        }
+        catalog.insert(
+            backend.as_str().to_string(),
+            json!(state.store.catalog(backend)),
+        );
+        catalog_backends.push(backend.as_str());
+    }
     Json(json!({
         "accounts": accounts,
         "requests": requests,
         "catalog": catalog,
+        "catalog_backends": catalog_backends,
         "now_ms": now,
     }))
     .into_response()

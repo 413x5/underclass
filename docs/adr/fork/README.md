@@ -62,3 +62,7 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 - [Monitor Operator Toggle](monitor-operator-toggle.md) — `underclass top` may perform exactly one
   write, a confirmed enable/disable of the selected account, sent through the authenticated admin API
   and never through the read-only monitor socket.
+
+- [Only Account-Backed Models Are Advertised](account-backed-model-advertisement.md) — `GET /v1/models`,
+  the UI snippet, and `underclass connect` list a backend's catalog only while it has an account;
+  stored catalogs are never pruned and the admin catalog editor still shows every row.
