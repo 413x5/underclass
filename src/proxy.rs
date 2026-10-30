@@ -465,10 +465,15 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let model = match surface {
+    let requested_model = match surface {
         Surface::Anthropic => crate::claude::canonical_model(raw_model),
         Surface::OpenAI => crate::models::normalize_model_name(raw_model),
     };
+    // Exact concrete match takes precedence over an alias: if the requested id exists in any
+    // backend catalog, treat it as a concrete model, not an alias.
+    // `model` is the value passed to selection (alias or concrete). Exact concrete matches
+    // take precedence over aliases, handled inside PoolCore::is_alias.
+    let model = requested_model.clone();
     let sticky = match surface {
         Surface::Anthropic => crate::claude::sticky_key(&client_headers, &body),
         Surface::OpenAI => extract_sticky_key(&body, session_header.as_deref()),
@@ -620,12 +625,14 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             }
         }
 
+        let upstream_model = selection.concrete_model.clone();
         match attempt_account(
             &state,
             &request_id,
             &endpoint,
             &target,
             &model,
+            &upstream_model,
             sticky.as_deref(),
             &selection,
             body_bytes.clone(),
@@ -743,6 +750,7 @@ async fn attempt_account(
     endpoint: &str,
     target: &str,
     model: &str,
+    upstream_model: &str,
     sticky: Option<&str>,
     selection: &Selection,
     body_bytes: axum::body::Bytes,
@@ -801,7 +809,7 @@ async fn attempt_account(
         }
     };
 
-    let url = backend.rewrite_url(target, model, &account);
+    let url = backend.rewrite_url(target, upstream_model, &account);
     let mut headers = HeaderMap::new();
     if backend.forward_client_headers() {
         for (name, value) in client_headers.iter() {
@@ -822,8 +830,15 @@ async fn attempt_account(
         );
     }
     let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+    // For aliases, the client sent the alias id; rewrite the body's model to the concrete id so
+    // backends that read the body model (prepare_body, auto_stream_usage) see the concrete id.
+    if let Some(obj) = outbound_body.as_object_mut()
+        && obj.get("model").and_then(Value::as_str).is_some()
+    {
+        obj.insert("model".into(), Value::String(upstream_model.to_string()));
+    }
     let responses_path = endpoint.ends_with("/responses");
-    let translate_responses = responses_path && backend.responses_via_chat(model);
+    let translate_responses = responses_path && backend.responses_via_chat(upstream_model);
     // The dialect the *upstream* speaks: a translated request is Chat Completions even though the
     // client's path is `/v1/responses`, so this must not be derived from the client path alone.
     // Used by every body parse - error bodies as much as successful ones.
@@ -851,8 +866,17 @@ async fn attempt_account(
         .contains(&selection.backend)
         && backend.auto_stream_usage(endpoint, &mut outbound_body);
     let outbound_bytes = if backend.forward_body_verbatim() {
-        // The upstream validates the client's own body, so it travels byte for byte.
-        body_bytes.to_vec()
+        // The upstream validates the client's own body, so it travels byte for byte — except when
+        // an alias rewrote the model, in which case the body must carry the concrete id.
+        if model != upstream_model {
+            let mut v: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("model".into(), Value::String(upstream_model.to_string()));
+            }
+            serde_json::to_vec(&v).unwrap_or_else(|_| body_bytes.to_vec())
+        } else {
+            body_bytes.to_vec()
+        }
     } else {
         backend.prepare_body(&mut outbound_body);
         serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec())
@@ -1271,7 +1295,7 @@ async fn attempt_account(
                     let response_id = format!("resp_{}", request_id.replace('-', ""));
                     let converted = crate::responses::completion_to_response(
                         &chat,
-                        model,
+                        upstream_model,
                         &response_id,
                         started_ms / 1000,
                     );
@@ -1331,7 +1355,7 @@ async fn attempt_account(
         let translator = translate_stream.then(|| {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::responses::ChatStreamTranslator::new(
-                    model,
+                    upstream_model,
                     &format!("resp_{}", request_id.replace('-', "")),
                     started_ms / 1000,
                 ),
@@ -1346,7 +1370,7 @@ async fn attempt_account(
         if let Some(code) = finish.tap.overload_before_output().map(str::to_string) {
             logging::log_overload_failover(
                 request_id,
-                model,
+                upstream_model,
                 &selection.account_id,
                 &account.label,
                 &code,
@@ -1702,6 +1726,34 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
                     }
                 })
                 .or_insert(entry);
+        }
+    }
+    // Derived model aliases.
+    if let Ok(pool) = state.pool.lock() {
+        // Fetch each backend's catalog once.
+        let catalogs: std::collections::HashMap<BackendId, Vec<_>> =
+            BackendId::all().iter().map(|b| (*b, state.store.catalog(*b))).collect();
+        for (alias, concretes) in &pool.aliases {
+            let mut ctx = 0i64; let mut inp = 0i64; let mut out = 0i64;
+            for (_, cid) in concretes {
+                for cat in catalogs.values() {
+                    if let Some(m) = cat.iter().find(|m| m.id == *cid) {
+                        ctx = ctx.max(m.context);
+                        inp = inp.max(m.input);
+                        out = out.max(m.output);
+                    }
+                }
+            }
+            let entry = serde_json::json!({
+                "id": alias,
+                "object": "model",
+                "name": alias,
+                "context_window": ctx,
+                "max_input_tokens": inp,
+                "max_output_tokens": out,
+                "owned_by": "underclass-alias",
+            });
+            merged.entry(alias.clone()).or_insert(entry);
         }
     }
     let data: Vec<Value> = merged.into_values().collect();

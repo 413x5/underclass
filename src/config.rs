@@ -1,5 +1,18 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelAliasesFile {
+    #[serde(default)]
+    pub subscription: Option<Vec<String>>,
+    #[serde(default)]
+    pub credits: Option<Vec<String>>,
+    #[serde(default, rename = "default_kind")]
+    pub default_kind: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Vec<String>>,
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct FileConfig {
@@ -23,6 +36,8 @@ pub struct FileConfig {
     pub codex_cooldown_ms: Option<u64>,
     pub auto_codex_resets: Option<bool>,
     pub stats_retention_days: Option<i64>,
+    #[serde(default)]
+    pub model_aliases: Option<ModelAliasesFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +56,8 @@ pub struct Config {
     pub cline_user_agent: Option<String>,
     pub opencode_go_user_agent: Option<String>,
     pub stats_retention_days: i64,
+    pub model_alias_kinds: BTreeMap<String, Vec<String>>,
+    pub model_alias_default_kind: String,
     pub data_dir: PathBuf,
     #[allow(dead_code)]
     pub config_dir: PathBuf,
@@ -146,6 +163,43 @@ impl Config {
             .unwrap_or(crate::stats::DEFAULT_RETENTION_DAYS)
             .max(1);
 
+        // Model alias classification config.
+        // Start from defaults, then let the operator override/extend per kind. A partial
+        // config therefore never silently drops the default classification of other kinds.
+        let mut model_alias_kinds = crate::aliases::AliasConfig::default_config().kinds;
+        if let Some(ma) = &file_cfg.model_aliases {
+            if let Some(v) = &ma.subscription {
+                model_alias_kinds.insert("subscription".to_string(), v.clone());
+            }
+            if let Some(v) = &ma.credits {
+                model_alias_kinds.insert("credits".to_string(), v.clone());
+            }
+            for (k, v) in &ma.extra {
+                model_alias_kinds.insert(k.clone(), v.clone());
+            }
+        }
+        let mut model_alias_default_kind = file_cfg
+            .model_aliases
+            .as_ref()
+            .and_then(|m| m.default_kind.clone())
+            .unwrap_or_else(|| "subscription".to_string());
+        // Validate against configured kinds (and the built-in defaults).
+        if !model_alias_kinds.contains_key(&model_alias_default_kind) {
+            eprintln!(
+                "warning: model_aliases.default_kind {:?} is not a configured kind; falling back to 'subscription'",
+                model_alias_default_kind
+            );
+            // Preserve operator-configured kinds; only fix the default.
+            if model_alias_kinds.contains_key("subscription") {
+                model_alias_default_kind = "subscription".to_string();
+            } else if let Some(first) = model_alias_kinds.keys().next().cloned() {
+                model_alias_default_kind = first;
+            } else {
+                model_alias_kinds = crate::aliases::AliasConfig::default_config().kinds;
+                model_alias_default_kind = "subscription".to_string();
+            }
+        }
+
         // `user_agent` is the shared default, so a per-backend key that is absent falls back to it
         // rather than to the built-in default.
         let shared_user_agent = first_configured([
@@ -176,6 +230,8 @@ impl Config {
             cline_user_agent,
             opencode_go_user_agent,
             stats_retention_days,
+            model_alias_kinds,
+            model_alias_default_kind,
             data_dir,
             config_dir,
         }

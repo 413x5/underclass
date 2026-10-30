@@ -21,6 +21,7 @@ pub struct Selection {
     pub account_id: String,
     pub backend: BackendId,
     pub decision: Decision,
+    pub concrete_model: String,
 }
 
 /// What `PoolCore::report_for` changed, so callers can persist and log it.
@@ -56,6 +57,10 @@ pub struct PoolCore {
     /// Per-account, per-model cooldowns: the upstream refused this model on this account while
     /// the account keeps serving its other models.
     model_cooldowns: HashMap<String, HashMap<String, i64>>,
+    /// Derived model aliases: alias string -> list of (backend, concrete model id).
+    pub aliases: crate::aliases::AliasTable,
+    /// Config used to derive aliases.
+    pub alias_config: crate::aliases::AliasConfig,
 }
 
 impl PoolCore {
@@ -69,6 +74,8 @@ impl PoolCore {
             catalog: HashMap::new(),
             surfaces,
             model_cooldowns: HashMap::new(),
+            aliases: crate::aliases::AliasTable::new(),
+            alias_config: crate::aliases::AliasConfig::default_config(),
         };
         for a in store.list_accounts() {
             core.accounts.insert(
@@ -96,10 +103,48 @@ impl PoolCore {
         self.catalog.insert(backend, models);
     }
 
+    pub fn set_aliases(&mut self, aliases: crate::aliases::AliasTable) {
+        self.aliases = aliases;
+    }
+    pub fn set_alias_config(&mut self, config: crate::aliases::AliasConfig) {
+        self.alias_config = config;
+    }
+    /// Rebuild aliases from current catalogs.
+    pub fn rebuild_aliases(&mut self, store: &crate::store::Store) {
+        let mut catalogs = std::collections::HashMap::new();
+        for b in crate::models::BackendId::all() {
+            catalogs.insert(b, store.catalog(b));
+        }
+        self.aliases = crate::aliases::build_alias_table(&catalogs, &self.alias_config);
+    }
+
+    /// Whether `requested` is an alias present in the table. (Concrete-match precedence is
+    /// handled per-backend in `serves`/`concrete_for`, not here, so a colliding concrete id in
+    /// one backend does not disable the alias for others.)
+    pub fn is_alias(&self, requested: &str) -> bool {
+        crate::aliases::is_alias(&self.aliases, requested)
+    }
+
+    /// Resolve `requested` to the concrete model id for `backend`. Returns `Some(requested)`
+    /// when it is not an alias but the backend serves it directly; `None` otherwise.
+    pub fn concrete_for(&self, backend: BackendId, requested: &str) -> Option<String> {
+        if self.catalog.get(&backend).is_some_and(|set| set.contains_key(requested)) {
+            return Some(requested.to_string());
+        }
+        if crate::aliases::is_alias(&self.aliases, requested) {
+            return crate::aliases::concrete_for(&self.aliases, backend, requested);
+        }
+        None
+    }
+
     pub fn serves(&self, backend: BackendId, model: &str) -> bool {
-        self.catalog
-            .get(&backend)
-            .is_some_and(|set| set.contains_key(model))
+        if self.catalog.get(&backend).is_some_and(|set| set.contains_key(model)) {
+            return true;
+        }
+        if crate::aliases::is_alias(&self.aliases, model) {
+            return crate::aliases::concrete_for(&self.aliases, backend, model).is_some();
+        }
+        false
     }
 
     /// The scope `backend`'s catalog stores for `model`: `Some(None)` when the backend lists the
@@ -107,9 +152,19 @@ impl PoolCore {
     /// does not list the model at all. The distinction matters: an explicit empty scope is an
     /// account-wide quota, not a missing entry.
     fn declared_scope(&self, backend: BackendId, model: &str) -> Option<Option<String>> {
+        let concrete = if self.catalog.get(&backend).is_some_and(|set| set.contains_key(model)) {
+            model.to_string()
+        } else if crate::aliases::is_alias(&self.aliases, model) {
+            match crate::aliases::concrete_for(&self.aliases, backend, model) {
+                Some(c) => c,
+                None => return None,
+            }
+        } else {
+            return None;
+        };
         self.catalog
             .get(&backend)
-            .and_then(|models| models.get(model))
+            .and_then(|models| models.get(&concrete))
             .map(|scope| Some(scope.clone()).filter(|scope| !scope.is_empty()))
     }
 
@@ -339,20 +394,30 @@ impl PoolCore {
                         && !exclude.contains(&bound_id)
                         && self.eligible_at(&state.account, model, &backends, now)
                     {
+                        let concrete = match self.concrete_for(state.account.backend, model) {
+                            Some(c) => c,
+                            // Unreachable when selection is consistent with `serves`; fall back to
+                            // the requested id rather than panicking. The upstream will reject an
+                            // unresolved alias, surfacing the bug instead of silently misrouting.
+                            None => model.to_string(),
+                        };
                         return Ok(Selection {
                             account_id: bound_id.clone(),
                             backend: state.account.backend,
                             decision: Decision::StickyHit,
+                            concrete_model: concrete,
                         });
                     }
                     let preferred = self.accounts.get(&bound_id).map(|s| s.account.backend);
                     if let Some(next) = find_healthy(self, preferred) {
                         let backend = self.accounts[&next].account.backend;
                         self.bind(key, &next, now);
+                        let concrete = self.concrete_for(backend, model).unwrap_or_else(|| model.to_string());
                         return Ok(Selection {
                             account_id: next,
                             backend,
                             decision: Decision::StickyRebind,
+                            concrete_model: concrete,
                         });
                     }
                 } else {
@@ -371,10 +436,12 @@ impl PoolCore {
             if let Some(key) = sticky {
                 self.bind(key, &next, now);
             }
+            let concrete = self.concrete_for(backend, model).unwrap_or_else(|| model.to_string());
             return Ok(Selection {
                 account_id: next,
                 backend,
                 decision,
+                concrete_model: concrete,
             });
         }
 
