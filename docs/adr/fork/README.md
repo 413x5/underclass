@@ -59,3 +59,6 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   SIGINT/SIGTERM, drains in-flight requests for a bounded 5 seconds via `with_graceful_shutdown`
   on both listeners, and lets `UsageFinish` record aborted streams as `client_closed` instead of
   dropping them.
+- [Monitor Operator Toggle](monitor-operator-toggle.md) — `underclass top` may perform exactly one
+  write, a confirmed enable/disable of the selected account, sent through the authenticated admin API
+  and never through the read-only monitor socket.
