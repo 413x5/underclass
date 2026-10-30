@@ -1080,7 +1080,19 @@ async fn attempt_account(
                 record.error_code.clone(),
             ));
         }
-        let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
+        let mut outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
+        // Free models (id contains a delimited "free" token) bill at $0 and must never cool a
+        // billing surface: a 402 on a free model is model-scoped, not account-wide, so the
+        // credits/subscriptions surfaces stay routable for paid models on the same account.
+        // `model` here is the requested id (alias or concrete), which is what the free alias
+        // and billing-surface logic key on; a free model's concrete id also contains the token.
+        if matches!(outcome, Outcome::QuotaExhausted { .. })
+            && crate::aliases::contains_free_token(model)
+        {
+            if let Outcome::QuotaExhausted { until_ms } = outcome {
+                outcome = Outcome::ModelQuotaExhausted { until_ms };
+            }
+        }
         let body_text = if translate_responses {
             crate::responses::error_body(&body_text)
         } else {

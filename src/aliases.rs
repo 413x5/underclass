@@ -76,7 +76,7 @@ pub fn base_name(model_id: &str) -> &str {
 /// Whether `s` contains "free" as a delimited token (case-insensitive): the substring must be
 /// bounded by a non-alphanumeric character or the string boundary on both sides, so "freedom"
 /// and "freemium" do not match but "beam-free", "free-tier", "Beam Free" and ":free" do.
-fn contains_free_token(s: &str) -> bool {
+pub fn contains_free_token(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let needle = b"free";
@@ -112,13 +112,30 @@ pub fn build_alias_table(
             // A model is also available as free/<base> when "free" appears as a delimited
             // token in its id or display name (case-insensitive), e.g. "beam-free", "free-tier",
             // "Beam Free", or ":free" - but not when "free" is merely a substring of a larger
-            // word such as "freedom" or "freemium". The operator may override this by defining a
-            // kind literally named "free" in [model_aliases], which then owns the namespace.
+            // word such as "freedom" or "freemium". When the base name is exactly "free" (e.g.
+            // cline/openrouter/free), append the previous path segment so the alias stays
+            // identifiable (free/openrouter/free) instead of collapsing to free/free.
+            // The operator may override this by defining a kind literally named "free" in
+            // [model_aliases], which then owns the namespace.
             let operator_owns_free = config.kinds.contains_key("free");
             let is_free = !operator_owns_free
                 && (contains_free_token(&m.id) || contains_free_token(&m.name));
             if is_free {
-                let free_alias = format!("free/{}", base_name(&m.id));
+                let base = base_name(&m.id);
+                let free_base = if base.eq_ignore_ascii_case("free") {
+                    // use last two segments when available, else prefix with "free" to avoid
+                    // collapsing to free/free.
+                    let parts: Vec<&str> = m.id.split('/').collect();
+                    if parts.len() >= 2 {
+                        format!("{}/{}", parts[parts.len()-2], parts[parts.len()-1])
+                    } else {
+                        // Single-segment "free" id: keep it as free/free (unavoidable).
+                        base.to_string()
+                    }
+                } else {
+                    base.to_string()
+                };
+                let free_alias = format!("free/{}", free_base);
                 table
                     .entry(free_alias)
                     .or_default()
