@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted, and corrected in part by
+[fork: Catalog Refresh Is Operator-Driven](fork/catalog-refresh-is-operator-driven.md): the Copilot
+catalog is no longer fetched on boot. The body below is left unedited.
 
 ## Context
 
