@@ -95,8 +95,10 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
         accounts.iter().map(|a| account_view(&state, a)).collect();
     let requests: Vec<RequestLogEntry> = state.logs.lock().unwrap().iter().rev().cloned().collect();
     // Only account-backed backends are advertised, so the opencode snippet built from this map
-    // matches `GET /v1/models`. The catalog editor reads `/admin/api/catalog/{backend}` instead and
-    // still sees every stored row, including a backend that has no accounts.
+    // matches `GET /v1/models`, and a row recorded as deprecated is dropped for the same reason:
+    // the snippet may not offer a model the provider has retired. The catalog editor reads
+    // `/admin/api/catalog/{backend}` instead and still sees every stored row, including a retired
+    // one and a backend that has no accounts.
     let mut catalog = serde_json::Map::new();
     let mut catalog_backends = Vec::new();
     for backend in BackendId::all() {
@@ -105,7 +107,14 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
         }
         catalog.insert(
             backend.as_str().to_string(),
-            json!(state.store.catalog(backend)),
+            json!(
+                state
+                    .store
+                    .catalog(backend)
+                    .into_iter()
+                    .filter(|model| !model.is_deprecated())
+                    .collect::<Vec<_>>()
+            ),
         );
         catalog_backends.push(backend.as_str());
     }
@@ -622,8 +631,6 @@ pub async fn refresh_account(
     .into_response()
 }
 
-
-
 pub async fn relogin_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -829,10 +836,12 @@ pub async fn get_aliases(State(state): State<Arc<AppState>>) -> Response {
         .map(|(alias, concretes)| {
             (
                 alias.clone(),
-                json!(concretes
-                    .iter()
-                    .map(|(b, m)| json!({"backend": b.as_str(), "model": m}))
-                    .collect::<Vec<_>>()),
+                json!(
+                    concretes
+                        .iter()
+                        .map(|(b, m)| json!({"backend": b.as_str(), "model": m}))
+                        .collect::<Vec<_>>()
+                ),
             )
         })
         .collect();

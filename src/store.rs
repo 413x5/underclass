@@ -158,6 +158,7 @@ fn schema() -> &'static str {
         input INTEGER NOT NULL DEFAULT 0,
         output INTEGER NOT NULL DEFAULT 0,
         scope TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
         PRIMARY KEY (backend, model_id)
     );
     CREATE TABLE IF NOT EXISTS config (
@@ -254,6 +255,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "scope") {
         conn.execute(
             "ALTER TABLE catalog ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|c| c == "metadata") {
+        conn.execute(
+            "ALTER TABLE catalog ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
             [],
         )?;
     }
@@ -1043,22 +1050,27 @@ impl Store {
         tx.commit().expect("commit binding prune");
     }
 
+    /// @cc [owner:ghuntley,label:persistence] catalog-metadata-round-trips
+    /// `catalog` and `set_catalog` MUST round-trip the whole `metadata` block through the single
+    /// `catalog.metadata` JSON column, MUST deserialize a row whose metadata is absent or malformed
+    /// into the empty block rather than failing the load, and `set_catalog` MUST serialize it with
+    /// serde on a struct so identical rows always produce identical bytes.
     pub fn catalog(&self, backend: BackendId) -> Vec<ModelInfo> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT model_id, name, context, input, output, scope FROM catalog
+                "SELECT model_id, name, context, input, output, scope, metadata FROM catalog
                  WHERE backend = ?1 ORDER BY model_id",
             )
             .expect("prepare catalog");
         let rows = stmt
             .query_map(params![backend.as_str()], |row| {
                 let mut id: String = row.get(0)?;
-                if backend == crate::models::BackendId::OpencodeGo
-                    && id.starts_with("opencode_go/")
+                if backend == crate::models::BackendId::OpencodeGo && id.starts_with("opencode_go/")
                 {
                     id = format!("opencode-go/{}", &id["opencode_go/".len()..]);
                 }
+                let metadata: String = row.get(6)?;
                 Ok(ModelInfo {
                     id,
                     name: row.get(1)?,
@@ -1066,6 +1078,9 @@ impl Store {
                     input: row.get(3)?,
                     output: row.get(4)?,
                     scope: row.get(5)?,
+                    // A row written before the column existed, or by a build that stored something
+                    // unusable, degrades to "no metadata published" instead of dropping the model.
+                    metadata: serde_json::from_str(&metadata).unwrap_or_default(),
                 })
             })
             .expect("query catalog");
@@ -1081,9 +1096,10 @@ impl Store {
         )
         .expect("clear catalog");
         for m in models {
+            let metadata = serde_json::to_string(&m.metadata).expect("serialize catalog metadata");
             tx.execute(
-                "INSERT INTO catalog (backend, model_id, name, context, input, output, scope) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![backend.as_str(), m.id, m.name, m.context, m.input, m.output, m.scope],
+                "INSERT INTO catalog (backend, model_id, name, context, input, output, scope, metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![backend.as_str(), m.id, m.name, m.context, m.input, m.output, m.scope, metadata],
             )
             .expect("insert catalog row");
         }
@@ -1246,6 +1262,7 @@ mod tests {
             input: 0,
             output: 0,
             scope: "cline-pass".into(),
+            metadata: Default::default(),
         }];
         store.set_catalog(crate::models::BackendId::Cline, &models);
         let catalog = store.catalog(crate::models::BackendId::Cline);

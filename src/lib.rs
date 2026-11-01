@@ -12,6 +12,7 @@ pub mod jwt;
 pub mod listing;
 pub mod logging;
 pub mod models;
+pub mod modelsdev;
 pub mod monitor;
 pub mod opencode_go;
 pub mod pool;

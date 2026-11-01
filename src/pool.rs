@@ -95,9 +95,15 @@ impl PoolCore {
         core
     }
 
+    /// @cc [owner:ghuntley,label:pool] deprecated-never-advertised
+    /// `set_catalog` MUST leave a row recorded as `deprecated` out of the routable catalog, so
+    /// keeping a retirement on the row never keeps the model routable: `serves` MUST answer `false`
+    /// for it and `select` MUST NOT choose the backend for it. The row stays in the store for the
+    /// operator; only the routable view drops it.
     pub fn set_catalog(&mut self, backend: BackendId, models: &[ModelInfo]) {
         let models = models
             .iter()
+            .filter(|model| !model.is_deprecated())
             .map(|model| (model.id.clone(), model.scope.clone()))
             .collect();
         self.catalog.insert(backend, models);
@@ -113,7 +119,12 @@ impl PoolCore {
     pub fn rebuild_aliases(&mut self, store: &crate::store::Store) {
         let mut catalogs = std::collections::HashMap::new();
         for b in crate::models::BackendId::all() {
-            catalogs.insert(b, store.catalog(b));
+            let models: Vec<ModelInfo> = store
+                .catalog(b)
+                .into_iter()
+                .filter(|model| !model.is_deprecated())
+                .collect();
+            catalogs.insert(b, models);
         }
         self.aliases = crate::aliases::build_alias_table(&catalogs, &self.alias_config);
     }
@@ -128,7 +139,11 @@ impl PoolCore {
     /// Resolve `requested` to the concrete model id for `backend`. Returns `Some(requested)`
     /// when it is not an alias but the backend serves it directly; `None` otherwise.
     pub fn concrete_for(&self, backend: BackendId, requested: &str) -> Option<String> {
-        if self.catalog.get(&backend).is_some_and(|set| set.contains_key(requested)) {
+        if self
+            .catalog
+            .get(&backend)
+            .is_some_and(|set| set.contains_key(requested))
+        {
             return Some(requested.to_string());
         }
         if crate::aliases::is_alias(&self.aliases, requested) {
@@ -138,7 +153,11 @@ impl PoolCore {
     }
 
     pub fn serves(&self, backend: BackendId, model: &str) -> bool {
-        if self.catalog.get(&backend).is_some_and(|set| set.contains_key(model)) {
+        if self
+            .catalog
+            .get(&backend)
+            .is_some_and(|set| set.contains_key(model))
+        {
             return true;
         }
         if crate::aliases::is_alias(&self.aliases, model) {
@@ -152,7 +171,11 @@ impl PoolCore {
     /// does not list the model at all. The distinction matters: an explicit empty scope is an
     /// account-wide quota, not a missing entry.
     fn declared_scope(&self, backend: BackendId, model: &str) -> Option<Option<String>> {
-        let concrete = if self.catalog.get(&backend).is_some_and(|set| set.contains_key(model)) {
+        let concrete = if self
+            .catalog
+            .get(&backend)
+            .is_some_and(|set| set.contains_key(model))
+        {
             model.to_string()
         } else if crate::aliases::is_alias(&self.aliases, model) {
             match crate::aliases::concrete_for(&self.aliases, backend, model) {
@@ -412,7 +435,9 @@ impl PoolCore {
                     if let Some(next) = find_healthy(self, preferred) {
                         let backend = self.accounts[&next].account.backend;
                         self.bind(key, &next, now);
-                        let concrete = self.concrete_for(backend, model).unwrap_or_else(|| model.to_string());
+                        let concrete = self
+                            .concrete_for(backend, model)
+                            .unwrap_or_else(|| model.to_string());
                         return Ok(Selection {
                             account_id: next,
                             backend,
@@ -436,7 +461,9 @@ impl PoolCore {
             if let Some(key) = sticky {
                 self.bind(key, &next, now);
             }
-            let concrete = self.concrete_for(backend, model).unwrap_or_else(|| model.to_string());
+            let concrete = self
+                .concrete_for(backend, model)
+                .unwrap_or_else(|| model.to_string());
             return Ok(Selection {
                 account_id: next,
                 backend,
@@ -743,6 +770,66 @@ mod tests {
         core
     }
 
+    /// A retirement recorded on the row must not leave the model routable: keeping it stored is
+    /// only for the operator's view.
+    #[test]
+    fn a_deprecated_row_is_not_routable() {
+        let store = Store::in_memory().unwrap();
+        let mut core = PoolCore::new(&store, openai_surfaces());
+        let mut retired = ModelInfo {
+            id: "cline/cline-pass/mimo-v2.5".into(),
+            name: "MiMo V2.5".into(),
+            context: 1_048_576,
+            input: 1_048_576,
+            output: 131_072,
+            scope: "cline-pass".into(),
+            metadata: Default::default(),
+        };
+        retired.metadata.status = crate::models::ModelStatus::Deprecated;
+        let live = ModelInfo {
+            id: "cline/cline-pass/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 1_048_576,
+            input: 1_048_576,
+            output: 131_072,
+            scope: "cline-pass".into(),
+            metadata: Default::default(),
+        };
+        core.set_catalog(BackendId::Cline, &[retired.clone(), live.clone()]);
+        core.insert_account(account("cline-1", BackendId::Cline));
+        assert!(
+            !core.serves(BackendId::Cline, &retired.id),
+            "a retired model must not be routable"
+        );
+        assert!(core.serves(BackendId::Cline, &live.id));
+        assert!(
+            core.select(1, None, &retired.id, Surface::OpenAI).is_err(),
+            "selection must not pick a retired model"
+        );
+        assert!(core.select(1, None, &live.id, Surface::OpenAI).is_ok());
+
+        // Storing the row and reusing it for aliases keeps the same property.
+        store.set_catalog(BackendId::Cline, &[retired.clone(), live]);
+        core.rebuild_aliases(&store);
+        assert!(
+            !core
+                .aliases
+                .get("subscriptions/mimo-v2.5")
+                .is_some_and(|concretes| concretes.iter().any(|(_, id)| *id == retired.id)),
+            "a retired concrete must not appear in the alias table"
+        );
+    }
+
+    fn openai_surfaces() -> std::collections::HashMap<BackendId, Vec<Surface>> {
+        std::collections::HashMap::from([
+            (BackendId::Codex, vec![Surface::OpenAI]),
+            (BackendId::Copilot, vec![Surface::OpenAI]),
+            (BackendId::Claude, vec![Surface::Anthropic]),
+            (BackendId::Cline, vec![Surface::OpenAI]),
+            (BackendId::OpencodeGo, vec![Surface::OpenAI]),
+        ])
+    }
+
     fn catalog(models: &[&str]) -> Vec<ModelInfo> {
         models
             .iter()
@@ -753,6 +840,7 @@ mod tests {
                 input: 0,
                 output: 0,
                 scope: String::new(),
+                metadata: Default::default(),
             })
             .collect()
     }

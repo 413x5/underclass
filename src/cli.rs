@@ -510,6 +510,10 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
             continue;
         }
         for m in underclass_store.catalog(backend) {
+            // A recorded retirement is stored but never offered: the same rule the listing applies.
+            if m.is_deprecated() {
+                continue;
+            }
             if seen.insert(m.id.clone()) {
                 all_models.push(m);
             }

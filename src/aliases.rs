@@ -8,17 +8,20 @@ pub struct AliasConfig {
 }
 
 impl AliasConfig {
-    pub fn from_config(kinds: std::collections::BTreeMap<String, Vec<String>>, default_kind: String) -> Self {
-        AliasConfig { kinds, default_kind }
+    pub fn from_config(
+        kinds: std::collections::BTreeMap<String, Vec<String>>,
+        default_kind: String,
+    ) -> Self {
+        AliasConfig {
+            kinds,
+            default_kind,
+        }
     }
     pub fn default_config() -> Self {
         let mut kinds = BTreeMap::new();
         kinds.insert(
             "subscriptions".to_string(),
-            vec![
-                "cline/cline-pass/".to_string(),
-                "opencode-go/".to_string(),
-            ],
+            vec!["cline/cline-pass/".to_string(), "opencode-go/".to_string()],
         );
         kinds.insert("credits".to_string(), vec!["cline/".to_string()]);
         AliasConfig {
@@ -50,9 +53,7 @@ impl AliasConfig {
                     // longest prefix wins; on tie, lexicographically smallest kind wins.
                     let better = match best {
                         None => true,
-                        Some((bl, bk, _)) => {
-                            len > bl || (len == bl && kind.as_str() < bk)
-                        }
+                        Some((bl, bk, _)) => len > bl || (len == bl && kind.as_str() < bk),
                     };
                     if better {
                         best = Some((len, kind.as_str(), prefix.as_str()));
@@ -85,8 +86,7 @@ pub fn contains_free_token(s: &str) -> bool {
         if bytes[i..i + needle.len()] == *needle {
             let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             let right_idx = i + needle.len();
-            let right_ok = right_idx == bytes.len()
-                || !bytes[right_idx].is_ascii_alphanumeric();
+            let right_ok = right_idx == bytes.len() || !bytes[right_idx].is_ascii_alphanumeric();
             if left_ok && right_ok {
                 return true;
             }
@@ -96,6 +96,11 @@ pub fn contains_free_token(s: &str) -> bool {
     false
 }
 
+/// @cc [owner:ghuntley,label:pool] deprecated-never-advertised
+/// `build_alias_table` MUST NOT derive an alias from a row recorded as `deprecated`, on any kind or
+/// on the implicit `free/` namespace, so an alias never resolves to a model the pool will not serve.
+/// Every caller shares this rule: the boot path builds the table from stored rows, and a stored
+/// retirement outlives the refresh that produced it.
 pub fn build_alias_table(
     catalogs: &std::collections::HashMap<BackendId, Vec<ModelInfo>>,
     config: &AliasConfig,
@@ -103,6 +108,11 @@ pub fn build_alias_table(
     let mut table: AliasTable = std::collections::HashMap::new();
     for (backend, models) in catalogs {
         for m in models {
+            // A recorded retirement is never an alias: an alias must resolve to a model the pool
+            // can actually serve, and `PoolCore::set_catalog` already drops the row from routing.
+            if m.is_deprecated() {
+                continue;
+            }
             let kind = config.billing_kind(*backend, &m.id, &m.scope);
             let alias = format!("{}/{}", kind, base_name(&m.id));
             table
@@ -118,8 +128,8 @@ pub fn build_alias_table(
             // The operator may override this by defining a kind literally named "free" in
             // [model_aliases], which then owns the namespace.
             let operator_owns_free = config.kinds.contains_key("free");
-            let is_free = !operator_owns_free
-                && (contains_free_token(&m.id) || contains_free_token(&m.name));
+            let is_free =
+                !operator_owns_free && (contains_free_token(&m.id) || contains_free_token(&m.name));
             if is_free {
                 let base = base_name(&m.id);
                 let free_base = if base.eq_ignore_ascii_case("free") {
@@ -127,7 +137,7 @@ pub fn build_alias_table(
                     // collapsing to free/free.
                     let parts: Vec<&str> = m.id.split('/').collect();
                     if parts.len() >= 2 {
-                        format!("{}/{}", parts[parts.len()-2], parts[parts.len()-1])
+                        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
                     } else {
                         // Single-segment "free" id: keep it as free/free (unavoidable).
                         base.to_string()
@@ -146,7 +156,10 @@ pub fn build_alias_table(
     for v in table.values_mut() {
         v.sort_by(|a, b| {
             use std::cmp::Ordering;
-            match a.0.as_str().cmp(b.0.as_str()) { Ordering::Equal => a.1.cmp(&b.1), o => o }
+            match a.0.as_str().cmp(b.0.as_str()) {
+                Ordering::Equal => a.1.cmp(&b.1),
+                o => o,
+            }
         });
         v.dedup();
     }
@@ -178,26 +191,62 @@ mod tests {
             input: 0,
             output: 0,
             scope: scope.to_string(),
+            metadata: Default::default(),
         }
     }
 
     #[test]
     fn base_name_last_segment() {
         assert_eq!(base_name("cline/openai/gpt-5.2"), "gpt-5.2");
-        assert_eq!(base_name("opencode-go/deepseek-v4.1-flash"), "deepseek-v4.1-flash");
+        assert_eq!(
+            base_name("opencode-go/deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
         assert_eq!(base_name("grok-4.7"), "grok-4.7");
+    }
+
+    /// The boot path builds the alias table straight from stored rows, so a stored retirement must
+    /// not become an alias there - otherwise a restart resurrects a retired model as routable.
+    #[test]
+    fn a_deprecated_row_derives_no_alias() {
+        let mut retired = model("cline/cline-pass/mimo-v2.5", "cline-pass");
+        retired.metadata.status = crate::models::ModelStatus::Deprecated;
+        let catalogs = std::collections::HashMap::from([(
+            BackendId::Cline,
+            vec![retired, model("cline/cline-pass/kimi-k3", "cline-pass")],
+        )]);
+        let table = build_alias_table(&catalogs, &AliasConfig::default_config());
+        assert!(
+            !table.contains_key("subscriptions/mimo-v2.5"),
+            "an alias must not resolve to a retired model"
+        );
+        assert!(
+            table.contains_key("subscriptions/kimi-k3"),
+            "a live sibling still derives its alias"
+        );
+        assert!(
+            table
+                .values()
+                .flatten()
+                .all(|(_, id)| id != "cline/cline-pass/mimo-v2.5"),
+            "no alias may point at a retired concrete"
+        );
     }
 
     #[test]
     fn cline_scope_authoritative() {
         let cfg = AliasConfig::default_config();
         assert_eq!(
-            cfg.billing_kind(BackendId::Cline, "cline/cline-pass/deepseek-v4.1-flash", "cline-pass"),
-"subscriptions"
+            cfg.billing_kind(
+                BackendId::Cline,
+                "cline/cline-pass/deepseek-v4.1-flash",
+                "cline-pass"
+            ),
+            "subscriptions"
         );
         assert_eq!(
             cfg.billing_kind(BackendId::Cline, "cline/openai/gpt-5.2", "credits"),
-"credits"
+            "credits"
         );
     }
 
@@ -237,6 +286,7 @@ mod tests {
                     input: 0,
                     output: 0,
                     scope: "credits".to_string(),
+                    metadata: Default::default(),
                 },
                 // not free
                 model("cline/openai/gpt-5.2", "credits"),

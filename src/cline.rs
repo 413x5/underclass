@@ -1,4 +1,4 @@
-use crate::models::{Account, AccountStatus, BackendId, ModelInfo, now_ms};
+use crate::models::{Account, AccountStatus, BackendId, ModelInfo, ModelStatus, now_ms};
 use crate::provider::Backend;
 use crate::store::Store;
 use http::HeaderMap;
@@ -88,6 +88,7 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
             input: 0,
             output: 0,
             scope: quota_scope(id).to_string(),
+            metadata: Default::default(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -146,6 +147,7 @@ pub fn parse_recommended_models(body: &Value) -> Vec<ModelInfo> {
                 input: 0,
                 output: 0,
                 scope: quota_scope(id).to_string(),
+                metadata: Default::default(),
             });
         }
     }
@@ -211,6 +213,13 @@ fn merge_row(existing: &ModelInfo, incoming: &ModelInfo) -> ModelInfo {
     } else {
         existing.name.clone()
     };
+    // Metadata follows the same rule as the limits: whichever source published a field supplies
+    // it, and a retirement recorded by either source sticks so the row is never re-advertised.
+    let mut merged_metadata = existing.metadata.clone();
+    merged_metadata.fill_from(&incoming.metadata);
+    if incoming.is_deprecated() {
+        merged_metadata.status = ModelStatus::Deprecated;
+    }
     ModelInfo {
         id: existing.id.clone(),
         name,
@@ -222,6 +231,7 @@ fn merge_row(existing: &ModelInfo, incoming: &ModelInfo) -> ModelInfo {
         } else {
             existing.scope.clone()
         },
+        metadata: merged_metadata,
     }
 }
 
@@ -236,6 +246,11 @@ pub fn subscription_catalog(feed: Vec<ModelInfo>) -> Vec<ModelInfo> {
 
 /// Model IDs documented for the ClinePass subscription, seeded at boot and used when Cline's
 /// recommended-models feed cannot be read, so the subscription stays visible either way.
+///
+/// A row here MUST be a model the subscription actually serves: `cline-pass/mimo-v2.5` and
+/// `cline-pass/mimo-v2.5-pro` are deliberately absent because a live completion answers
+/// `404 model not found` for both. A retirement is recorded on the row (`status`) rather than
+/// removed once the catalog is stored, so the next retirement needs no edit here.
 pub fn default_catalog() -> Vec<ModelInfo> {
     let entries: &[(&str, &str)] = &[
         ("cline-pass/glm-5.3", "GLM-5.3"),
@@ -248,8 +263,6 @@ pub fn default_catalog() -> Vec<ModelInfo> {
             "cline-pass/deepseek-v4.1-flash-1017",
             "DeepSeek V4.1 Flash 1017",
         ),
-        ("cline-pass/mimo-v2.5", "MiMo-V2.5"),
-        ("cline-pass/mimo-v2.5-pro", "MiMo-V2.5 Pro"),
         ("cline-pass/mimo-v2.6-flash", "MiMo-V2.6 Flash"),
         ("cline-pass/mimo-v2.6-pro", "MiMo-V2.6 Pro"),
         ("cline-pass/minimax-m3", "MiniMax M3"),
@@ -271,6 +284,7 @@ pub fn default_catalog() -> Vec<ModelInfo> {
             input: 0,
             output: 0,
             scope: quota_scope(id).to_string(),
+            metadata: Default::default(),
         })
         .collect()
 }
@@ -372,6 +386,21 @@ async fn fetch_recommended_models(
 /// the stored non-zero value for the same id, and MUST leave a fetched non-zero value alone. A
 /// fetched model absent from the stored catalog MUST keep its own (zero) limits rather than
 /// inheriting another model's.
+///
+/// Limits take the **stored** value where the refresh left one unknown, so an operator's catalog
+/// edit survives a refresh, and a models.dev spec fills it only where neither the refresh nor the
+/// operator produced one. That is why the caller runs this before enrichment: with the order
+/// reversed, a spec would make the value non-zero and the operator's number would be lost.
+///
+/// It MUST also carry a stored `status` onto a row the refresh produced: `build_catalog` re-creates
+/// documented rows as `available`, so without this one failed feed read would un-retire a model an
+/// earlier read retired. It MUST NOT carry `available` over a stored `deprecated`, and MUST leave a
+/// row with no stored counterpart alone. `retire_absent` runs afterwards and still owns the
+/// transition from `available` to `deprecated`, so a feed that names the model un-retires it.
+///
+/// It MUST fill every capability the fetched row does not already know from the stored row's
+/// block, so a read that could not publish a field never erases what an earlier read recorded.
+/// The fresh read is applied afterwards by `overlay_metadata`.
 fn carry_forward_limits(fetched: &mut [ModelInfo], previous: &[ModelInfo]) {
     for model in fetched.iter_mut() {
         let Some(old) = previous.iter().find(|old| old.id == model.id) else {
@@ -387,6 +416,28 @@ fn carry_forward_limits(fetched: &mut [ModelInfo], previous: &[ModelInfo]) {
         if model.output == 0 {
             model.output = old.output;
         }
+        // The stored capability block is the floor for the same reason the limits are: a refresh
+        // that read a source without a field must not erase what an earlier read established.
+        // `overlay_metadata` then applies whatever the fresh read does publish.
+        model.metadata.fill_from(&old.metadata);
+        if old.is_deprecated() {
+            model.metadata.status = ModelStatus::Deprecated;
+        }
+    }
+}
+
+/// @cc [owner:ghuntley,label:pool] metadata-never-invented
+/// `overlay_metadata` MUST apply a fresh read's metadata block onto every row it describes and keep
+/// a stored field only where the fresh block is silent, so a capability models.dev published on an
+/// earlier refresh survives a refresh that could not read it, or that dropped the field. It MUST
+/// leave a field the fresh block publishes exactly as the fresh block reports it, and MUST NOT touch
+/// a row the fresh block does not describe.
+fn overlay_metadata(models: &mut [ModelInfo], fresh: &[ModelInfo]) {
+    for model in models.iter_mut() {
+        let Some(spec) = fresh.iter().find(|spec| spec.id == model.id) else {
+            continue;
+        };
+        model.metadata.overlay_from(&spec.metadata);
     }
 }
 
@@ -411,6 +462,110 @@ pub fn build_catalog(listing: Vec<ModelInfo>, feed: Vec<ModelInfo>) -> Vec<Model
     models
 }
 
+/// @cc [owner:ghuntley,label:pool] cline-specs-from-models-dev
+/// `apply_specs` MUST fill a row's limits from the models.dev corpus only where the row does not
+/// already know them: models.dev is the reference for `limit`, never for the set, and never for
+/// `api.cline.bot`'s numbers (that listing describes the upstream provider, not the ClinePass
+/// quota). An id models.dev does not know MUST keep its row unchanged. Capability metadata is not
+/// touched here - `overlay_metadata` applies it, because a field models.dev omits must keep what an
+/// earlier read recorded. A models.dev `status` MUST NOT be copied, because retirement is decided by
+/// `retire_absent`.
+///
+/// It MUST also leave `input` at or below `context` afterwards: the two are filled independently,
+/// so an operator's smaller context combined with a spec's larger input would otherwise advertise
+/// more input than the window holds.
+pub fn apply_specs(models: &mut [ModelInfo], specs: &[ModelInfo]) {
+    for model in models.iter_mut() {
+        let Some(spec) = specs.iter().find(|spec| spec.id == model.id) else {
+            continue;
+        };
+        let pick = |current: i64, other: i64| if current != 0 { current } else { other };
+        model.context = pick(model.context, spec.context);
+        model.input = pick(model.input, spec.input);
+        model.output = pick(model.output, spec.output);
+        model.input_from_context();
+        if model.context > 0 {
+            model.input = model.input.min(model.context);
+        }
+    }
+}
+
+/// The ClinePass entries a feed read actually named, or `None` when the read is not evidence about
+/// the set at all: an unread feed, or one whose `clinePass` bucket came back empty because it was
+/// renamed, dropped, or reshaped.
+fn subscription_entries(published: Option<&[ModelInfo]>) -> Option<Vec<&ModelInfo>> {
+    published
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.scope == SCOPE_CLINE_PASS)
+                .collect::<Vec<_>>()
+        })
+        .filter(|rows| !rows.is_empty())
+}
+
+/// @cc [owner:ghuntley,label:pool] cline-retirement-follows-the-feed
+/// `retire_absent` MUST leave every ClinePass row's `status` untouched when the feed was not read or
+/// named no ClinePass entry, and otherwise MUST mark a row `available` exactly when the feed names
+/// it and `deprecated` when it does not. A recorded retirement therefore survives a transient feed
+/// outage - nothing is un-retired by a read that told us nothing - while a row the feed names again
+/// comes back to `available`. The feed is the set authority because it matched live availability
+/// exactly on the probed ids, while models.dev is stale in both directions: it marks ids Cline still
+/// serves and omits ids Cline publishes. A retired row MUST stay stored and MUST never be advertised.
+pub fn retire_absent(models: &mut [ModelInfo], published: Option<&[ModelInfo]>) {
+    let Some(published) = subscription_entries(published) else {
+        return;
+    };
+    for model in models.iter_mut() {
+        if model.scope != SCOPE_CLINE_PASS {
+            continue;
+        }
+        model.metadata.status = if published.iter().any(|row| row.id == model.id) {
+            ModelStatus::Available
+        } else {
+            ModelStatus::Deprecated
+        };
+    }
+}
+
+/// @cc [owner:ghuntley,label:pool] deprecated-never-advertised
+/// `keep_stored` MUST re-add every stored ClinePass row this refresh does not produce, carrying its
+/// stored `status`, so `set_catalog` never deletes a subscription row: a retirement stays recorded
+/// when the feed names no such model, and a row survives a feed outage instead of being erased and
+/// then recreated as `available`. A re-added row MUST keep the stored status - `deprecated` is not
+/// invented here, because only the feed can retire a model - and MUST NOT touch a row of any other
+/// scope or one the refresh still produces.
+pub fn keep_stored(models: &mut Vec<ModelInfo>, previous: &[ModelInfo]) {
+    for old in previous {
+        if old.scope != SCOPE_CLINE_PASS {
+            continue;
+        }
+        if models.iter().any(|model| model.id == old.id) {
+            continue;
+        }
+        models.push(old.clone());
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+}
+
+/// @cc [owner:ghuntley,label:pool] models-dev-failure-is-not-regression
+/// `enrich_catalog` MUST change no limit and no capability when `specs` is `None`, which is what a
+/// failed models.dev read yields, so the seed table, the listing and the feed keep describing the
+/// catalog on their own and no row regresses because a third-party feed was unreachable.
+/// Retirement is not enrichment: `retire_absent` still runs, because the feed read and the
+/// models.dev read are independent and a feed that names the model must record that either way.
+pub fn enrich_catalog(
+    models: &mut [ModelInfo],
+    published: Option<&[ModelInfo]>,
+    specs: Option<&[ModelInfo]>,
+) {
+    if let Some(specs) = specs {
+        overlay_metadata(models, specs);
+        apply_specs(models, specs);
+    }
+    retire_absent(models, published);
+}
+
 /// @cc [owner:ghuntley,label:pool] cline-refresh-never-shrinks-to-defaults
 /// `refresh_catalog` MUST leave the stored catalog and the routable model set untouched when the
 /// upstream `/models` listing yields zero usable entries, and MUST return `Ok` with an empty catalog
@@ -418,7 +573,9 @@ pub fn build_catalog(listing: Vec<ModelInfo>, feed: Vec<ModelInfo>) -> Vec<Model
 /// ClinePass defaults alone, because that would drop every credit-based `cline/<provider>/*` model
 /// from the pool until the next successful refresh. Limits previously stored for a still-listed
 /// model MUST be carried forward by `carry_forward_limits` so an operator's catalog edit survives
-/// the refresh.
+/// the refresh. A stored ClinePass row this refresh no longer produces MUST be kept by
+/// `keep_stored` rather than deleted, and `retire_absent` MUST then decide its status from the feed,
+/// so a retirement is recorded and a feed outage records nothing.
 pub async fn refresh_catalog(
     client: &Client,
     store: &Store,
@@ -432,17 +589,46 @@ pub async fn refresh_catalog(
     }
     let previous = store.catalog(BackendId::Cline);
     let feed = match fetch_recommended_models(client, user_agent).await {
-        Ok(feed) => feed,
+        Ok(feed) => Some(feed),
         Err(error) => {
             // The documented table keeps the subscription routable, but a feed-only model silently
             // stops being routable, which is exactly the symptom this catalog exists to prevent.
             // Say so rather than letting the next 503 be the first sign.
             tracing::warn!(error = %error, "catalog.cline_feed_unavailable");
-            Vec::new()
+            None
         }
     };
-    let mut models = build_catalog(listing, feed);
+    let mut models = build_catalog(listing, feed.clone().unwrap_or_default());
+    // Specs are an enrichment, never a set: a failed models.dev read leaves every row exactly as
+    // the listing, the feed and the documented table described it.
+    let specs = match crate::modelsdev::fetch(
+        &crate::modelsdev::feed_url(),
+        crate::modelsdev::CLINE_PASS_PROVIDER,
+        user_agent,
+    )
+    .await
+    {
+        Ok(document) => Some(crate::modelsdev::parse_provider(
+            &document,
+            crate::modelsdev::CLINE_PASS_PROVIDER,
+            CLINE_PASS_NAMESPACE,
+            MODEL_PREFIX,
+            SCOPE_CLINE_PASS,
+        )),
+        Err(error) => {
+            tracing::warn!(error = %error, "catalog.models_dev_unavailable");
+            None
+        }
+    };
+    // Order matters, and it is load-bearing:
+    // 1. a value the refresh did not produce comes from the operator's stored row, so an edit wins;
+    // 2. a row the refresh did not produce at all is re-added with its stored status;
+    // 3. models.dev fills what neither produced, and applies capabilities over the stored block;
+    // 4. the feed decides every subscription row's status, so an unread feed un-retires nothing
+    //    while a feed that names the model again un-retires it.
     carry_forward_limits(&mut models, &previous);
+    keep_stored(&mut models, &previous);
+    enrich_catalog(&mut models, feed.as_deref(), specs.as_deref());
     store.set_catalog(BackendId::Cline, &models);
     pool.lock().unwrap().set_catalog(BackendId::Cline, &models);
     pool.lock().unwrap().rebuild_aliases(store);
@@ -728,6 +914,7 @@ mod tests {
             input: 120_000,
             output: 8_000,
             scope: String::new(),
+            metadata: Default::default(),
         }];
         let mut fetched = parse_models_response(&json!({"data": [{"id": "openai/gpt-5.4"}]}));
         assert_eq!(fetched[0].context, 0, "the listing reports no limits");
@@ -747,6 +934,7 @@ mod tests {
                 input: 1,
                 output: 1,
                 scope: String::new(),
+                metadata: Default::default(),
             },
             ModelInfo {
                 id: "cline/gone/model".into(),
@@ -755,6 +943,7 @@ mod tests {
                 input: 999,
                 output: 999,
                 scope: String::new(),
+                metadata: Default::default(),
             },
         ];
         let mut fetched = vec![
@@ -765,6 +954,7 @@ mod tests {
                 input: 0,
                 output: 0,
                 scope: String::new(),
+                metadata: Default::default(),
             },
             ModelInfo {
                 id: "cline/brand/new".into(),
@@ -773,6 +963,7 @@ mod tests {
                 input: 0,
                 output: 0,
                 scope: String::new(),
+                metadata: Default::default(),
             },
         ];
         carry_forward_limits(&mut fetched, &stored);
@@ -904,6 +1095,7 @@ mod tests {
             input: 200_000,
             output: 32_000,
             scope: String::new(),
+            metadata: Default::default(),
         }];
         let feed = vec![ModelInfo {
             id: "cline/cline-pass/kimi-k3".into(),
@@ -912,6 +1104,7 @@ mod tests {
             input: 0,
             output: 0,
             scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
         }];
         // The documented table is the third source; `build_catalog` is what composes all three.
         let merged = build_catalog(listing, feed);
@@ -1006,6 +1199,7 @@ mod tests {
                 input: 120_000,
                 output: 8_000,
                 scope: String::new(),
+                metadata: Default::default(),
             },
             ModelInfo {
                 id: "cline/cline-pass/kimi-k3".into(),
@@ -1014,6 +1208,7 @@ mod tests {
                 input: 0,
                 output: 0,
                 scope: String::new(),
+                metadata: Default::default(),
             },
         ];
         assert!(backfill_scopes(&mut stored));
@@ -1034,6 +1229,534 @@ mod tests {
             "an explicit scope is never overwritten"
         );
         assert_eq!(stored[0].scope, "operator-surface");
+    }
+
+    fn fixture_document() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/models-dev-cline-pass.json"))
+            .expect("checked-in fixture parses")
+    }
+
+    fn fixture_specs() -> Vec<ModelInfo> {
+        crate::modelsdev::parse_provider(
+            &fixture_document(),
+            crate::modelsdev::CLINE_PASS_PROVIDER,
+            CLINE_PASS_NAMESPACE,
+            MODEL_PREFIX,
+            SCOPE_CLINE_PASS,
+        )
+    }
+
+    /// The recommended-models feed is the set: it names exactly the subscription models Cline
+    /// serves, and it is what `build_catalog` turns into rows with metadata from models.dev.
+    #[test]
+    fn a_full_cline_pass_row_carries_feed_name_feed_set_and_models_dev_specs() {
+        let feed_body: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/cline-recommended-models.json"
+        ))
+        .expect("checked-in fixture parses");
+        let feed = parse_recommended_models(&feed_body);
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        let specs = fixture_specs();
+        enrich_catalog(&mut models, Some(&feed), Some(&specs));
+
+        let row = models
+            .iter()
+            .find(|m| m.id == "cline/cline-pass/deepseek-v4.1-flash")
+            .expect("the feed names it");
+        assert_eq!(row.name, "DeepSeek V4.1 Flash", "the documented name wins");
+        assert_eq!(row.scope, SCOPE_CLINE_PASS);
+        assert_eq!(row.context, 1_000_000);
+        assert_eq!(
+            row.input, 1_000_000,
+            "models.dev carries no limit.input, so input equals context"
+        );
+        assert_eq!(row.output, 384_000);
+        let metadata = &row.metadata;
+        assert_eq!(
+            metadata.reasoning.as_ref().map(|r| r.effort.clone()),
+            Some(vec![
+                "none".into(),
+                "low".into(),
+                "high".into(),
+                "max".into()
+            ])
+        );
+        assert_eq!(metadata.tools, Some(true));
+        assert_eq!(
+            metadata.modalities.as_ref().unwrap().input,
+            vec!["text", "image"]
+        );
+        assert_eq!(metadata.cost.as_ref().unwrap().input, Some(0.15));
+        assert_eq!(metadata.prompt_cache, Some(true));
+        assert_eq!(metadata.status, ModelStatus::Available);
+
+        // Every published row names its billing surface and none of them regresses to zero when a
+        // spec is available for it.
+        for row in models.iter().filter(|m| m.scope == SCOPE_CLINE_PASS) {
+            assert_eq!(row.scope, SCOPE_CLINE_PASS, "{}", row.id);
+        }
+    }
+
+    /// A failed models.dev read is not a regression: the rows the feed, the listing and the
+    /// documented table produced are byte-identical to what they were before the read.
+    #[test]
+    fn a_failed_models_dev_read_leaves_every_row_unchanged() {
+        let feed_body: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/cline-recommended-models.json"
+        ))
+        .expect("checked-in fixture parses");
+        let feed = parse_recommended_models(&feed_body);
+        let listing = parse_models_response(&json!({"data": [{"id": "openai/gpt-5.4"}]}));
+        let before = build_catalog(listing, feed.clone());
+        let mut after = before.clone();
+        enrich_catalog(&mut after, Some(&feed), None);
+        assert_eq!(after, before, "no specs means no change at all");
+        assert!(
+            after
+                .iter()
+                .filter(|m| m.scope == SCOPE_CLINE_PASS)
+                .all(|m| m.context == 0),
+            "models.dev is the only spec source, so without it limits stay unpublished"
+        );
+    }
+
+    /// A feed that cannot be read must not retire anything: a retired row is one the feed has
+    /// stopped publishing, and an unread feed publishes nothing at all.
+    #[test]
+    fn an_unread_feed_retires_nothing() {
+        let mut models = default_catalog();
+        let before = models.clone();
+        enrich_catalog(&mut models, None, Some(&fixture_specs()));
+        let retired: Vec<&str> = models
+            .iter()
+            .filter(|m| m.is_deprecated())
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(
+            retired.is_empty(),
+            "an unread feed must not retire a subscription model: {retired:?}"
+        );
+        // The documented ids all survive as advertised rows.
+        for row in &before {
+            assert!(
+                models.iter().any(|m| m.id == row.id && !m.is_deprecated()),
+                "{} must stay routable",
+                row.id
+            );
+        }
+    }
+
+    /// A stored subscription row the feed stops naming must survive the refresh as `deprecated`:
+    /// `set_catalog` clears the table, so without `keep_stored` the operator loses the record.
+    #[test]
+    fn a_feed_only_row_the_feed_drops_stays_stored_and_retired() {
+        let stale = ModelInfo {
+            id: "cline/cline-pass/brand-new-model".into(),
+            name: "Brand New Model".into(),
+            context: 1_000_000,
+            input: 1_000_000,
+            output: 64_000,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        };
+        // The feed no longer names it, and the documented table never did.
+        let feed = parse_recommended_models(&json!({"clinePass": [
+            {"id": "cline-pass/kimi-k3"}
+        ]}));
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        assert!(
+            !models.iter().any(|m| m.id == stale.id),
+            "the refresh does not produce the row any more"
+        );
+        // The refresh path, in order: re-add what the refresh did not produce, then let the feed
+        // decide every subscription row's status.
+        keep_stored(&mut models, std::slice::from_ref(&stale));
+        retire_absent(&mut models, Some(&feed));
+
+        let kept = models
+            .iter()
+            .find(|m| m.id == stale.id)
+            .expect("the retirement must be recorded, not deleted");
+        assert_eq!(kept.metadata.status, ModelStatus::Deprecated);
+        assert_eq!(kept.context, stale.context, "the recorded limits are kept");
+        assert_eq!(kept.scope, SCOPE_CLINE_PASS);
+
+        // A published row is available, and it is not duplicated.
+        assert_eq!(
+            models
+                .iter()
+                .filter(|m| m.id == "cline/cline-pass/kimi-k3")
+                .count(),
+            1
+        );
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "cline/cline-pass/kimi-k3")
+                .unwrap()
+                .metadata
+                .status,
+            ModelStatus::Available
+        );
+
+        // A credit row is never re-added by this path.
+        let mut credits = stale.clone();
+        credits.id = "cline/openai/gpt-5.4".into();
+        credits.scope = SCOPE_CREDITS.into();
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        keep_stored(&mut models, &[credits]);
+        assert!(
+            !models.iter().any(|m| m.id == "cline/openai/gpt-5.4"),
+            "only ClinePass rows are kept by this path"
+        );
+    }
+
+    /// `keep_stored` re-adds a stored row with the status it already had. It never invents a
+    /// retirement: only the feed can retire a model.
+    #[test]
+    fn keep_stored_carries_the_stored_status_rather_than_inventing_one() {
+        let mut gone = ModelInfo {
+            id: "cline/cline-pass/gone-model".into(),
+            name: "Gone".into(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        };
+        gone.metadata.status = ModelStatus::Deprecated;
+        let mut models = default_catalog();
+        keep_stored(&mut models, std::slice::from_ref(&gone));
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == gone.id)
+                .expect("a stored subscription row is never deleted by a refresh")
+                .metadata
+                .status,
+            ModelStatus::Deprecated,
+            "the stored retirement is carried, not recomputed"
+        );
+
+        // The same row while still available stays available: `keep_stored` is not a retirement.
+        let mut live = gone.clone();
+        live.metadata.status = ModelStatus::Available;
+        let mut models = default_catalog();
+        keep_stored(&mut models, &[live]);
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == gone.id)
+                .unwrap()
+                .metadata
+                .status,
+            ModelStatus::Available
+        );
+    }
+
+    /// A feed outage must not un-retire a model: one transient failure would otherwise re-advertise
+    /// an id the provider answers `404` for, which is the bug this catalog exists to prevent.
+    #[test]
+    fn a_feed_outage_keeps_a_recorded_retirement() {
+        // Both shapes a retired row can have: one only the feed ever named, and one the documented
+        // table keeps re-creating as `available` on every refresh.
+        let retired_rows: Vec<ModelInfo> = ["cline-pass/brand-new-model", "cline-pass/glm-5.3"]
+            .iter()
+            .map(|id| {
+                let mut row = ModelInfo {
+                    id: pool_model_id(id),
+                    name: (*id).to_string(),
+                    context: 0,
+                    input: 0,
+                    output: 0,
+                    scope: SCOPE_CLINE_PASS.into(),
+                    metadata: Default::default(),
+                };
+                row.metadata.status = ModelStatus::Deprecated;
+                row
+            })
+            .collect();
+        for published in [None, Some(Vec::new())] {
+            let feed = published.clone().unwrap_or_default();
+            let mut models = build_catalog(Vec::new(), feed.clone());
+            assert!(
+                models.iter().any(|m| m.id == "cline/cline-pass/glm-5.3"),
+                "the documented table produces this row, and it starts available"
+            );
+            // The refresh path, in order.
+            keep_stored(&mut models, &retired_rows);
+            carry_forward_limits(&mut models, &retired_rows);
+            retire_absent(&mut models, published.as_deref());
+            for retired in &retired_rows {
+                let row = models
+                    .iter()
+                    .find(|m| m.id == retired.id)
+                    .unwrap_or_else(|| panic!("{} must survive a feed outage", retired.id));
+                assert_eq!(
+                    row.metadata.status,
+                    ModelStatus::Deprecated,
+                    "a read that told us nothing must not un-retire {}",
+                    retired.id
+                );
+            }
+            assert!(
+                models
+                    .iter()
+                    .all(|m| !m.is_deprecated() || retired_rows.iter().any(|r| r.id == m.id)),
+                "a feed outage still retires nothing new"
+            );
+        }
+    }
+
+    /// An operator's limit edit survives a refresh even when models.dev publishes one: the stored
+    /// value is carried before enrichment, so the spec only fills what neither produced.
+    #[test]
+    fn an_operator_limit_beats_a_models_dev_spec() {
+        let mut edited = ModelInfo {
+            id: "cline/cline-pass/deepseek-v4.1-flash".into(),
+            name: "DeepSeek V4.1 Flash".into(),
+            context: 424_242,
+            input: 111_111,
+            output: 22_222,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        };
+        edited.metadata.tools = Some(true);
+        let feed = parse_recommended_models(&json!({"clinePass": [
+            {"id": "cline-pass/deepseek-v4.1-flash"}
+        ]}));
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        // The refresh path, in the order `refresh_catalog` uses.
+        carry_forward_limits(&mut models, std::slice::from_ref(&edited));
+        keep_stored(&mut models, std::slice::from_ref(&edited));
+        enrich_catalog(&mut models, Some(&feed), Some(&fixture_specs()));
+        let row = models
+            .iter()
+            .find(|m| m.id == edited.id)
+            .expect("the feed names it");
+        assert_eq!(row.context, 424_242, "the operator's context wins");
+        assert_eq!(row.input, 111_111);
+        assert_eq!(row.output, 22_222);
+        // A capability models.dev publishes still arrives, because the row had none.
+        assert_eq!(
+            row.metadata.modalities.as_ref().unwrap().input,
+            vec!["text", "image"]
+        );
+        assert_eq!(
+            row.metadata.tools,
+            Some(true),
+            "the stored capability is kept"
+        );
+    }
+
+    /// A capability models.dev published on an earlier refresh survives a later read that cannot
+    /// supply it: the stored block is the floor, exactly like the limits.
+    #[test]
+    fn a_stored_capability_survives_a_read_that_drops_the_field() {
+        let mut stored = ModelInfo {
+            id: "cline/cline-pass/deepseek-v4.1-flash".into(),
+            name: "DeepSeek V4.1 Flash".into(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        };
+        stored.metadata.reasoning = Some(crate::models::ReasoningCapability {
+            supported: true,
+            effort: vec!["low".into(), "high".into()],
+        });
+        stored.metadata.knowledge = Some("2025-05".into());
+        let feed = parse_recommended_models(&json!({"clinePass": [
+            {"id": "cline-pass/deepseek-v4.1-flash"}
+        ]}));
+        // A spec that publishes limits but no reasoning or knowledge, as a partial corpus read does.
+        let partial = vec![ModelInfo {
+            id: "cline/cline-pass/deepseek-v4.1-flash".into(),
+            name: "DeepSeek V4.1 Flash".into(),
+            context: 1_000_000,
+            input: 1_000_000,
+            output: 384_000,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        }];
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        carry_forward_limits(&mut models, std::slice::from_ref(&stored));
+        keep_stored(&mut models, std::slice::from_ref(&stored));
+        enrich_catalog(&mut models, Some(&feed), Some(&partial));
+        let row = models
+            .iter()
+            .find(|m| m.id == stored.id)
+            .expect("the feed names it");
+        assert_eq!(
+            row.metadata.reasoning.as_ref().map(|r| r.effort.clone()),
+            Some(vec!["low".into(), "high".into()]),
+            "a capability the fresh read omits must keep the stored value"
+        );
+        assert_eq!(row.metadata.knowledge.as_deref(), Some("2025-05"));
+        assert_eq!(row.context, 1_000_000, "the spec still fills a limit");
+    }
+
+    /// An operator's smaller context plus a spec's larger input must not advertise more input than
+    /// the window holds, which is what `apply_specs` clamping afterwards guarantees.
+    #[test]
+    fn a_spec_never_leaves_input_above_context() {
+        let mut row = ModelInfo {
+            id: "cline/cline-pass/deepseek-v4.1-flash".into(),
+            name: "DeepSeek V4.1 Flash".into(),
+            context: 100_000,
+            input: 0,
+            output: 0,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        };
+        row.input = 0;
+        let specs = fixture_specs();
+        let mut models = vec![row];
+        apply_specs(&mut models, &specs);
+        assert_eq!(models[0].context, 100_000, "the operator's context is kept");
+        assert!(
+            models[0].input <= models[0].context,
+            "input {} must not exceed context {}",
+            models[0].input,
+            models[0].context
+        );
+        assert_eq!(models[0].input, 100_000);
+        assert_eq!(models[0].output, 384_000, "the spec still fills output");
+    }
+
+    /// A feed that names a model again un-retires it: the stored mark must not be permanent.
+    #[test]
+    fn a_feed_that_names_the_model_again_un_retires_it() {
+        let mut retired = ModelInfo {
+            id: "cline/cline-pass/glm-5.3".into(),
+            name: "GLM-5.3".into(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: SCOPE_CLINE_PASS.into(),
+            metadata: Default::default(),
+        };
+        retired.metadata.status = ModelStatus::Deprecated;
+        let feed = parse_recommended_models(&json!({"clinePass": [
+            {"id": "cline-pass/glm-5.3"}
+        ]}));
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        keep_stored(&mut models, std::slice::from_ref(&retired));
+        carry_forward_limits(&mut models, std::slice::from_ref(&retired));
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == retired.id)
+                .unwrap()
+                .metadata
+                .status,
+            ModelStatus::Deprecated,
+            "carry-forward keeps the stored mark until the feed decides"
+        );
+        retire_absent(&mut models, Some(&feed));
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == retired.id)
+                .unwrap()
+                .metadata
+                .status,
+            ModelStatus::Available,
+            "a model the feed publishes again is available again"
+        );
+    }
+
+    /// A feed that answered without a single ClinePass entry says nothing about which models are
+    /// gone - a renamed bucket or a changed response shape looks exactly like this - so it must not
+    /// retire the whole subscription.
+    #[test]
+    fn an_empty_cline_pass_bucket_retires_nothing() {
+        let mut models = default_catalog();
+        let empty: Vec<ModelInfo> = Vec::new();
+        enrich_catalog(&mut models, Some(&empty), None);
+        assert!(
+            models.iter().all(|m| !m.is_deprecated()),
+            "an empty feed read must not retire anything"
+        );
+        // A feed carrying only free models is the same case: it names no subscription model.
+        let free_only =
+            parse_recommended_models(&json!({"free": [{"id": "reflection/beam-free"}]}));
+        let mut models = default_catalog();
+        enrich_catalog(&mut models, Some(&free_only), None);
+        assert!(
+            models.iter().all(|m| !m.is_deprecated()),
+            "a feed with no clinePass entry must not retire anything"
+        );
+    }
+
+    /// The feed is the set that decides retirement: an id it still publishes keeps serving even
+    /// when models.dev marks it deprecated, and an id it has dropped is retired even though the
+    /// documented table still names it.
+    #[test]
+    fn the_feed_decides_which_subscription_models_are_retired() {
+        let feed = parse_recommended_models(&json!({"clinePass": [
+            {"id": "cline-pass/deepseek-v4.1-flash"},
+            {"id": "cline-pass/kimi-k2.7-code"}
+        ]}));
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        let specs = fixture_specs();
+        // models.dev marks `kimi-k2.7-code` deprecated, but the feed still publishes it: it keeps
+        // serving while the disagreement stays visible in the stored status.
+        enrich_catalog(&mut models, Some(&feed), Some(&specs));
+        let live = models
+            .iter()
+            .find(|m| m.id == "cline/cline-pass/kimi-k2.7-code")
+            .expect("published by the feed");
+        assert_eq!(
+            live.metadata.status,
+            ModelStatus::Available,
+            "a feed entry is never retired by models.dev alone"
+        );
+
+        // A documented row the feed has dropped is retired even though the table still names it, so
+        // the next retirement after `mimo-v2.5` needs no table edit.
+        let feed = parse_recommended_models(&json!({"clinePass": [
+            {"id": "cline-pass/deepseek-v4.1-flash"}
+        ]}));
+        let mut models = build_catalog(Vec::new(), feed.clone());
+        enrich_catalog(&mut models, Some(&feed), Some(&fixture_specs()));
+        let retired = models
+            .iter()
+            .find(|m| m.id == "cline/cline-pass/glm-5.3")
+            .expect("the documented table is a floor, not the advertised set");
+        assert_eq!(retired.metadata.status, ModelStatus::Deprecated);
+
+        // The listing drops it, so the id a client would 404 on is simply absent.
+        let catalogs = std::collections::HashMap::from([(BackendId::Cline, models)]);
+        let listed = crate::listing::advertised_models(
+            &catalogs,
+            &std::collections::HashSet::from([BackendId::Cline]),
+            &Default::default(),
+        );
+        assert!(listed.iter().all(|m| m.id != "cline/cline-pass/glm-5.3"));
+
+        // models.dev is never a set source: an id only it knows never becomes a row.
+        let mut documented = build_catalog(
+            Vec::new(),
+            parse_recommended_models(&json!({"clinePass": []})),
+        );
+        let before: Vec<String> = documented.iter().map(|m| m.id.clone()).collect();
+        enrich_catalog(&mut documented, Some(&[]), Some(&fixture_specs()));
+        let after: Vec<String> = documented.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            after, before,
+            "models.dev must not add an id to the catalog"
+        );
+    }
+
+    /// The two ids a live completion answers `404` for are gone from the documented table, so a
+    /// fresh install never advertises them in the first place.
+    #[test]
+    fn the_retired_documented_ids_are_gone() {
+        let ids: Vec<String> = default_catalog().into_iter().map(|m| m.id).collect();
+        assert!(!ids.contains(&"cline/cline-pass/mimo-v2.5".to_string()));
+        assert!(!ids.contains(&"cline/cline-pass/mimo-v2.5-pro".to_string()));
     }
 
     #[test]

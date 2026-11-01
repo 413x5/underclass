@@ -173,6 +173,14 @@ current: a stale entry actively misleads.
   rejected in ADR 0002, so its absence is deliberate.
 - `docs/adr/` records are append-only: a reversal is a new record that supersedes the old one, never an
   edit to it.
+- A `status = deprecated` catalog row is stored but never advertised, and the listing, the UI snippet
+  and `underclass connect` all apply that filter. The catalog editor (`/admin/api/catalog/{backend}`)
+  still shows every row, retired ones included - that is the operator's view on purpose.
+- The ~10 `opencode-go/*` ids Go's current `/v1/models` listing does not name are kept deliberately:
+  absence from a listing is not evidence of retirement, and several are free/preview specials. See
+  [`docs/adr/fork/model-metadata-sources.md`](docs/adr/fork/model-metadata-sources.md).
+- models.dev is an advisory spec source, never a set source, and a failed read leaves the catalog
+  byte-identical. Its `deprecated` marks do not retire anything on their own.
 ## Config files agents may edit
 
 `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `docs/adr/*`, `Cargo.toml`, `flake.nix`, `.github/*`,

@@ -121,7 +121,7 @@ Optional `~/.config/underclass/config.toml`:
 | `opencode_go_user_agent` | `unset` | per-backend override for OpenCode Go |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`, `UNDERCLASS_USER_AGENT`, `UNDERCLASS_CLINE_USER_AGENT`, `UNDERCLASS_OPENCODE_GO_USER_AGENT`. `UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS` overrides the OpenCode Go cooldown. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM`, `UNDERCLASS_GO_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`, and the OpenCode Go base is `https://opencode.ai/inference/go`). Set `UNDERCLASS_GO_UPSTREAM=https://opencode.ai/inference` to pool a pay-as-you-go Console key instead of a Go subscription; `UNDERCLASS_GO_CONSOLE` points key verification at a different Console.
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`, `UNDERCLASS_USER_AGENT`, `UNDERCLASS_CLINE_USER_AGENT`, `UNDERCLASS_OPENCODE_GO_USER_AGENT`. `UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS` overrides the OpenCode Go cooldown. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM`, `UNDERCLASS_MODELS_DEV_URL` (the models.dev corpus, default `https://models.dev/api.json`), `UNDERCLASS_GO_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`, and the OpenCode Go base is `https://opencode.ai/inference/go`). Set `UNDERCLASS_GO_UPSTREAM=https://opencode.ai/inference` to pool a pay-as-you-go Console key instead of a Go subscription; `UNDERCLASS_GO_CONSOLE` points key verification at a different Console.
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -153,7 +153,7 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `POST /v1/messages` | proxy key | Anthropic Messages API (Claude Code clients) |
 | `POST /v1/messages/count_tokens` | proxy key | Anthropic token counting, same |
 | `POST /messages` | proxy key | Messages API alias, for clients whose base URL already ends in `/v1` |
-| `GET /v1/models` | proxy key | union catalog of account-backed backends, with merged limits and derived aliases |
+| `GET /v1/models` | proxy key | union catalog of account-backed backends: merged limits, `scope`, capability `metadata`, and derived aliases |
 | `GET /` | none | web UI |
 | `GET /admin/api/state` | admin token | accounts, catalog, last 200 requests |
 | `GET /admin/api/usage` | admin token | token totals grouped by `group_by=model,account_id,cache_key` (any subset) |
@@ -186,6 +186,23 @@ Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase.
 The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, Cline's `cline/` + `cline/cline-pass/` IDs (refreshed from Cline's recommended-models feed), and OpenCode Go's `opencode-go/` IDs. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
 
 `GET /v1/models`, the UI's opencode snippet, and `underclass connect` list only the catalogs of backends that have an account, so every advertised id is one the pool can route. Stored rows are never pruned when an account is removed - re-adding it advertises its models again - and the catalog editor still shows every stored row, marking a backend with no account. See [Only Account-Backed Models Are Advertised](docs/adr/fork/account-backed-model-advertisement.md).
+
+Each entry carries the original seven keys plus two additive ones:
+
+| key | meaning |
+|---|---|
+| `id`, `object`, `name`, `owned_by` | unchanged |
+| `context_window`, `max_input_tokens`, `max_output_tokens` | the published limit, or JSON `null` when no source published one - the key is always present, and `0` never reaches the wire |
+| `scope` | `credits` or `cline-pass` for a model that bills against a surface; absent when the whole account shares one quota |
+| `metadata` | `reasoning` (`supported` plus the per-model `effort` ladder), `tools`, `structured_output`, `modalities`, `cost`, `prompt_cache`, `knowledge`, `wire`, `reasoning_field`, `status` |
+
+A capability a backend did not publish stays `null` in `metadata`, never a guess: an empty effort
+ladder means toggle-only reasoning, and a model that reports no effort array is not given invented
+levels. A model recorded as `deprecated` is stored but never advertised, so picking from
+`/v1/models` cannot hit a `404`. OpenCode Go's `/v1/models` supplies its own specs; Cline's
+ClinePass set comes from its recommended-models feed and its specs from models.dev `cline-pass`,
+which is advisory only - a failed models.dev read leaves the catalog exactly as it was. See
+[Model Metadata: Sources, Precedence, and What We Refuse to Copy](docs/adr/fork/model-metadata-sources.md).
 
 ## Nix flake
 

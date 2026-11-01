@@ -66,3 +66,9 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
 - [Only Account-Backed Models Are Advertised](account-backed-model-advertisement.md) — `GET /v1/models`,
   the UI snippet, and `underclass connect` list a backend's catalog only while it has an account;
   stored catalogs are never pruned and the admin catalog editor still shows every row.
+
+- [Model Metadata: Sources, Precedence, and What We Refuse to Copy](model-metadata-sources.md) —
+  unknown limits reach `GET /v1/models` as `null` rather than `0`, a stored `metadata` block carries
+  the capabilities each backend published (never a synthesized value), OpenCode Go's listing and
+  Cline's recommended-models feed plus models.dev supply it by precedence, and a retirement is a
+  recorded `status` that the listing filter drops.
