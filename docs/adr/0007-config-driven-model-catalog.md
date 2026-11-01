@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted
+Accepted, and corrected in part by
+[fork: Catalog Refresh Is Operator-Driven](fork/catalog-refresh-is-operator-driven.md): no backend's
+catalog refreshes at boot except Claude's, and the rest refresh only on an operator action. The body
+below is left unedited.
 
 ## Context
 

@@ -42,3 +42,6 @@ A models.dev read MUST be an enrichment, never a set source and never a regressi
 
 @cc [owner:ghuntley,label:persistence] catalog-metadata-round-trips
 The catalog MUST store a model's metadata block in one `catalog.metadata` JSON column added through the idempotent migration pattern, MUST deserialize a row whose metadata is absent or malformed into the empty block rather than dropping the row, MUST round-trip the block through `Store::catalog`/`Store::set_catalog`, and MUST serialize it deterministically so re-writing identical rows is byte-stable.
+
+@cc [owner:ghuntley,label:pool] catalog-refresh-is-operator-driven
+The Cline, OpenCode Go, and Copilot model sets MUST change only on an operator-initiated refresh - the admin catalog refresh endpoints, account onboarding, or a catalog edit - and startup MUST NOT fetch any of those three catalogs, so a restart never changes what the pool advertises and never delays readiness on a catalog read. The Claude catalog MAY refresh at boot, because the dashboard has no Claude refresh endpoint. This replaces the `cline-catalog-refreshed-on-boot` and `opencode-go-catalog-refreshed-on-boot` contracts, which required exactly that boot refresh and were removed with the functions they annotated.

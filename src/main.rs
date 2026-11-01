@@ -301,10 +301,13 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         });
     }
 
-    refresh_copilot_catalogs_on_boot(&state).await;
+    // Only the Claude catalog refreshes on boot: it has no refresh button. The Copilot, Cline and
+    // OpenCode Go catalogs change only when the operator presses the matching refresh button in
+    // the admin UI, so a restart never changes what the pool advertises and never holds the
+    // listener back on a multi-megabyte models.dev read.
     refresh_claude_catalogs_on_boot(&state).await;
-    refresh_cline_catalogs_on_boot(&state).await;
-    refresh_opencode_go_catalogs_on_boot(&state).await;
+    // Aliases and identities are not catalog refreshes: aliases are derived from the stored
+    // catalogs, and identities only fill in labels for generically-labelled accounts.
     refresh_aliases_on_boot(&state, &cfg).await;
     refresh_identities_on_boot(&state).await;
     {
@@ -609,104 +612,12 @@ fn seed_catalog(
     }
 }
 
-async fn refresh_copilot_catalogs_on_boot(state: &Arc<proxy::AppState>) {
-    let accounts: Vec<models::Account> = state
-        .store
-        .list_accounts()
-        .into_iter()
-        .filter(|a| a.backend == models::BackendId::Copilot)
-        .collect();
-    for account in accounts {
-        let Some(token) = account.refresh_token.clone() else {
-            continue;
-        };
-        if let Ok(catalog) = copilot::fetch_catalog(&state.client, &account, &token).await {
-            if !catalog.is_empty() {
-                state
-                    .store
-                    .set_catalog(models::BackendId::Copilot, &catalog);
-                state
-                    .pool
-                    .lock()
-                    .unwrap()
-                    .set_catalog(models::BackendId::Copilot, &catalog);
-                state.pool.lock().unwrap().rebuild_aliases(&state.store);
-            }
-        }
-    }
-}
-
-/// @cc [owner:ghuntley,label:pool] cline-catalog-refreshed-on-boot
-/// On boot, every Cline account with a stored key MUST refresh the Cline catalog, and a successful
-/// non-empty response MUST replace the stored and routable catalog so newly published models
-/// become available without a restart.
-async fn refresh_cline_catalogs_on_boot(state: &Arc<proxy::AppState>) {
-    let accounts: Vec<models::Account> = state
-        .store
-        .list_accounts()
-        .into_iter()
-        .filter(|account| account.backend == models::BackendId::Cline)
-        .collect();
-    for account in accounts {
-        let Some(key) = account.refresh_token.clone() else {
-            continue;
-        };
-        match underclass::cline::refresh_catalog(
-            &state.client,
-            &state.store,
-            &state.pool,
-            &key,
-            state.cline_user_agent.as_deref(),
-        )
-        .await
-        {
-            Ok(models) if !models.is_empty() => {
-                underclass::logging::log_catalog_refresh(&account, Some(models.len()), None);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                underclass::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
-            }
-        }
-    }
-}
-
-/// @cc [owner:ghuntley,label:pool] opencode-go-catalog-refreshed-on-boot
-/// On boot, every OpenCode Go account holding a key MUST refresh the OpenCode Go catalog, and a successful non-empty
-/// response MUST replace the stored and routable catalog so a model OpenCode Go has published since the
-/// last build becomes routable without a restart.
-async fn refresh_opencode_go_catalogs_on_boot(state: &Arc<proxy::AppState>) {
-    let accounts: Vec<models::Account> = state
-        .store
-        .list_accounts()
-        .into_iter()
-        .filter(|account| account.backend == models::BackendId::OpencodeGo)
-        .collect();
-    for account in accounts {
-        let Some(key) = account.refresh_token.clone() else {
-            continue;
-        };
-        match underclass::opencode_go::refresh_catalog(
-            &state.client,
-            &state.store,
-            &state.pool,
-            &key,
-            state.opencode_go_user_agent.as_deref(),
-        )
-        .await
-        {
-            Ok(models) if !models.is_empty() => {
-                underclass::logging::log_catalog_refresh(&account, Some(models.len()), None);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                underclass::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
-            }
-        }
-    }
-}
-
 /// Refreshes the Claude model catalog from Anthropic's Models API.
+///
+/// This is the only catalog that refreshes at boot: the dashboard has no Claude refresh button, so
+/// removing this would leave the Claude catalog unable to change at all. The Copilot, Cline, and
+/// OpenCode Go catalogs are fetched only from their admin refresh buttons - see
+/// `docs/adr/fork/catalog-refresh-is-operator-driven.md`.
 async fn refresh_claude_catalogs_on_boot(state: &Arc<proxy::AppState>) {
     let accounts: Vec<models::Account> = state
         .store
@@ -1097,6 +1008,52 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
 #[cfg(test)]
 mod tests {
     use super::is_generic_label;
+
+    /// A structural guard on the startup sequence: only the Claude catalog may be fetched before
+    /// the listener binds. Copilot, Cline and OpenCode Go change only from their admin refresh
+    /// endpoints, and the only honest way to keep that true without a live network is to assert on
+    /// the calls the boot path makes.
+    #[test]
+    fn boot_fetches_only_the_claude_catalog() {
+        let source = include_str!("main.rs");
+        let boot_start = source
+            .find("async fn async_serve(")
+            .expect("async_serve must exist");
+        let boot_end = boot_start
+            + source[boot_start..]
+                .find("tokio::net::TcpListener::bind")
+                .expect("async_serve must bind the HTTP listener");
+        let boot = &source[boot_start..boot_end];
+
+        assert!(
+            boot.contains("refresh_claude_catalogs_on_boot("),
+            "the Claude catalog has no admin refresh button, so boot must still fetch it"
+        );
+        for forbidden in [
+            "copilot::fetch_catalog(",
+            "cline::refresh_catalog(",
+            "opencode_go::refresh_catalog(",
+        ] {
+            assert!(
+                !boot.contains(forbidden),
+                "startup must not fetch a catalog through `{forbidden}`; it is operator-driven"
+            );
+        }
+
+        let boot_catalog_fns: Vec<&str> = source
+            .match_indices("async fn ")
+            .map(|(index, _)| {
+                let name = &source[index + "async fn ".len()..];
+                &name[..name.find('(').expect("a declaration has a parameter list")]
+            })
+            .filter(|name| name.ends_with("_catalogs_on_boot"))
+            .collect();
+        assert_eq!(
+            boot_catalog_fns,
+            ["refresh_claude_catalogs_on_boot"],
+            "the only boot catalog refresh may be Claude's"
+        );
+    }
 
     #[test]
     fn every_backend_fallback_label_is_generic() {

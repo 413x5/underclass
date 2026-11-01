@@ -8,6 +8,10 @@ Accepted. This is a fork-local ADR: it deliberately carries no upstream number s
 [Cline Backend with Responses Translation](cline-backend-responses-translation.md), whose body is
 left unedited.
 
+The boot refresh this record's `## Consequences` assumes is superseded by
+[Catalog Refresh Is Operator-Driven](catalog-refresh-is-operator-driven.md), which removes it; the
+body below is left unedited, so read that bullet as "at the next operator-requested refresh".
+
 ## Context
 
 The Cline backend built its catalog from `GET /api/v1/models` and merged a hand-maintained table of
