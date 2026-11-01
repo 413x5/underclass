@@ -461,6 +461,7 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
                 input: *input,
                 output: *output,
                 scope: String::new(),
+                metadata: Default::default(),
             },
         )
         .collect()

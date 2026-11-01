@@ -948,6 +948,7 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
             context: input,
             input,
             output,
+            metadata: Default::default(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1016,6 +1017,7 @@ pub fn default_catalog() -> Vec<ModelInfo> {
             context: *input,
             input: *input,
             output: *output,
+            metadata: Default::default(),
         })
         .collect()
 }

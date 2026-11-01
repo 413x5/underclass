@@ -15,7 +15,10 @@
 //!   open-weight models, `/openai/v1/responses` for the GPT/Grok/Muse family). `wire_for` is the
 //!   table that decides, and a `/v1/responses` request for a chat-family model is translated.
 
-use crate::models::{Account, AccountStatus, BackendId, ModelInfo, Outcome, Surface, now_ms};
+use crate::models::{
+    Account, AccountStatus, BackendId, Modalities, ModelCost, ModelInfo, ModelMetadata,
+    ModelStatus, Outcome, ReasoningCapability, Surface, WireApi, now_ms,
+};
 use crate::provider::Backend;
 use crate::store::Store;
 use http::HeaderMap;
@@ -175,11 +178,29 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
     &[
         ("beam-free", "Beam Free", 1_048_576, 1_048_576, 131_072),
         ("cat-jam-free", "Cat Jam Free", 1_048_576, 0, 131_072),
-        ("claude-haiku-5-5", "Claude Haiku 5.5", 1_000_000, 0, 128_000),
+        (
+            "claude-haiku-5-5",
+            "Claude Haiku 5.5",
+            1_000_000,
+            0,
+            128_000,
+        ),
         ("deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000, 0, 384_000),
-        ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1_000_000, 0, 384_000),
+        (
+            "deepseek-v4.1-flash",
+            "DeepSeek V4.1 Flash",
+            1_000_000,
+            0,
+            384_000,
+        ),
         ("gemini-4-argon", "Gemini 4 Argon", 1_048_576, 0, 65_536),
-        ("gemini-4-argon-contributor", "Gemini 4 Argon Contributor", 1_048_576, 0, 65_536),
+        (
+            "gemini-4-argon-contributor",
+            "Gemini 4 Argon Contributor",
+            1_048_576,
+            0,
+            65_536,
+        ),
         ("glm-5.1", "GLM-5.1", 204_800, 204_800, 131_072),
         ("glm-5.2", "GLM-5.2", 1_000_000, 1_000_000, 131_072),
         ("glm-5.3", "GLM-5.3", 1_000_000, 1_000_000, 131_072),
@@ -190,29 +211,71 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
         ("grok-4.7", "Grok 4.7", 500_000, 500_000, 500_000),
         ("hy3", "Hy3", 256_000, 192_000, 128_000),
         ("hy4-preview", "Hy4 preview", 1_024_000, 1_024_000, 64_000),
-        ("iceman-contributor-free", "Iceman Contributor Free", 262_144, 0, 131_072),
+        (
+            "iceman-contributor-free",
+            "Iceman Contributor Free",
+            262_144,
+            0,
+            131_072,
+        ),
         ("kimi-k2.6", "Kimi K2.6", 262_144, 262_144, 65_536),
         ("kimi-k2.7-code", "Kimi K2.7 Code", 262_144, 0, 262_144),
         ("kimi-k3", "Kimi K3", 1_048_576, 1_048_576, 131_072),
         ("kimi-k3.1-pro", "Kimi K3.1 Pro", 1_048_576, 0, 131_072),
         ("longcat-2.0", "LongCat-2.0", 1_000_000, 1_000_000, 131_072),
-        ("longcat-2.5-preview-free", "LongCat 2.5 Preview Free", 1_000_000, 0, 131_072),
+        (
+            "longcat-2.5-preview-free",
+            "LongCat 2.5 Preview Free",
+            1_000_000,
+            0,
+            131_072,
+        ),
         ("mimo-v2.5", "MiMo V2.5", 1_000_000, 1_000_000, 128_000),
         ("mimo-v2.5-pro", "MiMo V2.5 Pro", 1_048_576, 0, 128_000),
         ("mimo-v2.6-flash", "MiMo-V2.6-Flash", 1_048_576, 0, 131_072),
         ("mimo-v2.6-pro", "MiMo-V2.6-Pro", 1_048_576, 0, 131_072),
         ("minimax-m2.7", "MiniMax-M2.7", 204_800, 0, 131_072),
         ("minimax-m3", "MiniMax-M3", 1_000_000, 0, 131_072),
-        ("minimax-m3.1-flash", "MiniMax M3.1 Flash", 1_000_000, 0, 512_000),
-        ("minimax-m3.1-flash-free", "MiniMax M3.1 Flash Free", 1_000_000, 0, 512_000),
-        ("muse-spark-1.2-contributor", "Muse Spark 1.2 Contributor", 1_048_576, 0, 131_072),
-        ("muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor", 1_048_576, 0, 131_072),
+        (
+            "minimax-m3.1-flash",
+            "MiniMax M3.1 Flash",
+            1_000_000,
+            0,
+            512_000,
+        ),
+        (
+            "minimax-m3.1-flash-free",
+            "MiniMax M3.1 Flash Free",
+            1_000_000,
+            0,
+            512_000,
+        ),
+        (
+            "muse-spark-1.2-contributor",
+            "Muse Spark 1.2 Contributor",
+            1_048_576,
+            0,
+            131_072,
+        ),
+        (
+            "muse-spark-1.3-contributor",
+            "Muse Spark 1.3 Contributor",
+            1_048_576,
+            0,
+            131_072,
+        ),
         ("qwen3.7-plus", "Qwen3.7 Plus", 1_000_000, 0, 65_536),
         ("qwen3.8-flash", "Qwen3.8 Flash", 1_000_000, 0, 131_072),
         ("qwen3.8-max", "Qwen3.8 Max", 1_000_000, 0, 131_072),
         ("space-bunny", "Space Bunny", 1_048_576, 0, 524_288),
         ("step-5-preview", "Step 5 Preview", 1_000_000, 0, 65_536),
-        ("step-5-preview-free", "Step 5 Preview Free", 1_000_000, 0, 65_536),
+        (
+            "step-5-preview-free",
+            "Step 5 Preview Free",
+            1_000_000,
+            0,
+            65_536,
+        ),
     ]
 }
 
@@ -221,21 +284,158 @@ fn catalog_entries() -> &'static [(&'static str, &'static str, i64, i64, i64)] {
 /// prefix, MUST take the limits recorded for it here, and MUST leave `scope` empty so a `402`
 /// cools the account rather than an invented billing surface. Anthropic/Gemini-only ids are
 /// excluded (no OpenAI path).
+///
+/// The table is a **floor**, not the description of a model: a seed row records the limits this
+/// build knows and leaves every capability unset, so the listing - which carries `capabilities`,
+/// `modalities`, `cost` and `api` - is what fills `metadata` once it is read.
 pub fn default_catalog() -> Vec<ModelInfo> {
     let mut out: Vec<ModelInfo> = catalog_entries()
         .iter()
         .filter(|(id, ..)| wire_for(id).is_some())
-        .map(|(id, name, context, input, output)| ModelInfo {
-            id: pool_model_id(id),
-            name: (*name).to_string(),
-            context: *context,
-            input: *input,
-            output: *output,
-            scope: String::new(),
+        .map(|(id, name, context, input, output)| {
+            let mut model = ModelInfo {
+                id: pool_model_id(id),
+                name: (*name).to_string(),
+                context: *context,
+                input: *input,
+                output: *output,
+                scope: String::new(),
+                metadata: Default::default(),
+            };
+            // The seed encodes "unknown" as `0`; where it knows the context window but not the
+            // input limit, input equals context.
+            model.input_from_context();
+            model
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// @cc [owner:ghuntley,label:pool] metadata-never-invented
+/// `metadata_for` MUST record only what the listed entry reports: a model that reports
+/// `reasoning.supported: true` with no `effort` array MUST keep an empty ladder (toggle-only)
+/// rather than a guessed one, a `capabilities` member the entry omits MUST stay `None`, and the
+/// wire family MUST keep coming from `WIRE_FAMILY` with the entry's `api` member used only as a
+/// cross-check - an unknown `api` name is not mapped to a known one.
+fn metadata_for(item: &Value, upstream: &str) -> ModelMetadata {
+    let mut metadata = ModelMetadata::default();
+    let capabilities = item.get("capabilities");
+    if let Some(reasoning) = capabilities.and_then(|c| c.get("reasoning")) {
+        metadata.reasoning = Some(ReasoningCapability {
+            supported: reasoning
+                .get("supported")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            effort: reasoning
+                .get("effort")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+    }
+    metadata.tools = capabilities
+        .and_then(|c| c.get("tools"))
+        .and_then(|t| t.get("supported"))
+        .and_then(Value::as_bool);
+    metadata.structured_output = capabilities
+        .and_then(|c| c.get("structured_output"))
+        .and_then(Value::as_bool);
+    metadata.knowledge = item
+        .get("knowledge")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|knowledge| !knowledge.is_empty())
+        .map(str::to_string);
+    if let Some(modalities) = item.get("modalities") {
+        let names = |key: &str| {
+            modalities
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        metadata.modalities = Some(Modalities {
+            input: names("input"),
+            output: names("output"),
+        });
+    }
+    // `cost.text` is the token price for this surface; token tiers under `overrides` and the
+    // weekend/time multipliers are not flattened into one number, so only the base prices are
+    // recorded. A published `cache.read`/`cache.write` is what makes prompt caching real.
+    if let Some(text) = item.get("cost").and_then(|c| c.get("text")) {
+        let price = |path: &[&str]| {
+            let mut node = text;
+            for key in path {
+                node = node.get(*key)?;
+            }
+            node.as_f64()
+        };
+        let cost = ModelCost {
+            input: price(&["input", "price"]),
+            output: price(&["output", "price"]),
+            cache_read: price(&["input", "cache", "read"]),
+            cache_write: price(&["input", "cache", "write"]),
+        };
+        metadata.prompt_cache = Some(cost.cache_read.is_some() || cost.cache_write.is_some());
+        if cost != ModelCost::default() {
+            metadata.cost = Some(cost);
+        }
+    }
+    if let Some(wire) = wire_for(upstream) {
+        metadata.wire = Some(match wire {
+            Wire::Chat => WireApi::ChatCompletions,
+            Wire::Responses => WireApi::Responses,
+        });
+    }
+    metadata.reasoning_field = item
+        .get("api")
+        .and_then(Value::as_object)
+        .and_then(|api| {
+            api.values().find_map(|surface| {
+                surface
+                    .get("compatibility")?
+                    .get("reasoning_field")?
+                    .as_str()
+            })
+        })
+        .map(str::to_string);
+    metadata
+}
+
+/// @cc [owner:ghuntley,label:pool] opencode-go-surface-cross-check
+/// `api_surface_agrees_with_wire_family` MUST report whether the surface Go names in `api` and the
+/// one `WIRE_FAMILY` routes this build agree, and MUST report `true` when the entry names no
+/// surface this build knows - agreement is a cross-check, never a source of truth. A disagreement
+/// MUST be logged at warn level by the caller and MUST NOT change routing.
+fn api_surface_agrees_with_wire_family(item: &Value, upstream: &str) -> bool {
+    let Some(api) = item.get("api").and_then(Value::as_object) else {
+        return true;
+    };
+    let named: Vec<WireApi> = api.keys().filter_map(|name| WireApi::parse(name)).collect();
+    if named.is_empty() {
+        return true;
+    }
+    let Some(wire) = wire_for(upstream) else {
+        return true;
+    };
+    let expected = match wire {
+        Wire::Chat => WireApi::ChatCompletions,
+        Wire::Responses => WireApi::Responses,
+    };
+    named.contains(&expected)
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-catalog-servable-only
@@ -244,6 +444,13 @@ pub fn default_catalog() -> Vec<ModelInfo> {
 /// known upstream path - and MUST NOT panic on a malformed body or entry. It exists to describe a
 /// listing, not to change the catalog: the routable set is this module's table, because an
 /// unclassified id has no upstream path to route to.
+///
+/// A limit the entry publishes MUST be reported; a limit it omits MUST be reported as `0`
+/// (unknown), never as a value from this build's seed table, so a caller applying this listing can
+/// tell "the source did not say" from "the source said this". The one exception is the `name`, which
+/// an entry for a known id has no better value for. The entry's `limit.context` MUST govern `input`
+/// whenever the entry omits `limit.input` (input equals context), and `input` MUST NOT exceed
+/// `context` under any combination of published values.
 pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
     let Some(items) = body.get("data").and_then(Value::as_array) else {
         return Vec::new();
@@ -261,18 +468,69 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
         if wire_for(id).is_none() {
             continue;
         }
+        let upstream = id;
         let id = pool_model_id(id);
-        match known.iter().find(|model| model.id == id) {
-            Some(model) => out.push(model.clone()),
-            None => out.push(ModelInfo {
-                id: id.clone(),
-                name: upstream_model_id(&id).to_string(),
-                context: 0,
-                input: 0,
-                output: 0,
-                scope: String::new(),
-            }),
+        // The seed supplies a display name only. Its *limits* must not leak into a row that claims
+        // to describe this listing: a seed number would read as "the listing published it", and
+        // `apply_listing` would then overwrite an operator's stored edit with it. The seed's limits
+        // reach the catalog through `default_catalog()` in `refresh_catalog`, one level lower in
+        // the precedence chain.
+        let seed = known.iter().find(|model| model.id == id);
+        let mut model = ModelInfo {
+            id: id.clone(),
+            name: seed
+                .map(|seed| seed.name.clone())
+                .unwrap_or_else(|| upstream.to_string()),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: String::new(),
+            metadata: Default::default(),
+        };
+        model.metadata = metadata_for(item, upstream);
+        if let Some(limit) = item.get("limit") {
+            let published = |key: &str| {
+                limit
+                    .get(key)
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0)
+            };
+            let context = published("context");
+            let input = published("input");
+            // A listed entry that carries a `limit` object describes its own limits completely: a
+            // key it did not publish is *unknown* for this refresh, not the seed's number. Saying
+            // zero here is what lets the stored - and therefore the operator's - value win, with
+            // the seed supplying only what neither of them knows.
+            model.context = context.unwrap_or(0);
+            model.output = published("output").unwrap_or(0);
+            model.input = match (input, context) {
+                // A published input limit is authoritative, but cannot exceed the window holding it.
+                (Some(input), Some(context)) => input.min(context),
+                (Some(input), None) => input,
+                // Omitting `limit.input` means input equals the context the source just published.
+                // Keeping the seed's value here would leave it derived from a context that changed.
+                (None, Some(context)) => context,
+                // Neither published: unknown to this refresh, so a stored value can still win.
+                (None, None) => 0,
+            };
         }
+        model.input_from_context();
+        // A stored or seeded input can outlive a context the listing shrank; the window always wins,
+        // so `/v1/models` never advertises more input than the model holds.
+        if model.context > 0 {
+            model.input = model.input.min(model.context);
+        }
+        // Go's own surface name must agree with the wire family this build routes over. Routing
+        // keeps following `WIRE_FAMILY` - the `api` member is a cross-check, not a source - and a
+        // disagreement is logged so a table drift is visible in a release build too.
+        if !api_surface_agrees_with_wire_family(item, upstream) {
+            tracing::warn!(
+                model = upstream,
+                surface = ?wire_for(upstream),
+                "catalog.opencode_go_surface_disagrees_with_wire_family"
+            );
+        }
+        out.push(model);
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
@@ -280,23 +538,83 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
 }
 
 /// @cc [owner:ghuntley,label:pool] opencode-go-refresh-preserves-operator-limits
-/// `carry_forward_limits` MUST overwrite the `name`, `context`, `input`, and `output` of a refreshed
-/// model with the stored entry for the same id, MUST keep the refreshed name when the stored one is
-/// blank, and MUST NOT copy a stored entry onto an id that has no stored entry. The stored catalog
-/// is the operator's copy - Go reports no limits at all, so this module's table only seeds it and
-/// the catalog editor edits it - and a refresh that overwrote it would silently revert an edit the
-/// UI invited.
-fn carry_forward_limits(fetched: &mut [ModelInfo], previous: &[ModelInfo]) {
-    for model in fetched.iter_mut() {
+/// `carry_forward_limits` MUST apply the stored row for the same id over the row it is given: a
+/// stored non-zero `context`/`input`/`output` MUST replace the current value, a stored blank `name`
+/// MUST NOT replace a real one, and a stored `deprecated` status MUST be carried. It MUST NOT copy a
+/// stored entry onto an id that has no stored entry.
+///
+/// The stored row is the operator's copy, so it outranks this build's seed table. It does **not**
+/// outrank the listing: the caller applies what the listing published afterwards, which is why this
+/// runs before `apply_listing` and not after it.
+///
+/// It MUST also leave every row's `input` at or below its `context`: a stored input limit can
+/// predate a context the listing shrank, and `/v1/models` must never advertise more input than the
+/// window holds.
+///
+/// Go's listing reports no status at all, so a recorded retirement here is the operator's
+/// statement, not a source's, and a refresh MUST NOT silently undo it. No Go source can un-retire a
+/// row, because none reports a status; the operator clears it in the catalog editor.
+fn carry_forward_limits(models: &mut [ModelInfo], previous: &[ModelInfo]) {
+    for model in models.iter_mut() {
         let Some(old) = previous.iter().find(|old| old.id == model.id) else {
             continue;
         };
         if !old.name.trim().is_empty() {
             model.name = old.name.clone();
         }
-        model.context = old.context;
-        model.input = old.input;
-        model.output = old.output;
+        // A stored zero is "the operator did not say", so the seed or a later source still wins.
+        if old.context != 0 {
+            model.context = old.context;
+        }
+        if old.input != 0 {
+            model.input = old.input;
+        }
+        if old.output != 0 {
+            model.output = old.output;
+        }
+        model.input_from_context();
+        if model.context > 0 {
+            model.input = model.input.min(model.context);
+        }
+        // A capability models.dev published on an earlier refresh must survive a refresh that could
+        // not read it, so the stored block is the floor and the fresh read is applied after this.
+        model.metadata.fill_from(&old.metadata);
+        if old.is_deprecated() {
+            model.metadata.status = ModelStatus::Deprecated;
+        }
+    }
+}
+
+/// @cc [owner:ghuntley,label:pool] opencode-go-refresh-discovers-listed-models
+/// `apply_listing` MUST apply what Go's `/v1/models` entry published over the row already built:
+/// every non-zero published limit and the entry's capability block MUST replace the current value,
+/// and an id the listing names that is absent from `models` MUST be added. A value the listing does
+/// not publish MUST leave the current one alone, so the operator's stored number and the seed floor
+/// both survive a listing that has gone quiet. `input` MUST NOT exceed `context` afterwards.
+///
+/// It MUST NOT overwrite the `name` of a row it did not add. A listing entry for an id this build
+/// already knows carries this build's seed name, not a published one, so re-applying it would revert
+/// an operator's rename; a name is prose, never a limit, so nothing is lost by leaving it.
+fn apply_listing(models: &mut Vec<ModelInfo>, listing: &[ModelInfo]) {
+    for listed in listing {
+        let Some(model) = models.iter_mut().find(|model| model.id == listed.id) else {
+            models.push(listed.clone());
+            continue;
+        };
+        if listed.context != 0 {
+            model.context = listed.context;
+        }
+        if listed.input != 0 {
+            model.input = listed.input;
+        }
+        if listed.output != 0 {
+            model.output = listed.output;
+        }
+        model.metadata.overlay_from(&listed.metadata);
+        model.input_from_context();
+        if model.context > 0 {
+            model.input = model.input.min(model.context);
+        }
     }
 }
 
@@ -304,8 +622,9 @@ fn carry_forward_limits(fetched: &mut [ModelInfo], previous: &[ModelInfo]) {
 /// `refresh_catalog` MUST publish the union of Go's `/v1/models` listing and this build's
 /// `default_catalog()` floor, so a model Go publishes after this build becomes routable without a
 /// restart, while a failed or empty listing leaves the stored catalog untouched (never-shrink).
-/// Limits previously stored for a still-listed model MUST be carried forward by
-/// `carry_forward_limits` so an operator's catalog edit survives the refresh.
+/// Precedence MUST be the seed floor, then the stored row for the same id, then what the listing
+/// published, so an operator's catalog edit and a recorded retirement survive the refresh and the
+/// seed only supplies what neither the stored row nor the listing knows.
 pub async fn refresh_catalog(
     client: &Client,
     store: &Store,
@@ -332,8 +651,20 @@ pub async fn refresh_catalog(
         // Never-shrink: a transient empty listing leaves the stored catalog untouched.
         return Ok(Vec::new());
     }
-    let mut models = crate::cline::merge_discovered_models(listing, &default_catalog());
+    // One precedence chain, applied low to high, and the order is load-bearing:
+    //   seed table  ->  the stored row (the operator's copy)  ->  what the listing published.
+    // Starting from the listing instead would let the seed's own numbers win over an operator's
+    // edit for a model the listing no longer names.
+    let mut models = default_catalog();
+    for old in &previous {
+        if !models.iter().any(|model| model.id == old.id) {
+            models.push(old.clone());
+        }
+    }
     carry_forward_limits(&mut models, &previous);
+    apply_listing(&mut models, &listing);
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
     store.set_catalog(BackendId::OpencodeGo, &models);
     pool.lock()
         .unwrap()
@@ -740,21 +1071,159 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert_eq!(ids, vec!["opencode-go/glm-5.3", "opencode-go/kimi-k3", "opencode-go/omen-alpha"]);
+        assert_eq!(
+            ids,
+            vec![
+                "opencode-go/glm-5.3",
+                "opencode-go/kimi-k3",
+                "opencode-go/omen-alpha"
+            ]
+        );
         assert!(parse_models_response(&json!({})).is_empty());
         assert!(parse_models_response(&json!({"data": "nope"})).is_empty());
     }
 
     #[test]
-    fn listing_carries_the_recorded_limits() {
-        let models = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
-        assert_eq!(models[0].name, "Kimi K3");
-        assert_eq!(models[0].context, 1_048_576);
-        assert_eq!(models[0].output, 131_072);
+    fn a_listed_model_carries_its_full_metadata() {
+        let body: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/opencode-go-v1-models.json"))
+                .unwrap();
+        let models = parse_models_response(&body);
+        let flash = models
+            .iter()
+            .find(|m| m.id == "opencode-go/deepseek-v4.1-flash")
+            .expect("the listing names it");
+        let metadata = &flash.metadata;
+        assert_eq!(
+            metadata.reasoning,
+            Some(ReasoningCapability {
+                supported: true,
+                effort: vec!["low".into(), "high".into(), "max".into()],
+            })
+        );
+        assert_eq!(metadata.tools, Some(true));
+        assert_eq!(metadata.structured_output, Some(true));
+        assert_eq!(metadata.knowledge.as_deref(), Some("2025-05"));
+        let modalities = metadata.modalities.as_ref().expect("modalities");
+        assert_eq!(modalities.input[0], "text");
+        assert!(modalities.input.contains(&"image/png".to_string()));
+        assert_eq!(modalities.output, vec!["text"]);
+        let cost = metadata.cost.as_ref().expect("cost");
+        assert_eq!(cost.input, Some(0.15));
+        assert_eq!(cost.output, Some(0.6));
+        assert_eq!(cost.cache_read, Some(0.003));
+        assert_eq!(metadata.prompt_cache, Some(true));
+        assert_eq!(metadata.wire, Some(WireApi::ChatCompletions));
+        assert_eq!(
+            metadata.reasoning_field.as_deref(),
+            Some("reasoning_content")
+        );
+        assert_eq!(flash.context, 1_000_000);
+        assert_eq!(flash.output, 384_000);
     }
 
+    /// Go publishes `limit.input` on four models only. Its absence means "input equals context",
+    /// so the row carries a real number - never `0`, and never `None`.
     #[test]
-    fn operator_limits_survive_a_refresh() {
+    fn a_missing_input_limit_becomes_the_context_window() {
+        let body: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/opencode-go-v1-models.json"))
+                .unwrap();
+        let models = parse_models_response(&body);
+        let flash = models
+            .iter()
+            .find(|m| m.id == "opencode-go/deepseek-v4.1-flash")
+            .expect("the listing names it");
+        assert_eq!(flash.input, flash.context);
+        let luna = models
+            .iter()
+            .find(|m| m.id == "opencode-go/gpt-5.6-luna")
+            .expect("the listing names it");
+        assert_ne!(
+            luna.input, luna.context,
+            "a published input limit is kept as published"
+        );
+        assert_eq!(luna.input, 922_000);
+        assert_eq!(luna.context, 1_050_000);
+    }
+
+    /// A listing that shrinks a model's context while still omitting `limit.input` must not leave
+    /// the seed's input limit behind: input follows the published context, and never exceeds it.
+    #[test]
+    fn a_shrunk_context_derives_a_new_input_limit() {
+        // `kimi-k3` seeds at 1_048_576 / 1_048_576; a listing that now publishes 200_000 with no
+        // `limit.input` must advertise 200_000 for both, not a stale 1_048_576 input.
+        let models = parse_models_response(&json!({
+            "data": [{"id": "kimi-k3", "limit": {"context": 200_000, "output": 65_536}}]
+        }));
+        assert_eq!(models[0].context, 200_000);
+        assert_eq!(
+            models[0].input, 200_000,
+            "input follows the published context"
+        );
+        assert_eq!(models[0].output, 65_536);
+    }
+
+    /// A published `limit.input` larger than the published context is clamped: the window is what
+    /// the model actually holds.
+    #[test]
+    fn a_published_input_limit_never_exceeds_the_context() {
+        let models = parse_models_response(&json!({
+            "data": [{"id": "kimi-k3", "limit": {"context": 100_000, "input": 900_000}}]
+        }));
+        assert_eq!(models[0].context, 100_000);
+        assert_eq!(models[0].input, 100_000);
+    }
+
+    /// A stored row can also carry an input limit from before a context shrank. Carry-forward
+    /// keeps the stored number for a key the listing omits, so the clamp applied by
+    /// `carry_forward_limits` itself must be what brings `input` back under the context.
+    #[test]
+    fn a_carried_forward_input_limit_is_clamped_to_the_context() {
+        let stored = vec![ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 1_048_576,
+            input: 1_048_576,
+            output: 131_072,
+            scope: String::new(),
+            metadata: Default::default(),
+        }];
+        // The listing shrank the window and published no `limit.input`.
+        let listing = parse_models_response(&json!({
+            "data": [{"id": "kimi-k3", "limit": {"context": 100_000}}]
+        }));
+        let mut models = default_catalog();
+        carry_forward_limits(&mut models, &stored);
+        apply_listing(&mut models, &listing);
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/kimi-k3")
+            .expect("the seed floor keeps the row");
+        assert_eq!(row.context, 100_000, "the published window wins");
+        assert_eq!(
+            row.input, 100_000,
+            "the stored 1_048_576 input must be clamped to the published context"
+        );
+
+        // A stored row whose own input exceeds its own context is clamped by carry-forward.
+        let mut models = default_catalog();
+        carry_forward_limits(&mut models, &stored);
+        apply_listing(&mut models, &[]);
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/kimi-k3")
+            .expect("the seed floor keeps the row");
+        assert_eq!(row.context, 1_048_576);
+        assert_eq!(row.input, 1_048_576);
+        assert!(row.input <= row.context);
+    }
+
+    /// Go's listing is authoritative for every limit it publishes, so it replaces an
+    /// operator-edited number rather than deferring to it; the stored row only supplies what the
+    /// listing left unset.
+    #[test]
+    fn a_published_limit_beats_a_stored_one() {
         let stored = vec![ModelInfo {
             id: "opencode-go/kimi-k3".into(),
             name: "Kimi K3".into(),
@@ -762,18 +1231,204 @@ mod tests {
             input: 41,
             output: 40,
             scope: String::new(),
+            metadata: Default::default(),
         }];
-        let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
-        // The refresh carries this module's table, which is a seed, not the operator's copy.
-        assert_eq!(fetched[0].context, 1_048_576);
+        let listing = parse_models_response(&json!({
+            "data": [{"id": "kimi-k3", "limit": {"context": 1_048_576, "output": 131_072}}]
+        }));
+        let mut models = default_catalog();
+        carry_forward_limits(&mut models, &stored);
+        apply_listing(&mut models, &listing);
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/kimi-k3")
+            .expect("the seed floor keeps the row");
+        assert_eq!(row.context, 1_048_576);
+        assert_eq!(row.input, 1_048_576, "input follows the published context");
+        assert_eq!(row.output, 131_072);
+        assert_eq!(row.name, "Kimi K3", "a stored name is the operator's too");
+    }
+
+    /// A listing that has gone quiet about a limit must not wipe the stored one: the operator's
+    /// value wins over the seed, so the refresh never regresses a number the catalog already knew.
+    #[test]
+    fn a_listing_that_omits_a_limit_keeps_the_stored_one() {
+        let stored = vec![ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 42,
+            input: 41,
+            output: 40,
+            scope: String::new(),
+            metadata: Default::default(),
+        }];
+        // `limit: {}` publishes nothing, which is what a listing that stopped carrying a number
+        // looks like. `parse_models_response` reports that as unknown rather than the seed's value.
+        let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3", "limit": {}}]}));
+        assert_eq!(fetched[0].context, 0, "nothing published means unknown");
         carry_forward_limits(&mut fetched, &stored);
-        assert_eq!(fetched[0].context, 42);
+        assert_eq!(fetched[0].context, 42, "the stored value fills the unknown");
         assert_eq!(fetched[0].input, 41);
         assert_eq!(fetched[0].output, 40);
+        // Only what neither the listing nor the stored row knows falls through to the seed.
+        let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3", "limit": {}}]}));
+        carry_forward_limits(&mut fetched, &[]);
+        let models = crate::cline::merge_discovered_models(fetched, &default_catalog());
+        assert_eq!(models[0].context, 1_048_576, "the seed is the floor");
+    }
+
+    /// An operator edit beats the seed for the keys the listing did not publish - the case a seeded
+    /// row used to hide, because the seed pre-filled the row before carry-forward ran.
+    #[test]
+    fn an_operator_edit_beats_the_seed() {
+        let stored = vec![ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 42,
+            input: 42,
+            output: 40,
+            scope: String::new(),
+            metadata: Default::default(),
+        }];
+        let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3", "limit": {}}]}));
+        carry_forward_limits(&mut fetched, &stored);
+        let models = crate::cline::merge_discovered_models(fetched, &default_catalog());
+        // The seed floor adds the ids the listing did not name, so look this one up by id rather
+        // than by position.
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/kimi-k3")
+            .expect("the seed floor keeps the row");
         assert_eq!(
-            fetched[0].name, "Kimi K3",
-            "a stored name is the operator's too"
+            row.context, 42,
+            "the operator's number must survive the seed floor"
         );
+        assert_eq!(row.output, 40);
+    }
+
+    /// Go's listing reports no status, so a retirement on a Go row is the operator's. A refresh
+    /// must not rewrite it as available, which would silently re-advertise the model.
+    #[test]
+    fn a_recorded_retirement_survives_a_go_refresh() {
+        let mut retired = ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 1_048_576,
+            input: 1_048_576,
+            output: 131_072,
+            scope: String::new(),
+            metadata: Default::default(),
+        };
+        retired.metadata.status = ModelStatus::Deprecated;
+        let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
+        assert_eq!(
+            fetched[0].metadata.status,
+            ModelStatus::Available,
+            "the listing carries no status"
+        );
+        carry_forward_limits(&mut fetched, std::slice::from_ref(&retired));
+        assert_eq!(
+            fetched[0].metadata.status,
+            ModelStatus::Deprecated,
+            "a refresh must not un-retire a model Go never reported on"
+        );
+        assert!(fetched[0].is_deprecated());
+    }
+
+    /// An available row stays available: carry-forward carries the stored status, it does not
+    /// impose one.
+    #[test]
+    fn an_available_go_row_stays_available() {
+        let stored = vec![ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 1_048_576,
+            input: 1_048_576,
+            output: 131_072,
+            scope: String::new(),
+            metadata: Default::default(),
+        }];
+        let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
+        carry_forward_limits(&mut fetched, &stored);
+        assert_eq!(fetched[0].metadata.status, ModelStatus::Available);
+    }
+
+    /// A rename in the catalog editor must survive a refresh: a listing entry for a known id
+    /// carries this build's seed name, not a published one.
+    #[test]
+    fn an_operator_rename_survives_a_refresh() {
+        let stored = vec![ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Operator's Kimi".into(),
+            context: 0,
+            input: 0,
+            output: 0,
+            scope: String::new(),
+            metadata: Default::default(),
+        }];
+        let listing = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
+        assert_eq!(
+            listing[0].name, "Kimi K3",
+            "the seed name is what a listing entry carries for a known id"
+        );
+        let mut models = default_catalog();
+        carry_forward_limits(&mut models, &stored);
+        apply_listing(&mut models, &listing);
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/kimi-k3")
+            .expect("the row is published");
+        assert_eq!(
+            row.name, "Operator's Kimi",
+            "an operator's rename must not be reverted to the seed name"
+        );
+    }
+
+    /// A listing entry with no `limit` object at all is the same "listing told us nothing" shape as
+    /// `"limit": {}`: the seed's numbers must not leak into it, or an operator's edit would be lost.
+    #[test]
+    fn a_listing_entry_without_limits_carries_no_seed_numbers() {
+        let listing = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
+        assert_eq!(listing[0].context, 0);
+        assert_eq!(listing[0].input, 0);
+        assert_eq!(listing[0].output, 0);
+        assert_eq!(listing[0].name, "Kimi K3", "the seed name is kept");
+
+        let stored = vec![ModelInfo {
+            id: "opencode-go/kimi-k3".into(),
+            name: "Kimi K3".into(),
+            context: 424_242,
+            input: 424_242,
+            output: 22_222,
+            scope: String::new(),
+            metadata: Default::default(),
+        }];
+        let mut models = default_catalog();
+        carry_forward_limits(&mut models, &stored);
+        apply_listing(&mut models, &listing);
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/kimi-k3")
+            .expect("the row is published");
+        assert_eq!(
+            row.context, 424_242,
+            "an entry that publishes no limits must not revert an operator's edit"
+        );
+        assert_eq!(row.output, 22_222);
+    }
+
+    /// A model only the listing names is added under the name the listing gives it.
+    #[test]
+    fn a_listing_only_model_is_added_with_its_listing_name() {
+        let listing = parse_models_response(&json!({"data": [{"id": "brand-new-model"}]}));
+        let mut models = default_catalog();
+        carry_forward_limits(&mut models, &[]);
+        apply_listing(&mut models, &listing);
+        let row = models
+            .iter()
+            .find(|m| m.id == "opencode-go/brand-new-model")
+            .expect("a listed model absent from the seed is added");
+        assert_eq!(row.name, "brand-new-model");
     }
 
     #[test]
@@ -785,6 +1440,7 @@ mod tests {
             input: 0,
             output: 0,
             scope: String::new(),
+            metadata: Default::default(),
         }];
         let mut fetched = parse_models_response(&json!({"data": [{"id": "kimi-k3"}]}));
         carry_forward_limits(&mut fetched, &stored);
@@ -800,6 +1456,7 @@ mod tests {
             input: 41,
             output: 40,
             scope: String::new(),
+            metadata: Default::default(),
         }];
         let mut fetched = vec![ModelInfo {
             id: "opencode-go/kimi-k3-preview".into(),
@@ -808,6 +1465,7 @@ mod tests {
             input: 0,
             output: 0,
             scope: String::new(),
+            metadata: Default::default(),
         }];
         carry_forward_limits(&mut fetched, &stored);
         assert_eq!(fetched[0].context, 0);
@@ -857,7 +1515,10 @@ mod tests {
         assert!(!backend.responses_via_chat("opencode-go/gpt-6-luna"));
         // An id this build cannot classify defaults to the Responses path the operator prefers,
         // so it is not translated: the path and the body shape are two views of one decision.
-        assert_eq!(upstream_wire("opencode-go/never-heard-of-it"), Wire::Responses);
+        assert_eq!(
+            upstream_wire("opencode-go/never-heard-of-it"),
+            Wire::Responses
+        );
         assert!(!backend.responses_via_chat("opencode-go/never-heard-of-it"));
         assert_eq!(
             backend.rewrite_url("/v1/responses", "opencode-go/never-heard-of-it", &account()),

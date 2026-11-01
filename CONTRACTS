@@ -24,3 +24,21 @@ The flake's underclass package MUST put `underclass` and `utop` in `bin`; `utop`
 
 @cc [owner:ghuntley,label:persistence] health-write-under-pool-lock
 A write that persists an account's `status`, `reset_at`, or `scope_cooling` MUST be performed while the lock guarding the corresponding `PoolCore` is held, and MUST use the pool's current account rather than a snapshot taken outside that lock; otherwise a concurrent transition can be overwritten in the store and resurrected by `sync_from_store`.
+
+@cc [owner:ghuntley,label:proxy] unknown-limits-not-zero
+`GET /v1/models` MUST emit `context_window`, `max_input_tokens`, and `max_output_tokens` on every entry, as JSON `null` when no source has published the value (the stored `0`) and as the number otherwise, so a client can tell "unknown" from "zero capacity". A key MUST NOT be dropped to express unknown. An alias MUST take each limit as the widest value its servable concretes published, and MUST be `null` only when none of them published one. An alias MUST advertise `scope` only when every servable concrete agrees on one non-empty scope.
+
+@cc [owner:ghuntley,label:pool] input-falls-back-to-context
+When a source publishes a context window but omits its input limit, ingest MUST record `input = context`: absence of `limit.input` means "input equals context", not zero. `input` MUST stay `0` only when no source has published either value.
+
+@cc [owner:ghuntley,label:proxy] deprecated-never-advertised
+A catalog row whose recorded `status` is `deprecated` MUST NOT appear in `GET /v1/models`, MUST NOT keep an alias advertised, MUST NOT contribute to an alias's advertised limits, and MUST NOT be offered to a client by the UI snippet or `underclass connect`'s provider block. The row MUST stay stored and MUST stay visible in `GET /admin/api/catalog/{backend}`, and retirement MUST be recorded on the row rather than held in a hard-coded deny-list.
+
+@cc [owner:ghuntley,label:pool] metadata-never-invented
+A capability, modality, price, effort ladder, knowledge date, or surface name MUST be recorded only when the backend published it. A model that reports reasoning support without an effort array MUST keep an empty ladder, a source that omits a field MUST leave that field absent in `ModelInfo::metadata`, and a surface name this build does not recognise MUST NOT be mapped onto one it does.
+
+@cc [owner:ghuntley,label:pool] models-dev-failure-is-not-regression
+A models.dev read MUST be an enrichment, never a set source and never a regression: on any failure (network, non-2xx, malformed body, or a body without the provider read) the stored catalog and every row in it MUST be left exactly as they were, and the seed table, the backend listing, and the recommended-models feed MUST keep describing the catalog on their own. A models.dev `deprecated` marking MUST NOT retire a model on its own.
+
+@cc [owner:ghuntley,label:persistence] catalog-metadata-round-trips
+The catalog MUST store a model's metadata block in one `catalog.metadata` JSON column added through the idempotent migration pattern, MUST deserialize a row whose metadata is absent or malformed into the empty block rather than dropping the row, MUST round-trip the block through `Store::catalog`/`Store::set_catalog`, and MUST serialize it deterministically so re-writing identical rows is byte-stable.

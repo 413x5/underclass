@@ -197,6 +197,7 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
             input: max_prompt,
             output: max_output,
             scope: String::new(),
+            metadata: Default::default(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -467,6 +468,7 @@ pub fn fallback_catalog() -> Vec<ModelInfo> {
             input: *context,
             output: 128_000,
             scope: String::new(),
+            metadata: Default::default(),
         })
         .collect()
 }

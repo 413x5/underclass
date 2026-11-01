@@ -1,7 +1,7 @@
 use underclass::provider::BackendMap;
 use underclass::{
-    aliases, claude, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api,
-    store, tokens, top, ui,
+    aliases, claude, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy,
+    stats_api, store, tokens, top, ui,
 };
 
 use clap::{Parser, Subcommand};
@@ -426,10 +426,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             "/admin/api/catalog/{backend}",
             axum::routing::get(ui::get_catalog).put(ui::put_catalog),
         )
-        .route(
-            "/admin/api/aliases",
-            axum::routing::get(ui::get_aliases),
-        )
+        .route("/admin/api/aliases", axum::routing::get(ui::get_aliases))
         .route(
             "/admin/api/catalog/refresh-copilot",
             axum::routing::post(ui::refresh_copilot_catalog),
@@ -469,7 +466,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1005,7 +1002,10 @@ async fn refresh_aliases_on_boot(state: &Arc<proxy::AppState>, cfg: &config::Con
     for b in models::BackendId::all() {
         catalogs.insert(b, state.store.catalog(b));
     }
-    let cfg_alias = aliases::AliasConfig::from_config(cfg.model_alias_kinds.clone(), cfg.model_alias_default_kind.clone());
+    let cfg_alias = aliases::AliasConfig::from_config(
+        cfg.model_alias_kinds.clone(),
+        cfg.model_alias_default_kind.clone(),
+    );
     let table = aliases::build_alias_table(&catalogs, &cfg_alias);
     state.pool.lock().unwrap().set_alias_config(cfg_alias);
     state.pool.lock().unwrap().set_aliases(table);

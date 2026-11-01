@@ -35,6 +35,7 @@ fn catalog_of(ids: &[&str]) -> Vec<underclass::models::ModelInfo> {
             input: 0,
             output: 0,
             scope: String::new(),
+            metadata: Default::default(),
         })
         .collect()
 }
@@ -472,6 +473,7 @@ fn build(backend_spread: usize, account_count: usize) -> Built {
             input: 0,
             output: 0,
             scope: String::new(),
+            metadata: Default::default(),
         })
         .collect();
     core.set_catalog(BackendId::Codex, &catalog);
@@ -1117,6 +1119,7 @@ fn test_cline_catalog_always_contains_subscription_models(tc: TestCase) {
             input: 0,
             output: 0,
             scope: String::new(),
+            metadata: Default::default(),
         })
         .collect();
     let merged = underclass::cline::merge_catalog(fetched);
@@ -1152,6 +1155,7 @@ fn test_cline_feed_merge_is_monotonic_and_scoped(tc: TestCase) {
         input: 0,
         output: 0,
         scope: String::new(),
+        metadata: Default::default(),
     };
     let feed_ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(15));
     let listing = listing_ids
@@ -1498,6 +1502,7 @@ fn test_scoped_cooling_only_blocks_the_reported_surface(tc: TestCase) {
             input: 0,
             output: 0,
             scope: (*scope).to_string(),
+            metadata: Default::default(),
         })
         .collect();
     core.set_catalog(BackendId::Cline, &catalog);
@@ -1711,5 +1716,168 @@ fn test_model_listing_is_the_account_backed_view(tc: TestCase) {
         listed.contains(&"a/common".to_string()),
         !servable.is_empty(),
         "an alias grouping several backends follows the same rule"
+    );
+}
+
+/// A `ModelInfo` must survive a round trip through SQLite unchanged, and a row written by an older
+/// build - one with no `metadata` key at all - must still load. `metadata` is one JSON column whose
+/// every member is `serde(default)`, so the schema only ever grows and an upgraded binary reads a
+/// pre-upgrade `pool.db` without losing a row or failing the load.
+#[hegel::test]
+fn test_model_info_round_trips_through_sqlite(tc: TestCase) {
+    let ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(6));
+    let limits: Vec<(i64, i64, i64)> = tc.draw(
+        gs::vecs(gs::tuples!(
+            gs::integers::<i64>().min_value(0).max_value(4_000_000),
+            gs::integers::<i64>().min_value(0).max_value(4_000_000),
+            gs::integers::<i64>().min_value(0).max_value(4_000_000),
+        ))
+        .max_size(6),
+    );
+    let efforts: Vec<Vec<String>> = tc.draw(gs::vecs(gs::vecs(gs::text()).max_size(4)).max_size(6));
+    let booleans: Vec<Vec<bool>> =
+        tc.draw(gs::vecs(gs::vecs(gs::booleans()).max_size(3)).max_size(6));
+    let wires: Vec<Option<underclass::models::WireApi>> = tc.draw(
+        gs::vecs(gs::sampled_from(vec![
+            None,
+            Some(underclass::models::WireApi::ChatCompletions),
+            Some(underclass::models::WireApi::Responses),
+            Some(underclass::models::WireApi::Messages),
+            Some(underclass::models::WireApi::GenerateContent),
+        ]))
+        .max_size(6),
+    );
+    let statuses: Vec<underclass::models::ModelStatus> = tc.draw(
+        gs::vecs(gs::sampled_from(vec![
+            underclass::models::ModelStatus::Available,
+            underclass::models::ModelStatus::Deprecated,
+        ]))
+        .max_size(6),
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    let mut expected: Vec<underclass::models::ModelInfo> = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        // A catalog id is unique per backend, so a duplicate would collide on the primary key.
+        if id.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+        let (context, input, output) = limits
+            .get(index % limits.len().max(1))
+            .copied()
+            .unwrap_or((0, 0, 0));
+        let flags = booleans
+            .get(index % booleans.len().max(1))
+            .cloned()
+            .unwrap_or_default();
+        let reasoning = flags
+            .first()
+            .map(|supported| underclass::models::ReasoningCapability {
+                supported: *supported,
+                effort: efforts
+                    .get(index % efforts.len().max(1))
+                    .cloned()
+                    .unwrap_or_default(),
+            });
+        let mut metadata = underclass::models::ModelMetadata {
+            reasoning,
+            ..Default::default()
+        };
+        metadata.tools = flags.get(1).copied();
+        metadata.structured_output = flags.get(2).copied();
+        metadata.wire = wires
+            .get(index % wires.len().max(1))
+            .copied()
+            .unwrap_or(None);
+        metadata.status = statuses
+            .get(index % statuses.len().max(1))
+            .copied()
+            .unwrap_or_default();
+        metadata.cost = Some(underclass::models::ModelCost {
+            input: Some(index as f64 / 8.0),
+            output: None,
+            cache_read: Some(0.003),
+            cache_write: None,
+        });
+        metadata.knowledge = (!id.is_empty()).then(|| format!("20{}", id.len() % 30));
+        expected.push(underclass::models::ModelInfo {
+            id: id.clone(),
+            name: format!("model {id}"),
+            context,
+            input,
+            output,
+            scope: ["", "credits", "cline-pass"][index % 3].to_string(),
+            metadata,
+        });
+    }
+
+    let store = Store::in_memory().unwrap();
+    store.set_catalog(BackendId::Cline, &expected);
+    let loaded = store.catalog(BackendId::Cline);
+    let mut loaded_by_id: std::collections::HashMap<String, underclass::models::ModelInfo> =
+        loaded.into_iter().map(|m| (m.id.clone(), m)).collect();
+    for model in &expected {
+        let stored = loaded_by_id
+            .remove(&model.id)
+            .unwrap_or_else(|| panic!("{} must round-trip", model.id));
+        assert_eq!(&stored, model, "a stored row must round-trip unchanged");
+    }
+
+    // Writing the same rows again must produce the same bytes: a refresh cannot churn the store.
+    let first = store.catalog(BackendId::Cline);
+    store.set_catalog(BackendId::Cline, &first);
+    assert_eq!(
+        store.catalog(BackendId::Cline),
+        first,
+        "re-serializing identical rows must be byte-stable"
+    );
+}
+
+/// A `pool.db` written before `catalog.metadata` existed must load: the column is added with the
+/// empty-block default, and every row survives with no metadata rather than failing the load.
+#[hegel::test]
+fn test_a_legacy_catalog_row_without_metadata_still_loads(tc: TestCase) {
+    let id: String = tc.draw(gs::text());
+    if id.is_empty() || id.contains('\0') {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "underclass-legacy-metadata-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE catalog (
+                backend TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                context INTEGER NOT NULL DEFAULT 0,
+                input INTEGER NOT NULL DEFAULT 0,
+                output INTEGER NOT NULL DEFAULT 0,
+                scope TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (backend, model_id)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO catalog (backend, model_id, name, context) VALUES ('cline', ?1, ?1, ?2)",
+            rusqlite::params![id, 42i64],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let catalog = store.catalog(BackendId::Cline);
+    let _ = std::fs::remove_file(&path);
+    let row = catalog
+        .iter()
+        .find(|model| model.id == id)
+        .expect("a legacy row must load");
+    assert_eq!(row.context, 42);
+    assert_eq!(
+        row.metadata,
+        underclass::models::ModelMetadata::default(),
+        "a row with no metadata key loads as 'nothing published'"
     );
 }

@@ -59,6 +59,48 @@ const MOCK_CLINE_FREE_FEED: &[&str] = &["reflection/beam-free"];
 /// The credit-based ids this mock's `/api/v1/models` listing carries.
 const MOCK_CLINE_LISTING: &[&str] = &["anthropic/claude-sonnet-4-6", "openai/gpt-5.4:batch"];
 
+/// OpenCode Go's `/v1/models` entries, shaped like the real listing: one chat-family model that
+/// publishes an input limit of its own, and one that publishes limits but no `limit.input` - the
+/// `input = context` case - plus an Anthropic-only id this backend must drop.
+fn mock_go_models() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "id": "deepseek-v4.1-flash",
+            "name": "DeepSeek V4.1 Flash",
+            "knowledge": "2025-05",
+            "modalities": {"input": ["text", "image/png"], "output": ["text"]},
+            "capabilities": {
+                "tools": {"supported": true},
+                "reasoning": {"supported": true, "effort": ["low", "high", "max"]},
+                "structured_output": true
+            },
+            "limit": {"context": 1000000, "input": 900000, "output": 384000},
+            "cost": {"text": {"input": {"price": 0.15, "cache": {"read": 0.003}},
+                              "output": {"price": 0.6}}},
+            "api": {"chat-completions": {
+                "compatibility": {"reasoning_field": "reasoning_content"}
+            }}
+        }),
+        serde_json::json!({
+            "id": "kimi-k3",
+            "name": "Kimi K3",
+            "modalities": {"input": ["text"], "output": ["text"]},
+            "capabilities": {
+                "tools": {"supported": true},
+                "reasoning": {"supported": true, "effort": ["max"]}
+            },
+            "limit": {"context": 1048576, "output": 131072},
+            "api": {"chat-completions": {}}
+        }),
+        serde_json::json!({
+            "id": "claude-haiku-5-5",
+            "name": "Claude Haiku 5.5",
+            "limit": {"context": 1000000, "output": 128000},
+            "api": {"messages": {}}
+        }),
+    ]
+}
+
 async fn mock_responses(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: axum::http::HeaderMap,
@@ -95,6 +137,20 @@ async fn mock_responses(
                 "clinePass": pass,
             })
             .to_string(),
+        )
+            .into_response();
+    }
+    // OpenCode Go's only working models route. Its entry carries the capability, modality, cost
+    // and surface fields underclass projects into the catalog.
+    if uri.path().ends_with("/go/v1/models") || uri.path() == "/v1/models" {
+        let data = mock_go_models();
+        return (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            serde_json::json!({"object": "list", "data": data}).to_string(),
         )
             .into_response();
     }
@@ -515,6 +571,10 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
             std::env::set_var("UNDERCLASS_CLAUDE_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLINE_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_GO_UPSTREAM", format!("http://{addr}"));
+            // A port nothing listens on: the models.dev read is an enrichment, and every test that
+            // does not assert on it must exercise the failed-read path, which is what a real
+            // operator without egress sees.
+            std::env::set_var("UNDERCLASS_MODELS_DEV_URL", "http://127.0.0.1:9/api.json");
         }
         format!("http://{addr}")
     });
@@ -616,6 +676,7 @@ fn model(id: &str) -> ModelInfo {
         input: 272_000,
         output: 128_000,
         scope: String::new(),
+        metadata: Default::default(),
     }
 }
 
@@ -721,6 +782,10 @@ async fn spawn_app_with_user_agent(
         .route(
             "/admin/api/catalog/refresh-cline",
             axum::routing::post(underclass::ui::refresh_cline_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh-opencode-go",
+            axum::routing::post(underclass::ui::refresh_opencode_go_catalog),
         )
         .route(
             "/admin/api/monitor",
@@ -2837,4 +2902,172 @@ async fn e2e_models_lists_only_account_backed_models() {
         "the stored copilot rows come back with its account, got {ids:?}"
     );
     assert!(ids.contains(&"opencode-go/grok-4.7"), "got {ids:?}");
+}
+
+/// `GET /v1/models` must distinguish "unknown" from "zero": a limit no source published reaches
+/// the wire as `null` with the key present, never as `0`, and an alias takes its limits from the
+/// concretes that did publish one.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_models_reports_unpublished_limits_as_null() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let mut unpublished = scoped_model("cline/cline-pass/kimi-k3", "cline-pass");
+    unpublished.context = 0;
+    unpublished.input = 0;
+    unpublished.output = 0;
+    store.set_catalog(BackendId::Cline, &[unpublished]);
+    store.upsert_account(&cline_account("cline-null", "key-cline-null"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 400).await;
+    pool.lock().unwrap().rebuild_aliases(&store);
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "cline/cline-pass/kimi-k3")
+        .expect("the account-backed row is advertised");
+    for key in ["context_window", "max_input_tokens", "max_output_tokens"] {
+        assert!(
+            entry.get(key).is_some(),
+            "{key} must stay present so a client can destructure it"
+        );
+        assert_eq!(
+            entry[key],
+            serde_json::Value::Null,
+            "{key} must be null, not 0, when no source published it"
+        );
+    }
+    assert_eq!(entry["scope"], "cline-pass");
+
+    // The alias is derived from the same row, so it is null too rather than zero.
+    let alias = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "subscriptions/kimi-k3")
+        .expect("the alias is advertised");
+    assert_eq!(alias["max_input_tokens"], serde_json::Value::Null);
+}
+
+/// A model a source published in full must reach `/v1/models` with its metadata, and a retired
+/// model must not be there at all, including through an alias whose only concrete it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_models_carries_metadata_and_hides_retired_models() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.upsert_account(&go_account("go-metadata", "go-metadata-key"));
+    store.upsert_account(&cline_account("cline-metadata", "key-cline-metadata"));
+    let (base, _logs, pool) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    // Refresh the Go catalog from the mock listing: that is where the metadata comes from.
+    let response = http
+        .post(format!("{base}/admin/api/catalog/refresh-opencode-go"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "refresh-opencode-go said: {text}");
+
+    // Cline's refresh reads its own listing and feed, and the models.dev read fails (the mock's
+    // URL points at a closed port), so every row must survive unchanged.
+    let response = http
+        .post(format!("{base}/admin/api/catalog/refresh-cline"))
+        .header("Authorization", concat!("Bear", "er ", "unused"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        !store.catalog(BackendId::Cline).is_empty(),
+        "a failed models.dev read must not empty the catalog"
+    );
+
+    // A retired model is stored but never advertised.
+    // A base name no other backend serves, so the only concrete behind its alias is retired.
+    let mut retired = scoped_model("cline/cline-pass/e2e-retired-model", "cline-pass");
+    retired.metadata.status = underclass::models::ModelStatus::Deprecated;
+    let mut catalog = store.catalog(BackendId::Cline);
+    catalog.push(retired);
+    store.set_catalog(BackendId::Cline, &catalog);
+    pool.lock().unwrap().set_catalog(BackendId::Cline, &catalog);
+    pool.lock().unwrap().rebuild_aliases(&store);
+
+    let body: serde_json::Value = http
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = body["data"].as_array().unwrap();
+    let find = |id: &str| entries.iter().find(|m| m["id"] == id);
+
+    let flash = find("opencode-go/deepseek-v4.1-flash")
+        .unwrap_or_else(|| panic!("listed by the mock upstream: {entries:?}"));
+    let metadata = &flash["metadata"];
+    assert_eq!(metadata["reasoning"]["supported"], true);
+    assert_eq!(metadata["reasoning"]["effort"][2], "max");
+    assert_eq!(metadata["tools"], true);
+    assert_eq!(metadata["structured_output"], true);
+    assert_eq!(metadata["modalities"]["input"][1], "image/png");
+    assert_eq!(metadata["cost"]["input"], 0.15);
+    assert_eq!(metadata["prompt_cache"], true);
+    assert_eq!(metadata["knowledge"], "2025-05");
+    assert_eq!(metadata["wire"], "chat-completions");
+    assert_eq!(metadata["reasoning_field"], "reasoning_content");
+    assert_eq!(metadata["status"], "available");
+    assert_eq!(flash["max_input_tokens"], 900_000);
+    assert_eq!(flash["context_window"], 1_000_000);
+
+    // `limit.input` absent on the listing means input equals context, not zero.
+    let kimi = find("opencode-go/kimi-k3").expect("listed by the mock upstream");
+    assert_eq!(kimi["max_input_tokens"], 1_048_576);
+    assert_eq!(kimi["context_window"], 1_048_576);
+
+    // An Anthropic-only id is never catalogued, so it is never listed.
+    assert!(find("opencode-go/claude-haiku-5-5").is_none());
+    // A retired model is stored and absent, both directly and through its alias.
+    assert!(
+        store
+            .catalog(BackendId::Cline)
+            .iter()
+            .any(|m| m.id == "cline/cline-pass/e2e-retired-model" && m.is_deprecated()),
+        "the retired row stays stored for the operator"
+    );
+    assert!(find("cline/cline-pass/e2e-retired-model").is_none());
+    assert!(
+        find("subscriptions/e2e-retired-model").is_none(),
+        "an alias whose only concrete is retired must be absent"
+    );
+
+    // The seven original keys keep their meaning for every advertised entry, and a client that
+    // only knows those seven still parses the whole listing.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldModel {
+        id: String,
+        object: String,
+        name: String,
+        context_window: Option<i64>,
+        max_input_tokens: Option<i64>,
+        max_output_tokens: Option<i64>,
+        owned_by: String,
+    }
+    let parsed: Vec<OldModel> = serde_json::from_value(body["data"].clone())
+        .expect("a client that only reads the original seven keys must still parse the listing");
+    assert_eq!(parsed.len(), entries.len());
 }
