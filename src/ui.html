@@ -47,7 +47,7 @@
 </head>
 <body>
 <main>
-  <h1>underclass <small>pooled codex + copilot + claude + cline + opencode go subscriptions</small></h1>
+  <h1>underclass <small>pooled codex + copilot + claude + cline + opencode go + vercel subscriptions</small></h1>
 
   <section class="card">
     <div class="row" style="justify-content: space-between">
@@ -57,6 +57,7 @@
         <button onclick="refreshCopilotCatalog()">Refresh Copilot catalog</button>
         <button onclick="refreshClineCatalog()">Refresh Cline catalog</button>
         <button onclick="refreshGoCatalog()">Refresh OpenCode Go catalog</button>
+        <button onclick="refreshVercelCatalog()">Refresh Vercel catalog</button>
       </div>
     </div>
     <table id="accounts">
@@ -162,6 +163,7 @@
       <option value="claude">Claude Code (Anthropic)</option>
       <option value="cline">Cline (API key)</option>
       <option value="opencode-go">OpenCode Go (API key)</option>
+      <option value="vercel">Vercel AI Gateway (API key)</option>
     </select>
     <div id="enterpriseWrap" style="display:none">
       <label>GitHub Enterprise URL or domain (blank for github.com)</label>
@@ -180,6 +182,13 @@
       <label>label (optional — defaults to the OpenCode Go workspace id)</label>
       <input id="flowGoLabel" placeholder="wrk_…">
       <p class="muted">OpenCode Go models appear as <code>underclass/opencode-go/*</code>. Models Go serves only over its Anthropic or Gemini API are not pooled.</p>
+    </div>
+    <div id="vercelWrap" style="display:none">
+      <label>API key from <a href="https://vercel.com/dashboard/ai-gateway/api-keys" target="_blank" rel="noopener">Vercel AI Gateway</a> → API Keys</label>
+      <input id="flowVercelApiKey" type="password" autocomplete="off" placeholder="vg_…">
+      <label>label (optional)</label>
+      <input id="flowVercelLabel" placeholder="vercel">
+      <p class="muted">Vercel AI Gateway models appear as <code>underclass/vercel/&lt;provider&gt;/&lt;model&gt;</code>.</p>
     </div>
     <div class="row" style="margin-top:16px">
       <button class="primary" onclick="beginFlow()">Continue</button>
@@ -497,7 +506,7 @@ function snippet(catalog) {
   return {
     provider: { underclass: {
       npm: '@ai-sdk/openai-compatible',
-      name: 'Underclass (pooled Codex + Copilot + Claude + Cline + OpenCode Go)',
+      name: 'Underclass (pooled Codex + Copilot + Claude + Cline + OpenCode Go + Vercel)',
       options: { baseURL: location.origin + '/v1', apiKey: '<proxy-key>', setCacheKey: true },
       models
     }},
@@ -544,6 +553,7 @@ document.getElementById('flowBackend').addEventListener('change', () => {
   document.getElementById('enterpriseWrap').style.display = backend === 'copilot' ? 'block' : 'none';
   document.getElementById('clineWrap').style.display = backend === 'cline' ? 'block' : 'none';
   document.getElementById('goWrap').style.display = backend === 'opencode-go' ? 'block' : 'none';
+  document.getElementById('vercelWrap').style.display = backend === 'vercel' ? 'block' : 'none';
 });
 
 async function startFlow() {
@@ -568,9 +578,9 @@ async function beginFlow() {
     const ent = document.getElementById('flowEnterprise').value.trim();
     if (ent) body.enterprise_url = ent;
   }
-  if (backend === 'cline' || backend === 'opencode-go') {
-    body.api_key = (backend === 'opencode-go' ? document.getElementById('flowGoApiKey') : document.getElementById('flowApiKey')).value.trim();
-    const label = (backend === 'opencode-go' ? document.getElementById('flowGoLabel') : document.getElementById('flowLabel')).value.trim();
+  if (backend === 'cline' || backend === 'opencode-go' || backend === 'vercel') {
+    body.api_key = (backend === 'opencode-go' ? document.getElementById('flowGoApiKey') : backend === 'vercel' ? document.getElementById('flowVercelApiKey') : document.getElementById('flowApiKey')).value.trim();
+    const label = (backend === 'opencode-go' ? document.getElementById('flowGoLabel') : backend === 'vercel' ? document.getElementById('flowVercelLabel') : document.getElementById('flowLabel')).value.trim();
     if (label) body.label = label;
     if (pendingReplace) body.account_id = pendingReplace;
   }
@@ -658,9 +668,12 @@ async function relogin(id) {
     document.getElementById('flowLabel').value = '';
     document.getElementById('flowGoApiKey').value = '';
     document.getElementById('flowGoLabel').value = '';
+    document.getElementById('flowVercelApiKey').value = '';
+    document.getElementById('flowVercelLabel').value = '';
     document.getElementById('enterpriseWrap').style.display = 'none';
     document.getElementById('clineWrap').style.display = document.getElementById('flowBackend').value === 'cline' ? 'block' : 'none';
     document.getElementById('goWrap').style.display = document.getElementById('flowBackend').value === 'opencode-go' ? 'block' : 'none';
+    document.getElementById('vercelWrap').style.display = document.getElementById('flowBackend').value === 'vercel' ? 'block' : 'none';
     document.getElementById('flowIdle').style.display = 'block';
     document.getElementById('flowPending').style.display = 'none';
     document.getElementById('flowDone').style.display = 'none';
@@ -710,6 +723,13 @@ async function refreshGoCatalog() {
   const res = await api('/admin/api/catalog/refresh-opencode-go', { method: 'POST' });
   const data = await res.json().catch(() => ({}));
   if (data.errors && data.errors.length) alert('OpenCode Go catalog errors: ' + data.errors.join('; '));
+  loadState();
+  loadCatalog();
+}
+async function refreshVercelCatalog() {
+  const res = await api('/admin/api/catalog/refresh-vercel', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (data.errors && data.errors.length) alert('Vercel catalog errors: ' + data.errors.join('; '));
   loadState();
   loadCatalog();
 }

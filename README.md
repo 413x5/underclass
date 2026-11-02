@@ -1,6 +1,6 @@
 # underclass
 
-**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, ClinePass, and OpenCode Go subscriptions behind one endpoint.**
+**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, ClinePass, OpenCode Go, and Vercel AI Gateway subscriptions behind one endpoint.**
 
 ## Fork features
 
@@ -17,21 +17,24 @@ Architecture decision records: [`docs/adr/fork`](docs/adr/fork/README.md).
                        ┌────────────────────────────────────┐
                        │            underclass              │
                        │                                    │
- opencode ────────────►│  /v1/responses       (OpenAI)      │────► chatgpt.com
- (any OpenAI-compatible│  /v1/chat/completions              │      (N Codex subs,
+ client ──────────────►│  /v1/responses       (OpenAI)      │────► chatgpt.com
+ (any OpenAI-compatible│  /v1/chat/completions              │      (Codex subs,
   client)              │  /v1/models                        │       OAuth device flow)
                        │                                    │────► api.githubcopilot.com
- Claude Code ─────────►│  /v1/messages        (Anthropic)   │      (M Copilot subs,
+ Claude Code ─────────►│  /v1/messages        (Anthropic)   │      (Copilot subs,
  (ANTHROPIC_BASE_URL)  │                                    │       GitHub device flow)
  web UI ◄─────────────►│  sticky sessions · health pool     │────► api.anthropic.com
- (accounts, catalog,   │  fail-fast saturation · tracing    │      (K Claude Code subs,
+ (accounts, catalog,   │  fail-fast saturation · tracing    │      (Claude Code subs,
   live request feed)   │  per-surface quota cooling         │       OAuth paste-back)
                        │                                    │────► api.cline.bot
-                       │                                    │      (J API keys,
-                       │                                    │       ClinePass subs + Cline Credits)
+                       │                                    │      (ClinePass subs, Credits,
+                       │                                    │       API keys)
                        │                                    │────► opencode.ai/inference/go
-                       └────────────────────────────────────┘      (I API keys,
-                                                                     OpenCode Go subs)
+                       │                                    │      (OpenCode Go subs,
+                       │                                    │       API keys)
+                       │                                    │────► ai-gateway.vercel.sh
+                       │                                    │      (Credits,
+                       └────────────────────────────────────┘       API keys)
 ```
 
 One subscription runs out of quota? It leaves rotation until its window resets — and comes back on its own. Sessions stay pinned to one subscription so upstream prompt caches stay warm. When *everything* is exhausted, the proxy fails fast with the earliest reset time instead of hanging.
@@ -332,6 +335,7 @@ src/
   claude.rs      Claude Code backend (PKCE paste-back flow, Anthropic surface)
   cline.rs       Cline backend (API key, Chat-Completions upstream)
   opencode_go.rs OpenCode Go backend (API key, per-model OpenAI surface)
+  vercel.rs      Vercel AI Gateway backend (API key, dynamic catalog, credits)
   flows.rs       device-code flow registry for onboarding
   tokens.rs      single-flight token refresh
   jwt.rs         token claim parsing (account id extraction)

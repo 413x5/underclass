@@ -73,6 +73,7 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   Cline's recommended-models feed plus models.dev supply it by precedence, and a retirement is a
   recorded `status` that the listing filter drops.
 
+- [Vercel AI Gateway Backend](vercel-ai-gateway-backend.md) — sixth backend (API-key onboarding, vercel/<provider>/<model> namespace, dynamic catalog from /v1/models, credits-based account-wide quota).
 - [Catalog Refresh Is Operator-Driven](catalog-refresh-is-operator-driven.md) — `underclass serve`
   no longer fetches the Copilot, Cline, or OpenCode Go catalog, so a restart cannot change what the
   pool advertises or hold the listener back on a multi-megabyte models.dev read; those sets change

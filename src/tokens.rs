@@ -98,7 +98,8 @@ impl TokenManager {
         match account.backend {
             crate::models::BackendId::Copilot
             | crate::models::BackendId::Cline
-            | crate::models::BackendId::OpencodeGo => account
+            | crate::models::BackendId::OpencodeGo
+            | crate::models::BackendId::Vercel => account
                 .refresh_token
                 .clone()
                 .ok_or(TokenError::MissingToken),
@@ -152,7 +153,8 @@ impl TokenManager {
         match account.backend {
             crate::models::BackendId::Copilot
             | crate::models::BackendId::Cline
-            | crate::models::BackendId::OpencodeGo => Ok(refresh_token),
+            | crate::models::BackendId::OpencodeGo
+            | crate::models::BackendId::Vercel => Ok(refresh_token),
             crate::models::BackendId::Codex => {
                 let tokens = crate::codex::refresh(&self.client, &refresh_token)
                     .await

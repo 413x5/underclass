@@ -9,6 +9,7 @@ pub enum BackendId {
     Claude,
     Cline,
     OpencodeGo,
+    Vercel,
 }
 
 impl BackendId {
@@ -19,6 +20,7 @@ impl BackendId {
             BackendId::Claude => "claude",
             BackendId::Cline => "cline",
             BackendId::OpencodeGo => "opencode-go",
+            BackendId::Vercel => "vercel",
         }
     }
 
@@ -29,20 +31,22 @@ impl BackendId {
             "claude" => Some(BackendId::Claude),
             "cline" => Some(BackendId::Cline),
             "opencode_go" | "opencode-go" => Some(BackendId::OpencodeGo),
+            "vercel" => Some(BackendId::Vercel),
             _ => None,
         }
     }
 
-    /// Every backend, in the order routing falls back through. `OpencodeGo` is last: an unknown
+    /// Every backend, in the order routing falls back through. `Vercel` is last: an unknown
     /// model keeps landing on the first backend that serves the requested surface, so adding a
     /// backend cannot move an existing model's fallback.
-    pub const fn all() -> [BackendId; 5] {
+    pub const fn all() -> [BackendId; 6] {
         [
             BackendId::Codex,
             BackendId::Copilot,
             BackendId::Claude,
             BackendId::Cline,
             BackendId::OpencodeGo,
+            BackendId::Vercel,
         ]
     }
 
