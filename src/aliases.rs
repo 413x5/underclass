@@ -113,12 +113,17 @@ pub fn build_alias_table(
             if m.is_deprecated() {
                 continue;
             }
-            let kind = config.billing_kind(*backend, &m.id, &m.scope);
-            let alias = format!("{}/{}", kind, base_name(&m.id));
-            table
-                .entry(alias)
-                .or_default()
-                .push((*backend, m.id.clone()));
+            let is_free = !config.kinds.contains_key("free") && (contains_free_token(&m.id) || contains_free_token(&m.name));
+            // Free models get only the free/ alias, not the billing-kind one, because they
+            // cost nothing and must not be advertised under credits/ or subscriptions/.
+            if !is_free {
+                let kind = config.billing_kind(*backend, &m.id, &m.scope);
+                let alias = format!("{}/{}", kind, base_name(&m.id));
+                table
+                    .entry(alias)
+                    .or_default()
+                    .push((*backend, m.id.clone()));
+            }
             // A model is also available as free/<base> when "free" appears as a delimited
             // token in its id or display name (case-insensitive), e.g. "beam-free", "free-tier",
             // "Beam Free", or ":free" - but not when "free" is merely a substring of a larger
@@ -127,9 +132,6 @@ pub fn build_alias_table(
             // identifiable (free/openrouter/free) instead of collapsing to free/free.
             // The operator may override this by defining a kind literally named "free" in
             // [model_aliases], which then owns the namespace.
-            let operator_owns_free = config.kinds.contains_key("free");
-            let is_free =
-                !operator_owns_free && (contains_free_token(&m.id) || contains_free_token(&m.name));
             if is_free {
                 let base = base_name(&m.id);
                 let free_base = if base.eq_ignore_ascii_case("free") {
