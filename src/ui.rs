@@ -392,6 +392,74 @@ async fn start_go_flow(
     (state.flows.clone(), flow_id)
 }
 
+async fn start_vercel_flow(
+    state: &Arc<AppState>,
+    api_key: Option<String>,
+    label: Option<String>,
+    replace_account: Option<String>,
+) -> (crate::flows::FlowRegistry, String) {
+    let flow_id = state.flows.create(
+        BackendId::Vercel,
+        crate::flows::FlowState::Pending {
+            user_code: String::new(),
+            verify_url: "https://vercel.com/dashboard/ai-gateway/api-keys".into(),
+        },
+        replace_account.clone(),
+    );
+    let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) else {
+        state.flows.set_state(
+            &flow_id,
+            crate::flows::FlowState::Failed {
+                message: "a Vercel AI Gateway API key is required".into(),
+            },
+        );
+        return (state.flows.clone(), flow_id);
+    };
+    let api_key = api_key.trim().to_string();
+    match crate::vercel::add_account(
+        &state.client,
+        &state.store,
+        &api_key,
+        label,
+        replace_account,
+        state.vercel_user_agent.as_deref(),
+    )
+    .await
+    {
+        Ok(account) => {
+            state.pool.lock().unwrap().sync_account(account.clone());
+            if let Err(error) = crate::vercel::refresh_catalog(
+                &state.client,
+                &state.store,
+                &state.pool,
+                &api_key,
+                state.vercel_user_agent.as_deref(),
+            )
+            .await
+            {
+                crate::logging::log_catalog_refresh(&account, None, Some(&error.to_string()));
+            }
+            state.flows.set_state(
+                &flow_id,
+                crate::flows::FlowState::Authorized {
+                    account_id: account.id,
+                },
+            );
+        }
+        Err(error) => {
+            let message = match error {
+                crate::vercel::AuthError::Failed => "Vercel rejected the API key".to_string(),
+                crate::vercel::AuthError::BadReplaceTarget => {
+                    "that account no longer exists or is not a Vercel account; close this dialog and re-key it from the account list".to_string()
+                }
+                other => format!("could not verify the Vercel API key, try again ({other})"),
+            };
+            state.flows.set_state(&flow_id, crate::flows::FlowState::Failed { message });
+        }
+    }
+    (state.flows.clone(), flow_id)
+}
+
 pub async fn start_flow(
     State(state): State<Arc<AppState>>,
     body: Option<Json<StartFlowBody>>,
@@ -402,7 +470,7 @@ pub async fn start_flow(
     let Some(backend) = BackendId::parse(&body.backend) else {
         return (StatusCode::BAD_REQUEST, "unknown backend").into_response();
     };
-    if backend == BackendId::Cline || backend == BackendId::OpencodeGo {
+    if backend == BackendId::Cline || backend == BackendId::OpencodeGo || backend == BackendId::Vercel {
         let replace_account = body.account_id.clone().filter(|id| !id.trim().is_empty());
         if let Some(account_id) = replace_account.as_deref() {
             let Some(account) = state.store.get_account(account_id) else {
@@ -419,6 +487,15 @@ pub async fn start_flow(
         let (flows, flow_id) = match backend {
             BackendId::OpencodeGo => {
                 start_go_flow(
+                    &state,
+                    body.api_key.clone(),
+                    body.label.clone(),
+                    replace_account,
+                )
+                .await
+            }
+            BackendId::Vercel => {
+                start_vercel_flow(
                     &state,
                     body.api_key.clone(),
                     body.label.clone(),
@@ -464,7 +541,7 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
-        BackendId::Cline | BackendId::OpencodeGo => unreachable!("handled above"),
+        BackendId::Cline | BackendId::OpencodeGo | BackendId::Vercel => unreachable!("handled above"),
     };
     match result {
         Ok(flow_id) => {
@@ -667,7 +744,7 @@ pub async fn relogin_account(
         // A Cline or OpenCode key cannot be refreshed, so re-keying is a paste-a-new-key flow that
         // keeps this account's id and clears its cooldown. No polling flow is created: the browser
         // collects the new key and posts it to `/admin/api/flows` with this account id.
-        BackendId::Cline | BackendId::OpencodeGo => {
+        BackendId::Cline | BackendId::OpencodeGo | BackendId::Vercel => {
             // The dialog needs to know which key box to show; the row the operator clicked already
             // says which backend this account belongs to.
             return Json(json!({ "rekey": id, "backend": account.backend.as_str() }))
@@ -926,6 +1003,40 @@ pub async fn refresh_opencode_go_catalog(State(state): State<Arc<AppState>>) -> 
             &state.pool,
             &key,
             state.opencode_go_user_agent.as_deref(),
+        )
+        .await
+        {
+            Ok(models) if !models.is_empty() => refreshed += 1,
+            Ok(_) => {}
+            Err(error) => errors.push(format!("{}: {error}", account.label)),
+        }
+    }
+    Json(json!({ "refreshed_accounts": refreshed, "errors": errors })).into_response()
+}
+
+/// @cc [owner:ghuntley,label:pool] vercel-catalog-refresh-endpoint
+/// `refresh_vercel_catalog` MUST attempt a catalog refresh for every Vercel account that holds a key, MUST
+/// count only non-empty successful refreshes, and MUST report one `label: error` string per failed
+/// account without failing the whole request.
+pub async fn refresh_vercel_catalog(State(state): State<Arc<AppState>>) -> Response {
+    let accounts: Vec<_> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|account| account.backend == BackendId::Vercel)
+        .collect();
+    let mut refreshed = 0usize;
+    let mut errors = Vec::new();
+    for account in accounts {
+        let Some(key) = account.refresh_token.clone() else {
+            continue;
+        };
+        match crate::vercel::refresh_catalog(
+            &state.client,
+            &state.store,
+            &state.pool,
+            &key,
+            state.vercel_user_agent.as_deref(),
         )
         .await
         {

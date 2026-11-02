@@ -12,6 +12,7 @@ use underclass::models::{
     Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
 };
 use underclass::opencode_go::OpencodeGoBackend;
+use underclass::vercel::VercelBackend;
 use underclass::pool::PoolCore;
 use underclass::provider::BackendMap;
 use underclass::proxy::AppState;
@@ -658,6 +659,7 @@ fn openai_surfaces() -> std::collections::HashMap<BackendId, Vec<Surface>> {
         (BackendId::Claude, vec![Surface::Anthropic]),
         (BackendId::Cline, vec![Surface::OpenAI]),
         (BackendId::OpencodeGo, vec![Surface::OpenAI]),
+        (BackendId::Vercel, vec![Surface::OpenAI]),
     ])
 }
 
@@ -709,6 +711,13 @@ async fn spawn_app_with_user_agent(
             user_agent: user_agent.map(str::to_string),
         }),
     );
+    backends.insert(
+        BackendId::Vercel,
+        Arc::new(VercelBackend {
+            cooldown_ms,
+            user_agent: user_agent.map(str::to_string),
+        }),
+    );
     let core = PoolCore::new(&store, backend_surfaces(&backends));
     let pool = Arc::new(Mutex::new(core));
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -732,6 +741,7 @@ async fn spawn_app_with_user_agent(
         stats_retention_days: 730,
         cline_user_agent: user_agent.map(str::to_string),
         opencode_go_user_agent: user_agent.map(str::to_string),
+        vercel_user_agent: user_agent.map(str::to_string),
     });
 
     let v1 = axum::Router::new()

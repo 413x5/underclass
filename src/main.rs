@@ -225,6 +225,13 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             user_agent: cfg.opencode_go_user_agent.clone(),
         }),
     );
+    backends.insert(
+        models::BackendId::Vercel,
+        Arc::new(underclass::vercel::VercelBackend {
+            cooldown_ms: cfg.vercel_cooldown_ms,
+            user_agent: cfg.vercel_user_agent.clone(),
+        }),
+    );
     // The pool learns which surfaces each backend serves from the backends themselves.
     let surfaces: HashMap<models::BackendId, Vec<models::Surface>> = backends
         .iter()
@@ -257,6 +264,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         stats_retention_days: cfg.stats_retention_days,
         cline_user_agent: cfg.cline_user_agent.clone(),
         opencode_go_user_agent: cfg.opencode_go_user_agent.clone(),
+        vercel_user_agent: cfg.vercel_user_agent.clone(),
     });
 
     {
@@ -441,6 +449,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/refresh-opencode-go",
             axum::routing::post(ui::refresh_opencode_go_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh-vercel",
+            axum::routing::post(ui::refresh_vercel_catalog),
         )
         .route("/admin/api/client-key", axum::routing::get(ui::client_key))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -978,6 +990,17 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
                     &state.client,
                     &token,
                     state.opencode_go_user_agent.as_deref(),
+                )
+                .await
+            }
+            models::BackendId::Vercel => {
+                let Some(token) = account.refresh_token.clone() else {
+                    continue;
+                };
+                underclass::vercel::fetch_identity(
+                    &state.client,
+                    &token,
+                    state.vercel_user_agent.as_deref(),
                 )
                 .await
             }

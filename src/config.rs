@@ -33,6 +33,9 @@ pub struct FileConfig {
     pub user_agent: Option<String>,
     pub cline_user_agent: Option<String>,
     pub opencode_go_user_agent: Option<String>,
+    pub vercel_cooldown_secs: Option<u64>,
+    pub vercel_cooldown_ms: Option<u64>,
+    pub vercel_user_agent: Option<String>,
     pub claude_cooldown_secs: Option<u64>,
     pub claude_cooldown_ms: Option<u64>,
     pub copilot_cooldown_ms: Option<u64>,
@@ -53,11 +56,13 @@ pub struct Config {
     pub copilot_cooldown_ms: i64,
     pub cline_cooldown_ms: i64,
     pub opencode_go_cooldown_ms: i64,
+    pub vercel_cooldown_ms: i64,
     pub claude_cooldown_ms: i64,
     /// The outbound user agent for Cline and OpenCode Go, already resolved through the per-backend
     /// keys. `None` leaves each backend its default and forwards a client's own value.
     pub cline_user_agent: Option<String>,
     pub opencode_go_user_agent: Option<String>,
+    pub vercel_user_agent: Option<String>,
     pub stats_retention_days: i64,
     pub model_alias_kinds: BTreeMap<String, Vec<String>>,
     pub model_alias_default_kind: String,
@@ -148,6 +153,13 @@ impl Config {
             .or(file_cfg.opencode_go_cooldown_ms)
             .or(file_cfg.opencode_go_cooldown_secs.map(|s| s * 1000))
             .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
+        let vercel_cooldown_ms = std::env::var("UNDERCLASS_VERCEL_COOLDOWN_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.saturating_mul(1000))
+            .or(file_cfg.vercel_cooldown_ms)
+            .or(file_cfg.vercel_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
         let claude_cooldown_ms = file_cfg
             .claude_cooldown_ms
             .or(file_cfg.claude_cooldown_secs.map(|s| s * 1000))
@@ -222,6 +234,11 @@ impl Config {
             file_cfg.opencode_go_user_agent,
             shared_user_agent.clone(),
         ]);
+        let vercel_user_agent = first_configured([
+            std::env::var("UNDERCLASS_VERCEL_USER_AGENT").ok(),
+            file_cfg.vercel_user_agent,
+            shared_user_agent.clone(),
+        ]);
 
         Self {
             bind,
@@ -232,9 +249,11 @@ impl Config {
             copilot_cooldown_ms,
             cline_cooldown_ms,
             opencode_go_cooldown_ms,
+            vercel_cooldown_ms,
             claude_cooldown_ms,
             cline_user_agent,
             opencode_go_user_agent,
+            vercel_user_agent,
             stats_retention_days,
             model_alias_kinds,
             model_alias_default_kind,

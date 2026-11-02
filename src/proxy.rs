@@ -73,6 +73,7 @@ pub struct AppState {
     /// request and the backend's configured override.
     pub cline_user_agent: Option<String>,
     pub opencode_go_user_agent: Option<String>,
+    pub vercel_user_agent: Option<String>,
 }
 
 /// @cc [owner:ghuntley,label:accounting] stream-finish-recorded

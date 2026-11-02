@@ -23,7 +23,7 @@ impl AliasConfig {
             "subscriptions".to_string(),
             vec!["cline/cline-pass/".to_string(), "opencode-go/".to_string()],
         );
-        kinds.insert("credits".to_string(), vec!["cline/".to_string()]);
+        kinds.insert("credits".to_string(), vec!["cline/".to_string(), "vercel/".to_string()]);
         AliasConfig {
             kinds,
             default_kind: "subscriptions".to_string(),

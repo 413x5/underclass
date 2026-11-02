@@ -22,6 +22,7 @@ fn openai_surfaces() -> HashMap<BackendId, Vec<Surface>> {
         (BackendId::Claude, vec![Surface::Anthropic]),
         (BackendId::Cline, vec![Surface::OpenAI]),
         (BackendId::OpencodeGo, vec![Surface::OpenAI]),
+        (BackendId::Vercel, vec![Surface::OpenAI]),
     ])
 }
 
