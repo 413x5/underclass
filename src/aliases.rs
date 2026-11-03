@@ -23,7 +23,10 @@ impl AliasConfig {
             "subscriptions".to_string(),
             vec!["cline/cline-pass/".to_string(), "opencode-go/".to_string()],
         );
-        kinds.insert("credits".to_string(), vec!["cline/".to_string(), "vercel/".to_string()]);
+        kinds.insert(
+            "credits".to_string(),
+            vec!["cline/".to_string(), "vercel/".to_string()],
+        );
         AliasConfig {
             kinds,
             default_kind: "subscriptions".to_string(),
@@ -32,15 +35,11 @@ impl AliasConfig {
     pub fn billing_kind(&self, backend: BackendId, model_id: &str, scope: &str) -> String {
         if backend == BackendId::Cline {
             match scope {
-                "cline-pass" => {
-                    if self.kinds.contains_key("subscriptions") {
-                        return "subscriptions".to_string();
-                    }
+                "cline-pass" if self.kinds.contains_key("subscriptions") => {
+                    return "subscriptions".to_string();
                 }
-                "credits" => {
-                    if self.kinds.contains_key("credits") {
-                        return "credits".to_string();
-                    }
+                "credits" if self.kinds.contains_key("credits") => {
+                    return "credits".to_string();
                 }
                 _ => {}
             }
@@ -113,7 +112,8 @@ pub fn build_alias_table(
             if m.is_deprecated() {
                 continue;
             }
-            let is_free = !config.kinds.contains_key("free") && (contains_free_token(&m.id) || contains_free_token(&m.name));
+            let is_free = !config.kinds.contains_key("free")
+                && (contains_free_token(&m.id) || contains_free_token(&m.name));
             // Free models get only the free/ alias, not the billing-kind one, because they
             // cost nothing and must not be advertised under credits/ or subscriptions/.
             if !is_free {

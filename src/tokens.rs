@@ -104,26 +104,24 @@ impl TokenManager {
                 .clone()
                 .ok_or(TokenError::MissingToken),
             crate::models::BackendId::Codex => {
-                if let Some(token) = &account.access_token {
-                    if account
+                if let Some(token) = &account.access_token
+                    && account
                         .expires_at
                         .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
                         > now_ms()
-                    {
-                        return Ok(token.clone());
-                    }
+                {
+                    return Ok(token.clone());
                 }
                 self.force_refresh(&account.id).await
             }
             crate::models::BackendId::Claude => {
-                if let Some(token) = &account.access_token {
-                    if account
+                if let Some(token) = &account.access_token
+                    && account
                         .expires_at
                         .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
                         > now_ms()
-                    {
-                        return Ok(token.clone());
-                    }
+                {
+                    return Ok(token.clone());
                 }
                 self.force_refresh(&account.id).await
             }
@@ -162,9 +160,9 @@ impl TokenManager {
                 let claims = jwt::parse_jwt_claims(&tokens.access_token);
                 let chatgpt_account_id = claims
                     .as_ref()
-                    .and_then(|c| jwt::extract_account_id(c))
+                    .and_then(jwt::extract_account_id)
                     .or(account.account_id.clone());
-                let residency = claims.as_ref().and_then(|c| jwt::extract_residency(c));
+                let residency = claims.as_ref().and_then(jwt::extract_residency);
                 let expires_at = now_ms() + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
                 self.store.update_tokens(
                     account_id,

@@ -50,14 +50,14 @@ impl BackendId {
         ]
     }
 
-    /// Terminal cells the longest id occupies, so a UI column can be sized from the ids instead of
-    /// a hardcoded guess: adding a backend or renaming one moves this with it. Counted in bytes,
-    /// which equal cells because every id is ASCII (`BackendId::all().map(as_str)` is asserted so).
-    ///
     /// @cc [owner:ghuntley,label:cli] backend-id-width-derived
     /// The value MUST be computed from `BackendId::all()` rather than written as a literal, so that
     /// adding a backend or renaming one changes the width instead of leaving a column cap that clips
     /// the new id.
+    ///
+    /// Terminal cells the longest id occupies, so a UI column can be sized from the ids instead of
+    /// a hardcoded guess: adding a backend or renaming one moves this with it. Counted in bytes,
+    /// which equal cells because every id is ASCII (`BackendId::all().map(as_str)` is asserted so).
     pub const fn max_str_width() -> usize {
         let ids = Self::all();
         let mut widest = 0;

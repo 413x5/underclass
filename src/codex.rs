@@ -187,17 +187,17 @@ pub async fn start_flow(
                         Ok(tokens) => {
                             let claims = jwt::parse_jwt_claims(&tokens.access_token);
                             let account_id_claim =
-                                claims.as_ref().and_then(|c| jwt::extract_account_id(c));
+                                claims.as_ref().and_then(jwt::extract_account_id);
                             let residency = claims
                                 .as_ref()
-                                .and_then(|c| jwt::extract_residency(c))
+                                .and_then(jwt::extract_residency)
                                 .or_else(|| {
                                     tokens
                                         .id_token
                                         .as_deref()
                                         .and_then(jwt::parse_jwt_claims)
                                         .as_ref()
-                                        .and_then(|c| jwt::extract_residency(c))
+                                        .and_then(jwt::extract_residency)
                                 });
                             let identity =
                                 identity_from_token(&tokens.access_token).or_else(|| {
@@ -416,15 +416,15 @@ impl Backend for CodexBackend {
             http::header::AUTHORIZATION,
             http::HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
         );
-        if let Some(account_id) = &account.account_id {
-            if let Ok(v) = http::HeaderValue::from_str(account_id) {
-                headers.insert("ChatGPT-Account-Id", v);
-            }
+        if let Some(account_id) = &account.account_id
+            && let Ok(v) = http::HeaderValue::from_str(account_id)
+        {
+            headers.insert("ChatGPT-Account-Id", v);
         }
-        if let Some(residency) = &account.residency {
-            if let Ok(v) = http::HeaderValue::from_str(residency) {
-                headers.insert("x-openai-internal-codex-residency", v);
-            }
+        if let Some(residency) = &account.residency
+            && let Ok(v) = http::HeaderValue::from_str(residency)
+        {
+            headers.insert("x-openai-internal-codex-residency", v);
         }
         headers.insert("originator", http::HeaderValue::from_static("opencode"));
         if let Ok(v) = http::HeaderValue::from_str(USER_AGENT) {

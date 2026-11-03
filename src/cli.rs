@@ -430,10 +430,10 @@ pub fn merge_provider(doc: &mut Value, block: &Value, default_model: Option<&str
             );
         }
         None => {
-            if let Some(model) = map.get("model").and_then(|v| v.as_str()) {
-                if model.starts_with(&format!("{PROVIDER_ID}/")) {
-                    map.remove("model");
-                }
+            if let Some(model) = map.get("model").and_then(|v| v.as_str())
+                && model.starts_with(&format!("{PROVIDER_ID}/"))
+            {
+                map.remove("model");
             }
         }
     }
@@ -444,10 +444,10 @@ pub fn remove_provider(doc: &mut Value) {
         if let Some(providers) = map.get_mut("provider").and_then(|p| p.as_object_mut()) {
             providers.remove(PROVIDER_ID);
         }
-        if let Some(model) = map.get("model").and_then(|v| v.as_str()).map(String::from) {
-            if model.starts_with(&format!("{PROVIDER_ID}/")) {
-                map.remove("model");
-            }
+        if let Some(model) = map.get("model").and_then(|v| v.as_str()).map(String::from)
+            && model.starts_with(&format!("{PROVIDER_ID}/"))
+        {
+            map.remove("model");
         }
     }
 }
@@ -626,10 +626,10 @@ fn resolve_api_key(args: &ConnectArgs, store: &crate::store::Store) -> Result<St
     if let Some(key) = &args.api_key {
         return Ok(key.clone());
     }
-    if let Ok(key) = std::env::var("UNDERCLASS_PROXY_KEY") {
-        if !key.is_empty() {
-            return Ok(key);
-        }
+    if let Ok(key) = std::env::var("UNDERCLASS_PROXY_KEY")
+        && !key.is_empty()
+    {
+        return Ok(key);
     }
     if let Some(key) = store.config_get("proxy_key") {
         return Ok(key);

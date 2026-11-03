@@ -51,9 +51,22 @@ pkgs.testers.nixosTest {
         machine.succeed("curl --unix-socket /run/underclass/monitor.sock -sf http://localhost/monitor | grep -q minute_bins")
         machine.fail("curl --unix-socket /run/underclass/monitor.sock -sf -o /dev/null http://localhost/admin/api/state")
 
-    with subtest("v1 models serves the union catalog with the proxy key"):
+    # This node configures no accounts, and `/v1/models` advertises a backend only when an
+    # account backs it, so the listing must be empty. The stored catalog is checked separately
+    # below: grepping the listing for a model id would pass whether or not that filter works.
+    # Matching `"data":[]` rather than the whole body keeps this on the invariant instead of
+    # serde_json's key order, so adding a field to the envelope is not a false failure.
+    with subtest("v1 models advertises nothing without an account"):
         machine.succeed(
-            "curl -sf -H 'Authorization: Bearer test-key' http://127.0.0.1:8080/v1/models | grep -q gpt-5.5"
+            "curl -sf -H 'Authorization: Bearer test-key' http://127.0.0.1:8080/v1/models "
+            "> /tmp/models.json"
+        )
+        machine.succeed("grep -qF '\"data\":[]' /tmp/models.json")
+
+    with subtest("catalog is seeded even though nothing is advertised"):
+        machine.succeed(
+            "curl -sf -H 'Authorization: Bearer test-ui-token' "
+            "http://127.0.0.1:8080/admin/api/catalog/codex | grep -q gpt-5.5"
         )
 
     with subtest("state persists to the state directory"):
@@ -64,8 +77,10 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("underclass.service")
         machine.wait_for_open_port(8080)
         machine.succeed(
-            "curl -sf -H 'Authorization: Bearer test-key' http://127.0.0.1:8080/v1/models | grep -q gpt-5.5"
+            "curl -sf -H 'Authorization: Bearer test-key' http://127.0.0.1:8080/v1/models "
+            "> /tmp/models.json"
         )
+        machine.succeed("grep -qF '\"data\":[]' /tmp/models.json")
 
     with subtest("empty pool reports no configured subscriptions"):
         machine.succeed(

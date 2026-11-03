@@ -216,11 +216,14 @@ pub fn admin_http_target(
     Ok((url, token))
 }
 
+// Two contracts on one declaration means two doc comments, which trips
+// `clippy::empty_line_after_doc_comments`; the contracts themselves are required.
+#[allow(clippy::empty_line_after_doc_comments)]
 /// @cc [owner:ghuntley,label:cli] top-observes-only
 /// Dashboard data MUST be obtained only through GET requests to the local monitor socket or
 /// authenticated HTTP, and `run` MUST leave the local SQLite database untouched and restore
 /// terminal state on every normal exit or error.
-///
+
 /// @cc [owner:ghuntley,label:cli] top-operator-toggle
 /// The only write `top` MAY perform is an operator's confirmed enable/disable of the selected
 /// account, and it MUST go through the running server's authenticated admin API
@@ -1027,6 +1030,11 @@ fn account_detail(account: &MonitorAccount, now_ms: i64) -> String {
     parts.join("  ·  ")
 }
 
+/// @cc [owner:ghuntley,label:cli] recent-columns-measure-backend
+/// `BACKEND` MUST be measured from the backend values in `snapshot.recent` and capped at
+/// `MAX_BACKEND_WIDTH`, never from a literal width, and the returned widths plus the five
+/// inter-column gaps MUST NOT exceed `area_width - 2`.
+///
 /// Recent-outcomes widths. This table has no header row, so every column is measured from the
 /// values it will draw: `MODEL` is the widest in practice (`cline/cline-pass/deepseek-v4.1-flash`
 /// is 41 cells) and takes the largest share, while the fixed-shape columns (`HH:MM:SS`, the status
@@ -1034,11 +1042,6 @@ fn account_detail(account: &MonitorAccount, now_ms: i64) -> String {
 /// the rows and capped at [`MAX_BACKEND_WIDTH`], the same cap the accounts table uses. The total is
 /// clamped to the panel's inner width, so a narrow pane shrinks `MODEL`/`ACCOUNT` instead of
 /// spilling past the border.
-///
-/// @cc [owner:ghuntley,label:cli] recent-columns-measure-backend
-/// `BACKEND` MUST be measured from the backend values in `snapshot.recent` and capped at
-/// `MAX_BACKEND_WIDTH`, never from a literal width, and the returned widths plus the five
-/// inter-column gaps MUST NOT exceed `area_width - 2`.
 fn recent_columns(area_width: u16, snapshot: &MonitorSnapshot) -> Vec<Constraint> {
     let inner = area_width.saturating_sub(2); // the panel's borders
     let spacing = 5u16; // five gaps between six columns
