@@ -4,6 +4,7 @@
 //! proxy converts the request body before the upstream call and converts the upstream body back
 //! before it reaches the client.
 
+use crate::usage::UPSTREAM_STREAM_ERROR;
 use serde_json::{Map, Value, json};
 use std::io::Write;
 
@@ -558,6 +559,26 @@ impl ChatStreamTranslator {
             }
             self.process_line(&line, &mut out);
         }
+        out
+    }
+
+    /// @cc [owner:ghuntley,label:proxy] translation-error-tail-single
+    /// `finish_on_error` MUST close a stream whose upstream transfer failed with exactly one
+    /// terminal event, carrying `upstream_stream_error` so a client sees the same code an
+    /// untranslated stream is given, and MUST emit nothing when the translator already finished or
+    /// the upstream had sent its own terminal event.
+    pub fn finish_on_error(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.finished {
+            return out;
+        }
+        self.finish(
+            Finish::Failed(json!({
+                "code": UPSTREAM_STREAM_ERROR,
+                "message": "upstream failed before the response completed",
+            })),
+            &mut out,
+        );
         out
     }
 
@@ -1489,6 +1510,26 @@ mod tests {
                 .iter()
                 .any(|frame| frame["type"] == "response.completed")
         );
+    }
+
+    #[test]
+    fn an_upstream_transfer_failure_is_one_terminal_event_with_its_own_code() {
+        let mut translator = ChatStreamTranslator::new("m", "resp_3", 5);
+        let mut out =
+            translator.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        out.extend(translator.finish_on_error());
+        let frames = stream_frames(&out);
+        let terminal: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| matches!(frame["type"].as_str(), Some("response.failed")))
+            .collect();
+        assert_eq!(terminal.len(), 1, "exactly one terminal event");
+        assert_eq!(
+            terminal[0]["response"]["error"]["code"],
+            UPSTREAM_STREAM_ERROR
+        );
+        // A second failure report after the stream already ended emits nothing.
+        assert!(translator.finish_on_error().is_empty());
     }
 
     #[test]

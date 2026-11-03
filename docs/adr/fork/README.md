@@ -79,3 +79,7 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   pool advertises or hold the listener back on a multi-megabyte models.dev read; those sets change
   only on an admin refresh, onboarding, or a catalog edit. Claude keeps its boot refresh because it
   has no refresh button.
+- [Stream Failures End the Body Cleanly, and No Timeout Cuts a Long Response](stream-failure-and-timeouts.md)
+  — an upstream failure after output ends the client's body with one dialect-shaped terminal event
+  carrying `upstream_stream_error` instead of aborting the frame, and nothing on the inference path
+  has a wall-clock deadline by default (the idle timeout is opt-in and ends the body the same way).
