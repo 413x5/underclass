@@ -23,11 +23,20 @@ cargo build
 cargo test          # unit tests, Hegel property tests, and the e2e suite
 ```
 
-That pair is the gate: it is what CI runs, and a change is not done until it passes.
+That pair is the floor. CI (`.github/workflows/ci.yml`) runs these inside the devenv shell on every pull
+request, on pushes to `main`, and on demand (`workflow_dispatch`), and a change is not done until they pass:
 
-CI (`.github/workflows/ci.yml`) runs the same build and test commands inside the devenv shell on every pull
-request and on pushes to `main`, plus the NixOS module evaluation and machine test. If you add a check, add
-it to both.
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release
+npx --yes @spolu/cc-check@0.2.0 format   # contract syntax and dangling `@cc` ids
+```
+
+The NixOS module evaluation and machine test run in a separate job with the runner's unused toolchains
+removed first, because the machine test compiles the crate in release mode inside the Nix sandbox and does
+not fit beside the test job's artifacts. If you add a check, add it to the workflow.
 
 ## Testing expectations
 

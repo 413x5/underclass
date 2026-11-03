@@ -12,29 +12,29 @@ pub fn parse_retry_after_headers(headers: &http::HeaderMap, now_ms: i64) -> Opti
     if let Some(v) = headers
         .get(RETRY_AFTER_MS_HEADER)
         .and_then(|v| v.to_str().ok())
+        && let Ok(ms) = v.trim().parse::<f64>()
+        && ms.is_finite()
+        && ms >= 0.0
     {
-        if let Ok(ms) = v.trim().parse::<f64>() {
-            if ms.is_finite() && ms >= 0.0 {
-                return Some(now_ms.saturating_add(ms as i64));
-            }
-        }
+        return Some(now_ms.saturating_add(ms as i64));
     }
     if let Some(v) = headers
         .get(RETRY_AFTER_HEADER)
         .and_then(|v| v.to_str().ok())
     {
         let trimmed = v.trim();
-        if let Ok(secs) = trimmed.parse::<f64>() {
-            if secs.is_finite() && secs >= 0.0 {
-                return Some(now_ms.saturating_add((secs * 1000.0) as i64));
-            }
+        if let Ok(secs) = trimmed.parse::<f64>()
+            && secs.is_finite()
+            && secs >= 0.0
+        {
+            return Some(now_ms.saturating_add((secs * 1000.0) as i64));
         }
-        if let Ok(date) = httpdate::parse_http_date(trimmed) {
-            if let Ok(delta) = date.duration_since(std::time::UNIX_EPOCH) {
-                let deadline = delta.as_millis().min(i64::MAX as u128) as i64;
-                if deadline > now_ms {
-                    return Some(deadline);
-                }
+        if let Ok(date) = httpdate::parse_http_date(trimmed)
+            && let Ok(delta) = date.duration_since(std::time::UNIX_EPOCH)
+        {
+            let deadline = delta.as_millis().min(i64::MAX as u128) as i64;
+            if deadline > now_ms {
+                return Some(deadline);
             }
         }
     }

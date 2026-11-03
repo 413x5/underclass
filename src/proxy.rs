@@ -535,6 +535,16 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         deferred: deferred.clone(),
     };
 
+    let req = AttemptRequest {
+        request_id: &request_id,
+        endpoint: &endpoint,
+        target: &target,
+        model: &model,
+        sticky: sticky.as_deref(),
+        body_bytes: &body_bytes,
+        client_headers: &client_headers,
+    };
+
     while attempts < max_attempts {
         attempts += 1;
         let mut selection = state.pool.lock().unwrap().select_excluding(
@@ -606,44 +616,27 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             account_label(&state, &selection.account_id).as_deref(),
         );
 
-        if selection.decision == Decision::NewBinding
-            || selection.decision == Decision::StickyRebind
+        if (selection.decision == Decision::NewBinding
+            || selection.decision == Decision::StickyRebind)
+            && let Some(key) = &sticky
+            && let Some(binding) = state
+                .pool
+                .lock()
+                .unwrap()
+                .bindings()
+                .into_iter()
+                .find(|b| b.cache_key == *key)
         {
-            if let Some(key) = &sticky {
-                if let Some(binding) = state
-                    .pool
-                    .lock()
-                    .unwrap()
-                    .bindings()
-                    .into_iter()
-                    .find(|b| b.cache_key == *key)
-                {
-                    state.store.upsert_binding(&binding);
-                    state.store.prune_bindings(
-                        now_ms(),
-                        crate::pool::BINDING_TTL_MS,
-                        crate::pool::DEFAULT_BINDING_CAP,
-                    );
-                }
-            }
+            state.store.upsert_binding(&binding);
+            state.store.prune_bindings(
+                now_ms(),
+                crate::pool::BINDING_TTL_MS,
+                crate::pool::DEFAULT_BINDING_CAP,
+            );
         }
 
         let upstream_model = selection.concrete_model.clone();
-        match attempt_account(
-            &state,
-            &request_id,
-            &endpoint,
-            &target,
-            &model,
-            &upstream_model,
-            sticky.as_deref(),
-            &selection,
-            body_bytes.clone(),
-            &client_headers,
-            &mut refreshed,
-        )
-        .await
-        {
+        match attempt_account(&state, &req, &upstream_model, &selection, &mut refreshed).await {
             Attempt::Respond(resp) => {
                 logging::log_request_completed(
                     &request_id,
@@ -737,6 +730,18 @@ impl Drop for AffinityGuard {
     }
 }
 
+/// The parts of one proxy request that stay fixed across every attempt. Bundled so an attempt's
+/// signature names only what varies per attempt (`selection` and its `upstream_model`).
+struct AttemptRequest<'a> {
+    request_id: &'a str,
+    endpoint: &'a str,
+    target: &'a str,
+    model: &'a str,
+    sticky: Option<&'a str>,
+    body_bytes: &'a axum::body::Bytes,
+    client_headers: &'a HeaderMap,
+}
+
 /// @cc [owner:ghuntley,label:proxy] failover-bounded-by-accounts
 /// A request MUST make at most as many attempts as configured accounts, plus one additional attempt
 /// after a successful banked reset, and the first successful upstream response MUST be returned
@@ -749,17 +754,20 @@ impl Drop for AffinityGuard {
 /// account `AuthFailed` and fail over.
 async fn attempt_account(
     state: &Arc<AppState>,
-    request_id: &str,
-    endpoint: &str,
-    target: &str,
-    model: &str,
+    req: &AttemptRequest<'_>,
     upstream_model: &str,
-    sticky: Option<&str>,
     selection: &Selection,
-    body_bytes: axum::body::Bytes,
-    client_headers: &HeaderMap,
     refreshed: &mut std::collections::HashSet<String>,
 ) -> Attempt {
+    let AttemptRequest {
+        request_id,
+        endpoint,
+        target,
+        model,
+        sticky,
+        body_bytes,
+        client_headers,
+    } = *req;
     let started = Instant::now();
     let started_ms = now_ms();
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
@@ -832,7 +840,7 @@ async fn attempt_account(
             http::HeaderValue::from_static("text/event-stream, application/json"),
         );
     }
-    let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+    let mut outbound_body: Value = serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
     // For aliases, the client sent the alias id; rewrite the body's model to the concrete id so
     // backends that read the body model (prepare_body, auto_stream_usage) see the concrete id.
     if let Some(obj) = outbound_body.as_object_mut()
@@ -872,7 +880,7 @@ async fn attempt_account(
         // The upstream validates the client's own body, so it travels byte for byte — except when
         // an alias rewrote the model, in which case the body must carry the concrete id.
         if model != upstream_model {
-            let mut v: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+            let mut v: Value = serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("model".into(), Value::String(upstream_model.to_string()));
             }
@@ -1091,10 +1099,9 @@ async fn attempt_account(
         // and billing-surface logic key on; a free model's concrete id also contains the token.
         if matches!(outcome, Outcome::QuotaExhausted { .. })
             && crate::aliases::contains_free_token(model)
+            && let Outcome::QuotaExhausted { until_ms } = outcome
         {
-            if let Outcome::QuotaExhausted { until_ms } = outcome {
-                outcome = Outcome::ModelQuotaExhausted { until_ms };
-            }
+            outcome = Outcome::ModelQuotaExhausted { until_ms };
         }
         let body_text = if translate_responses {
             crate::responses::error_body(&body_text)
@@ -1201,11 +1208,10 @@ async fn attempt_account(
         );
         Attempt::Failover(Some(upstream_error_response(
             status,
-            &resp_headers
+            resp_headers
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string(),
+                .unwrap_or("application/json"),
             body_text,
         )))
     } else {

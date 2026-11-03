@@ -122,6 +122,9 @@ fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::Error>
     runtime.block_on(async_serve(bind_override))
 }
 
+// Two contracts on one declaration means two doc comments, which trips
+// `clippy::empty_line_after_doc_comments`; the contracts themselves are required.
+#[allow(clippy::empty_line_after_doc_comments)]
 /// @cc [owner:ghuntley,label:security] keys-minted-once
 /// The proxy API key and admin UI token MUST be minted on first run, persisted to the store, and
 /// reused on every subsequent start; an explicitly configured key/token MUST take precedence over
@@ -825,11 +828,6 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
     }
 }
 
-/// @cc [owner:ghuntley,label:auth] generic-label-is-replaceable
-/// `is_generic_label` MUST report true for every backend's seeded fallback label, so the boot
-/// identity refresh can replace a placeholder with the profile's email or name. A fallback label
-/// reported as non-generic would stay ambiguous in logs and the UI forever.
-
 /// Disables accounts on a free plan and re-enables those it disabled once they are upgraded.
 ///
 /// Codex plans come from the stored access token's claims, which the daily scheduled rotation
@@ -887,6 +885,10 @@ fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
     }
 }
 
+/// @cc [owner:ghuntley,label:auth] generic-label-is-replaceable
+/// `is_generic_label` MUST report true for every backend's seeded fallback label, so the boot
+/// identity refresh can replace a placeholder with the profile's email or name. A fallback label
+/// reported as non-generic would stay ambiguous in logs and the UI forever.
 fn is_generic_label(label: &str) -> bool {
     matches!(
         label,

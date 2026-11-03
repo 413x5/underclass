@@ -128,7 +128,7 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
+fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, (StatusCode, &'static str)> {
     if query.from_ms.is_none() && query.to_ms.is_none() {
         let now = chrono::Utc::now();
         let start = now
@@ -146,7 +146,7 @@ fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
         .zip(query.to_ms)
         .is_some_and(|(from, to)| from >= to)
     {
-        return Err((StatusCode::BAD_REQUEST, "from_ms must precede to_ms").into_response());
+        return Err((StatusCode::BAD_REQUEST, "from_ms must precede to_ms"));
     }
     if query
         .group_by
@@ -155,14 +155,13 @@ fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
         .split(',')
         .any(|part| !part.is_empty() && !matches!(part, "model" | "account_id" | "cache_key"))
     {
-        return Err((StatusCode::BAD_REQUEST, "invalid group_by").into_response());
+        return Err((StatusCode::BAD_REQUEST, "invalid group_by"));
     }
     if query.cache_key.is_some() && query.missing_key == Some(true) {
         return Err((
             StatusCode::BAD_REQUEST,
             "cache_key conflicts with missing_key",
-        )
-            .into_response());
+        ));
     }
     Ok(query)
 }
@@ -176,7 +175,7 @@ pub async fn usage_summary(
 ) -> Response {
     let query = match usage_query(query) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err((status, message)) => return (status, message).into_response(),
     };
     match state.store.usage_summary(&query) {
         Ok(groups) => {
@@ -202,7 +201,7 @@ pub async fn usage_requests(
 ) -> Response {
     let query = match usage_query(query) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err((status, message)) => return (status, message).into_response(),
     };
     match state.store.usage_records(&query) {
         Ok(requests) => {
@@ -454,7 +453,9 @@ async fn start_vercel_flow(
                 }
                 other => format!("could not verify the Vercel API key, try again ({other})"),
             };
-            state.flows.set_state(&flow_id, crate::flows::FlowState::Failed { message });
+            state
+                .flows
+                .set_state(&flow_id, crate::flows::FlowState::Failed { message });
         }
     }
     (state.flows.clone(), flow_id)
@@ -470,7 +471,10 @@ pub async fn start_flow(
     let Some(backend) = BackendId::parse(&body.backend) else {
         return (StatusCode::BAD_REQUEST, "unknown backend").into_response();
     };
-    if backend == BackendId::Cline || backend == BackendId::OpencodeGo || backend == BackendId::Vercel {
+    if backend == BackendId::Cline
+        || backend == BackendId::OpencodeGo
+        || backend == BackendId::Vercel
+    {
         let replace_account = body.account_id.clone().filter(|id| !id.trim().is_empty());
         if let Some(account_id) = replace_account.as_deref() {
             let Some(account) = state.store.get_account(account_id) else {
@@ -541,7 +545,9 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
-        BackendId::Cline | BackendId::OpencodeGo | BackendId::Vercel => unreachable!("handled above"),
+        BackendId::Cline | BackendId::OpencodeGo | BackendId::Vercel => {
+            unreachable!("handled above")
+        }
     };
     match result {
         Ok(flow_id) => {

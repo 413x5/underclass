@@ -178,10 +178,7 @@ impl PoolCore {
         {
             model.to_string()
         } else if crate::aliases::is_alias(&self.aliases, model) {
-            match crate::aliases::concrete_for(&self.aliases, backend, model) {
-                Some(c) => c,
-                None => return None,
-            }
+            crate::aliases::concrete_for(&self.aliases, backend, model)?
         } else {
             return None;
         };
@@ -1046,10 +1043,10 @@ mod tests {
             Outcome::QuotaExhausted { until_ms: 1_000 },
         );
         core.report_model_quota("a", "cline/cline-pass/kimi-k3", 2_000);
-        assert!(matches!(
-            core.select(500, None, "cline/cline-pass/kimi-k3", Surface::OpenAI),
-            Ok(_)
-        ));
+        assert!(
+            core.select(500, None, "cline/cline-pass/kimi-k3", Surface::OpenAI)
+                .is_ok()
+        );
         // Account `b` is untouched and absorbs selection at `now`; the deadline must still name
         // the later of `a`'s two deadlines rather than the earlier one.
         core.report("b", Outcome::QuotaExhausted { until_ms: 5_000 });

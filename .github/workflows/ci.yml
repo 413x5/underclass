@@ -5,57 +5,115 @@ on:
   push:
     branches:
       - main
+  # Actions is enabled per repository, so a run can also be started by hand - useful for
+  # validating this workflow itself, and for re-running main after a settings change.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded pull-request push has no value, so it is cancelled. A `main` run is left to
+# finish: its result is the branch's history, not just a gate on the newest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-    - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-    - uses: cachix/install-nix-action@v31
-      with:
-        github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # A dangling `@cc` id is a contract nothing attaches to; this repository has already
+      # shipped one when boot-refresh contracts were deleted with their annotations. Runs before
+      # any cargo step because cc-check walks the tree and does not honour `.gitignore` - after a
+      # build it would also scan the generated sources under `target/`.
+      - name: Check code contracts
+        run: npx --yes @spolu/cc-check@0.2.0 format
 
-    - uses: cachix/cachix-action@v17
-      with:
-        name: devenv
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Install devenv.sh
-      shell: bash
-      run: nix profile add nixpkgs#devenv
+      - uses: cachix/cachix-action@v17
+        with:
+          name: devenv
 
-    - name: Build the devenv shell and run pre-test checks
-      run: devenv test
+      - name: Install devenv.sh
+        shell: bash
+        run: nix profile add nixpkgs#devenv
 
-    - name: Compile
-      shell: devenv shell -- bash -e {0}
-      run: cargo build --locked --release
+      # Gates are explicit steps rather than one `devenv test`: `enterTest` in devenv.nix runs
+      # `cargo build --locked` and `cargo test --locked`, which is exactly the suite below, so
+      # `devenv test` ran it a second time and made the failing stage harder to read.
+      - name: Check formatting
+        shell: devenv shell -- bash -e {0}
+        run: cargo fmt --check
 
-    - name: Check formatting
-      shell: devenv shell -- bash -e {0}
-      run: cargo fmt --check
+      # Zero warnings as of this change. The baseline was 35 under rustc 1.92 and the count
+      # differs per toolchain - 1.98, which devenv's pinned nixpkgs provides, flags one extra
+      # (`clippy::collapsible_match` in src/aliases.rs) - so measure with the toolchain that
+      # `devenv shell` actually resolves before changing this. `-D warnings` makes a new lint a
+      # failure rather than another entry in a list nobody reads.
+      - name: Clippy
+        shell: devenv shell -- bash -e {0}
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-    - name: Run tests
-      shell: devenv shell -- bash -e {0}
-      run: cargo test --locked
+      - name: Run tests
+        shell: devenv shell -- bash -e {0}
+        run: cargo test --locked
 
+      # Kept because release is the profile that ships: `rustPlatform.buildRustPackage` in
+      # flake.nix and the NixOS VM check both compile it, so an optimizer-only compile error
+      # must fail here, on the fast runner, rather than first in the job that boots a VM.
+      - name: Release build
+        shell: devenv shell -- bash -e {0}
+        run: cargo build --locked --release
+
+  # Both NixOS checks stay in this one job. `underclass-module` is evaluate-only: it reads
+  # `config.system.build.toplevel.drvPath` from a NixOS instantiation, which compiles nothing and
+  # boots nothing. `underclass-vm` is the disk-heavy one - the Nix sandbox compiles the crate in
+  # release mode and boots the result under QEMU - and it is what died with ENOSPC (`failed to
+  # write .../lib.rmeta: No space left on device`) when it shared a runner with the devenv test
+  # artifacts. So the disk-heavy check moved here, to a fresh runner with the image's unused
+  # toolchains removed first, while the cheap evaluate-only check rides along.
   nixos:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-    - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-    - uses: cachix/install-nix-action@v31
-      with:
-        github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-    - uses: cachix/cachix-action@v17
-      with:
-        name: devenv
+      - uses: cachix/cachix-action@v17
+        with:
+          name: devenv
 
-    - name: Evaluate the NixOS module
-      run: nix --accept-flake-config build .#checks.x86_64-linux.underclass-module
+      - name: Free runner disk space
+        run: |
+          df -h /
+          # Toolchains the ubuntu-latest image ships that this build never uses. Each removal is
+          # guarded, so an image that stops including one cannot fail the job.
+          for path in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY}" \
+            /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL
+          do
+            sudo rm -rf "$path" || true
+          done
+          df -h /
 
-    - name: Run the NixOS machine test
-      run: nix --accept-flake-config build .#checks.x86_64-linux.underclass-vm
+      - name: Evaluate the NixOS module
+        run: nix --accept-flake-config build .#checks.x86_64-linux.underclass-module
+
+      - name: Run the NixOS machine test
+        run: nix --accept-flake-config build .#checks.x86_64-linux.underclass-vm

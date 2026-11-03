@@ -315,10 +315,10 @@ pub async fn start_flow(
                             account
                         }
                     };
-                    if let Ok(catalog) = fetch_catalog(&client, &account, &token).await {
-                        if !catalog.is_empty() {
-                            store.set_catalog(BackendId::Copilot, &catalog);
-                        }
+                    if let Ok(catalog) = fetch_catalog(&client, &account, &token).await
+                        && !catalog.is_empty()
+                    {
+                        store.set_catalog(BackendId::Copilot, &catalog);
                     }
                     flows.set_state(
                         &flow_id,
@@ -436,10 +436,10 @@ impl Backend for CopilotBackend {
             "Openai-Intent",
             http::HeaderValue::from_static("conversation-edits"),
         );
-        if let Some(sticky) = sticky {
-            if let Ok(v) = http::HeaderValue::from_str(sticky) {
-                headers.insert("X-Interaction-Id", v);
-            }
+        if let Some(sticky) = sticky
+            && let Ok(v) = http::HeaderValue::from_str(sticky)
+        {
+            headers.insert("X-Interaction-Id", v);
         }
         if body_has_image(body) {
             headers.insert(

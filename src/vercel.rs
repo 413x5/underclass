@@ -48,7 +48,11 @@ pub fn pool_model_id(upstream: &str) -> String {
     format!("{MODEL_PREFIX}{upstream}")
 }
 
-async fn verify_key(client: &Client, api_key: &str, user_agent: Option<&str>) -> Result<Option<String>, AuthError> {
+async fn verify_key(
+    client: &Client,
+    api_key: &str,
+    user_agent: Option<&str>,
+) -> Result<Option<String>, AuthError> {
     // Verified empirically: /v1/models is readable without a key, but a request that
     // carries a bad bearer is rejected with 401, so sending the key here validates it.
     // A 429 means the key is valid but rate-limited, so it is treated as success.
@@ -181,7 +185,10 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
             continue;
         }
         // Only language models are routable through the OpenAI chat/responses surfaces.
-        let ty = item.get("type").and_then(Value::as_str).unwrap_or("language");
+        let ty = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("language");
         if ty != "language" {
             continue;
         }
@@ -195,10 +202,7 @@ pub fn parse_models_response(body: &Value) -> Vec<ModelInfo> {
             .get("context_window")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let output = item
-            .get("max_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let output = item.get("max_tokens").and_then(Value::as_i64).unwrap_or(0);
         out.push(ModelInfo {
             id: pool_model_id(id),
             name: name.to_string(),
@@ -360,7 +364,10 @@ mod tests {
 
     #[test]
     fn upstream_model_id_strips_prefix() {
-        assert_eq!(upstream_model_id("vercel/openai/gpt-6-luna"), "openai/gpt-6-luna");
+        assert_eq!(
+            upstream_model_id("vercel/openai/gpt-6-luna"),
+            "openai/gpt-6-luna"
+        );
         assert_eq!(upstream_model_id("openai/gpt-6-luna"), "openai/gpt-6-luna");
     }
 }

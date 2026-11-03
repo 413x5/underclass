@@ -1174,6 +1174,15 @@ fn parse_status(s: &str) -> AccountStatus {
     }
 }
 
+fn status_str(s: AccountStatus) -> &'static str {
+    match s {
+        AccountStatus::Healthy => "healthy",
+        AccountStatus::Cooling => "cooling",
+        AccountStatus::AuthError => "auth_error",
+        AccountStatus::Disabled => "disabled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Store, UsageQuery, UsageRecord};
@@ -1434,14 +1443,5 @@ mod tests {
         let rows = store.list_bindings();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cache_key, "new");
-    }
-}
-
-fn status_str(s: AccountStatus) -> &'static str {
-    match s {
-        AccountStatus::Healthy => "healthy",
-        AccountStatus::Cooling => "cooling",
-        AccountStatus::AuthError => "auth_error",
-        AccountStatus::Disabled => "disabled",
     }
 }

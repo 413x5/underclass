@@ -12,12 +12,12 @@ use underclass::models::{
     Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
 };
 use underclass::opencode_go::OpencodeGoBackend;
-use underclass::vercel::VercelBackend;
 use underclass::pool::PoolCore;
 use underclass::provider::BackendMap;
 use underclass::proxy::AppState;
 use underclass::store::Store;
 use underclass::tokens::TokenManager;
+use underclass::vercel::VercelBackend;
 
 #[derive(Default)]
 struct MockState {
@@ -934,7 +934,7 @@ async fn e2e_full_pool_story() {
 
     let store = Arc::new(Store::in_memory().unwrap());
     let m = model("gpt-5.5");
-    store.set_catalog(BackendId::Codex, &[m.clone()]);
+    store.set_catalog(BackendId::Codex, std::slice::from_ref(&m));
     store.set_catalog(BackendId::Copilot, &[m]);
     store.upsert_account(&codex_account("acc-1", "tok-acc-1"));
     store.upsert_account(&copilot_account("acc-2", "cop-acc-2"));
@@ -1177,7 +1177,7 @@ async fn e2e_full_pool_story() {
     // phase 7: 401 on one backend fails over and marks auth_error
     let store2 = Arc::new(Store::in_memory().unwrap());
     let m2 = model("m");
-    store2.set_catalog(BackendId::Codex, &[m2.clone()]);
+    store2.set_catalog(BackendId::Codex, std::slice::from_ref(&m2));
     store2.set_catalog(BackendId::Copilot, &[m2]);
     store2.upsert_account(&codex_account("acc-1", "bad-token"));
     store2.upsert_account(&copilot_account("acc-2", "tok-good"));
@@ -1348,7 +1348,7 @@ async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
     // without a network round trip, so this exercises the 403 path hermetically.
     let store = Arc::new(Store::in_memory().unwrap());
     let m = model("m");
-    store.set_catalog(BackendId::Codex, &[m.clone()]);
+    store.set_catalog(BackendId::Codex, std::slice::from_ref(&m));
     store.set_catalog(BackendId::Copilot, &[m]);
     store.upsert_account(&copilot_account("cop-403", "cop-403-token"));
     store.upsert_account(&copilot_account("cop-spare", "cop-spare-token"));
@@ -1390,7 +1390,7 @@ async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
     let m = model("m");
-    store.set_catalog(BackendId::Codex, &[m.clone()]);
+    store.set_catalog(BackendId::Codex, std::slice::from_ref(&m));
     store.set_catalog(BackendId::Copilot, &[m]);
     store.upsert_account(&copilot_account("acct-auth", "tok-auth"));
     store.upsert_account(&copilot_account("acct-cooling", "tok-cooling"));
@@ -2784,7 +2784,7 @@ async fn e2e_catalog_refresh_publishes_feed_only_cline_models() {
     // The listing's own entries survive the refresh.
     assert!(find("cline/anthropic/claude-sonnet-4-6").is_some());
     assert!(
-        !find("cline/openai/gpt-5.4:batch").is_some(),
+        find("cline/openai/gpt-5.4:batch").is_none(),
         "batch-only ids stay out of the catalog"
     );
     // The model this issue is about is routable, and bills against the subscription.

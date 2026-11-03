@@ -566,19 +566,19 @@ fn test_rebinding_stays_stable_after_rebind(tc: TestCase) {
                     .core
                     .select(now, Some(key), "gpt-5.5", Surface::OpenAI)
                 {
-                    if let Some(old) = &current {
-                        if old != &sel.account_id {
-                            let previous_healthy = built.core.accounts[old].account.healthy();
-                            assert!(
-                                !previous_healthy,
-                                "binding changed while previous account was still healthy"
-                            );
-                            match &rebound {
-                                Some(first_rebind) => {
-                                    assert_eq!(*first_rebind, sel.account_id, "unstable rebinding");
-                                }
-                                None => rebound = Some(sel.account_id.clone()),
+                    if let Some(old) = &current
+                        && old != &sel.account_id
+                    {
+                        let previous_healthy = built.core.accounts[old].account.healthy();
+                        assert!(
+                            !previous_healthy,
+                            "binding changed while previous account was still healthy"
+                        );
+                        match &rebound {
+                            Some(first_rebind) => {
+                                assert_eq!(*first_rebind, sel.account_id, "unstable rebinding");
                             }
+                            None => rebound = Some(sel.account_id.clone()),
                         }
                     }
                     current = Some(sel.account_id);
