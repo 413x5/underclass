@@ -1,0 +1,131 @@
+# underclass configuration - every setting, at its built-in default.
+#
+# underclass runs correctly with no config file at all; this file exists so the whole surface is
+# visible in one place. To change anything, copy it to `~/.config/underclass/config.toml` (or set
+# `UNDERCLASS_CONFIG_DIR`) and edit that copy. Every key below is optional: delete a line and the
+# built-in default applies, which is the value shown.
+#
+# Environment variables override the file. `file` marks a key that also has an environment
+# equivalent, named in the comment; an environment variable exported as empty is ignored.
+
+# --------------------------------------------------------------------------------------------
+# Listener and credentials
+# --------------------------------------------------------------------------------------------
+
+# Address the proxy listens on. Env: UNDERCLASS_BIND
+bind = "127.0.0.1:8080"
+
+# Bearer key clients must send to /v1/*. Env: UNDERCLASS_PROXY_KEY
+# Empty (the default) mints one on first run and stores it in pool.db. Set a value to pin your own.
+proxy_key = ""
+
+# Admin token for the web UI and /admin/api/*. Env: UNDERCLASS_UI_TOKEN
+# Empty (the default) mints one on first run and stores it in pool.db.
+ui_token = ""
+
+# --------------------------------------------------------------------------------------------
+# Cooldowns - how long a subscription is taken out of rotation after an upstream refuses it
+# --------------------------------------------------------------------------------------------
+
+# Seconds to cool an account when the upstream reports no reset time of its own.
+# The *_cooldown_ms keys below take precedence over their *_cooldown_secs sibling.
+codex_cooldown_secs = 1800
+# codex_cooldown_ms = (unset; overrides codex_cooldown_secs when set)
+
+copilot_cooldown_secs = 1800
+# copilot_cooldown_ms = (unset; overrides copilot_cooldown_secs when set)
+
+# Claude Code cools only on 401; a 403 is a per-resource refusal.
+claude_cooldown_secs = 1800
+# claude_cooldown_ms = (unset; overrides claude_cooldown_secs when set)
+
+# Cline cools the billing surface the model draws from (credits or cline-pass), not the account.
+# Env: UNDERCLASS_CLINE_COOLDOWN_SECS
+cline_cooldown_secs = 1800
+# cline_cooldown_ms = (unset; overrides cline_cooldown_secs when set)
+
+# OpenCode Go cools the requested model rather than the account.
+# Env: UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS
+opencode_go_cooldown_secs = 1800
+# opencode_go_cooldown_ms = (unset; overrides opencode_go_cooldown_secs when set)
+
+# Env: UNDERCLASS_VERCEL_COOLDOWN_SECS
+vercel_cooldown_secs = 1800
+# vercel_cooldown_ms = (unset; overrides vercel_cooldown_secs when set)
+
+# --------------------------------------------------------------------------------------------
+# Codex banked resets
+# --------------------------------------------------------------------------------------------
+
+# Redeem one banked reset automatically when a live request finds every Codex account
+# unavailable. Env: UNDERCLASS_AUTO_CODEX_RESETS
+auto_codex_resets = true
+
+# --------------------------------------------------------------------------------------------
+# Timeouts - what is bounded, and what deliberately is not
+# --------------------------------------------------------------------------------------------
+#
+# Nothing here bounds how long a response may take. A long review runs for as long as the upstream
+# keeps producing: there is no request deadline and no read deadline, and no inference request
+# carries a per-request HTTP timeout.
+#
+# If the upstream fails after the response has started, underclass ends the client's body cleanly
+# with exactly one terminal error event (code `upstream_stream_error`) instead of truncating the
+# frame. A stream the upstream sends nothing on for `stream_idle_timeout_secs` is ended the same
+# way, rather than by killing the connection.
+
+# Seconds the upstream TCP/TLS connect may take before the attempt fails over to another account.
+# Bounds only the start of an attempt, never the response. Env: UNDERCLASS_UPSTREAM_CONNECT_TIMEOUT_SECS
+upstream_connect_timeout_secs = 10
+
+# Seconds a streamed response's first output is held back so a capacity failure can still fail
+# over to another account. Expiry is NOT a failure: holding stops and the response streams on, so a
+# slow first token is delivered rather than cut. Env: UNDERCLASS_PRE_OUTPUT_HOLD_SECS
+pre_output_hold_secs = 60
+
+# Bytes that may be buffered during that hold. Env: UNDERCLASS_PRE_OUTPUT_HOLD_BYTES
+pre_output_hold_bytes = 1048576
+
+# Seconds an established stream may send nothing at all before it is ended with a terminal error
+# event. 0 (the default) never ends a stream for being quiet - set it only if you want a dead
+# upstream ended sooner than the client's own read timeout would.
+# Env: UNDERCLASS_STREAM_IDLE_TIMEOUT_SECS
+stream_idle_timeout_secs = 0
+
+# --------------------------------------------------------------------------------------------
+# Retention
+# --------------------------------------------------------------------------------------------
+
+# Days to keep usage rows, upstream events, and daily stats rollups. Env: UNDERCLASS_STATS_RETENTION_DAYS
+stats_retention_days = 730
+
+# --------------------------------------------------------------------------------------------
+# Outbound user agent
+# --------------------------------------------------------------------------------------------
+#
+# Cline and OpenCode Go present the client's own User-Agent when it sent one, and a built-in
+# default otherwise. Empty (the default) keeps that behaviour; setting `user_agent` presents one of
+# your own instead, and the per-backend keys override it for a single backend.
+
+# Env: UNDERCLASS_USER_AGENT
+user_agent = ""
+# Env: UNDERCLASS_CLINE_USER_AGENT
+cline_user_agent = ""
+# Env: UNDERCLASS_OPENCODE_GO_USER_AGENT
+opencode_go_user_agent = ""
+# Env: UNDERCLASS_VERCEL_USER_AGENT
+vercel_user_agent = ""
+
+# --------------------------------------------------------------------------------------------
+# Model alias classification
+# --------------------------------------------------------------------------------------------
+#
+# A model whose id starts with one of these prefixes is advertised under a derived
+# `subscriptions/<id>` or `credits/<id>` alias, so a request can be routed by billing kind. A
+# partial block never drops a kind: keys you omit keep their built-in default. `subscription`
+# (singular) is the deprecated spelling of `subscriptions` and is still accepted.
+
+[model_aliases]
+subscriptions = ["cline/cline-pass/", "opencode-go/"]
+credits = ["cline/", "vercel/"]
+default_kind = "subscriptions"

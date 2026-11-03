@@ -148,6 +148,18 @@ pub fn log_overload_failover(
     );
 }
 
+/// An upstream failure after the response body started. The client is told through a terminal
+/// error event; this line is the operator's record of why. `reason` is a fixed label
+/// (`connection_failed` or `idle`), never upstream message text.
+pub fn log_upstream_body_failure(request_id: &str, backend: &str, reason: &str) {
+    tracing::warn!(
+        request_id = %request_id,
+        backend = %backend,
+        reason = %reason,
+        "stream.upstream_failure"
+    );
+}
+
 /// `until_ms` is the absolute epoch-millisecond pool reset; `retry_after_ms` is the relative wait.
 pub fn log_saturated(request_id: &str, until_ms: i64, now_ms: i64) {
     tracing::warn!(

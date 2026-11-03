@@ -107,24 +107,34 @@ Design decisions and their trade-offs live in [`docs/adr/`](docs/adr) — start 
 
 ## Configuration
 
-Optional `~/.config/underclass/config.toml`:
+Optional `~/.config/underclass/config.toml`. [`config.example.toml`](config.example.toml) lists
+every key with its built-in default and what it does; copy it there and edit the copy to change
+anything. Nothing in it is required — deleting a key restores the default shown.
 
 | key | default | meaning |
 |---|---|---|
 | `bind` | `127.0.0.1:8080` | listen address |
-| `proxy_key` | minted on first run | bearer key clients must send to `/v1/*` |
-| `ui_token` | minted on first run | admin token for the web UI + `/admin/api/*` |
-| `codex_cooldown_secs` | `1800` | cooling window when upstream omits `retry-after` |
-| `copilot_cooldown_secs` | `1800` | same, for Copilot |
-| `claude_cooldown_secs` | `1800` | same, for Claude Code accounts |
-| `cline_cooldown_secs` | `1800` | same, for Cline (applied on `402`, scoped to the model's billing surface) |
-| `opencode_go_cooldown_secs` | `1800` | same, for OpenCode Go (applied on `429`, scoped to the requested model) |
-| `user_agent` | `unset` | outbound user agent for Cline and OpenCode Go; unset forwards the client's own |
-| `cline_user_agent` | `unset` | per-backend override for Cline |
-| `opencode_go_user_agent` | `unset` | per-backend override for OpenCode Go |
+| `proxy_key` | empty: minted on first run | bearer key clients must send to `/v1/*` |
+| `ui_token` | empty: minted on first run | admin token for the web UI + `/admin/api/*` |
+| `codex_cooldown_secs` / `codex_cooldown_ms` | `1800` / unset | cooling window when upstream omits `retry-after`; the `_ms` key wins when set |
+| `copilot_cooldown_secs` / `copilot_cooldown_ms` | `1800` / unset | same, for Copilot |
+| `claude_cooldown_secs` / `claude_cooldown_ms` | `1800` / unset | same, for Claude Code accounts |
+| `cline_cooldown_secs` / `cline_cooldown_ms` | `1800` / unset | same, for Cline (applied on `402`, scoped to the model's billing surface) |
+| `opencode_go_cooldown_secs` / `opencode_go_cooldown_ms` | `1800` / unset | same, for OpenCode Go (applied on `429`, scoped to the requested model) |
+| `vercel_cooldown_secs` / `vercel_cooldown_ms` | `1800` / unset | same, for Vercel AI Gateway |
+| `auto_codex_resets` | `true` | redeem one banked Codex reset when every Codex account is unavailable |
+| `upstream_connect_timeout_secs` | `10` | TCP/TLS connect budget per attempt; bounds only startup |
+| `pre_output_hold_secs` | `60` | how long first output is held back so a capacity failure can fail over; expiry only stops holding |
+| `pre_output_hold_bytes` | `1048576` | bytes buffered during that hold |
+| `stream_idle_timeout_secs` | `0` (off) | end a streamed response that sends nothing for this long, with a terminal error event; `0` never ends a stream for being quiet |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
+| `user_agent` | empty: the client's own | outbound user agent for Cline, OpenCode Go, and Vercel |
+| `cline_user_agent` | empty: falls back to `user_agent` | per-backend override for Cline |
+| `opencode_go_user_agent` | empty: falls back to `user_agent` | per-backend override for OpenCode Go |
+| `vercel_user_agent` | empty: falls back to `user_agent` | per-backend override for Vercel |
+| `[model_aliases]` | `subscriptions` / `credits` / `default_kind = "subscriptions"` | billing-kind prefixes behind the derived `subscriptions/` and `credits/` aliases |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`, `UNDERCLASS_USER_AGENT`, `UNDERCLASS_CLINE_USER_AGENT`, `UNDERCLASS_OPENCODE_GO_USER_AGENT`. `UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS` overrides the OpenCode Go cooldown. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM`, `UNDERCLASS_MODELS_DEV_URL` (the models.dev corpus, default `https://models.dev/api.json`), `UNDERCLASS_GO_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`, and the OpenCode Go base is `https://opencode.ai/inference/go`). Set `UNDERCLASS_GO_UPSTREAM=https://opencode.ai/inference` to pool a pay-as-you-go Console key instead of a Go subscription; `UNDERCLASS_GO_CONSOLE` points key verification at a different Console.
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`, `UNDERCLASS_STREAM_IDLE_TIMEOUT_SECS`, `UNDERCLASS_UPSTREAM_CONNECT_TIMEOUT_SECS`, `UNDERCLASS_PRE_OUTPUT_HOLD_SECS`, `UNDERCLASS_PRE_OUTPUT_HOLD_BYTES`, `UNDERCLASS_USER_AGENT`, `UNDERCLASS_CLINE_USER_AGENT`, `UNDERCLASS_OPENCODE_GO_USER_AGENT`. `UNDERCLASS_OPENCODE_GO_COOLDOWN_SECS` overrides the OpenCode Go cooldown. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLINE_UPSTREAM`, `UNDERCLASS_MODELS_DEV_URL` (the models.dev corpus, default `https://models.dev/api.json`), `UNDERCLASS_GO_UPSTREAM` (default to the real endpoints; the Cline base URL is `https://api.cline.bot`, without `/api/v1`, and the OpenCode Go base is `https://opencode.ai/inference/go`). Set `UNDERCLASS_GO_UPSTREAM=https://opencode.ai/inference` to pool a pay-as-you-go Console key instead of a Go subscription; `UNDERCLASS_GO_CONSOLE` points key verification at a different Console.
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -177,6 +187,35 @@ Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log
 Accounting queries accept `from_ms` (inclusive), `to_ms` (exclusive), and exact `model`, `account_id`, or `cache_key` filters. Use `missing_key=true` to select requests without a key. Grouped summaries and request details accept `limit` (1–1000, default 100) and `offset`; summary responses also include unpaginated `totals`. With no time bounds, queries default to the current UTC month; provide `from_ms=0` to query all history. Each summary includes measured and unknown request counts. Token totals sum reported values only; they are lower bounds when unknown requests exist. See [ADR 0014](docs/adr/0014-per-attempt-token-accounting.md).
 
 A blank `cache key` means the client sent no `prompt_cache_key`, not that prompt caching is off — the proxy does not invent a key. Cline's prompt cache is content-addressed and shared across its API keys, so a session that moves between Cline subscriptions still hits cache; stickiness keeps a session on one billing surface rather than protecting cache warmth. See [Prompt Cache Scope Across Subscriptions](docs/adr/fork/prompt-cache-scope-across-subscriptions.md).
+
+### Long requests, timeouts, and stream failures
+
+Nothing on the inference path has a wall-clock deadline. A long review runs for as long as the
+upstream keeps producing: there is no request deadline and no read deadline, and no inference
+request carries a per-request HTTP timeout. What is bounded is only startup and holding:
+
+| bound | value | what it bounds | on expiry |
+|---|---|---|---|
+| upstream connect (`upstream_connect_timeout_secs`) | 10s | TCP/TLS connect | the attempt fails over |
+| pre-output hold (`pre_output_hold_secs` / `pre_output_hold_bytes`) | 60s / 1 MiB | how long output is held back so a capacity failure can still fail over | holding stops and streaming continues — never a failure |
+| stream idle timeout (`stream_idle_timeout_secs`) | `0` = off | how long an established stream may send nothing at all | the body ends with the terminal error event below |
+| shutdown drain | 5s | graceful restart only | remaining requests abort, recorded `client_closed` |
+
+If the upstream fails after the response has started, the client's body is never truncated. The
+proxy emits exactly one terminal error event in the protocol the client is speaking, using the
+stable code `upstream_stream_error` and a message naming the backend, and then ends the body
+completely, so a chunked terminator (or `Content-Length`) always arrives:
+
+```
+event: error
+data: {"type":"error","code":"upstream_stream_error","message":"upstream codex stream ended early: the connection failed before the response completed"}
+```
+
+Chat Completions receives the same `data:` frame with an OpenAI-shaped `error` object, and the
+Anthropic surface receives `{"type":"error","error":{"type":"upstream_stream_error",...}}`. A
+translated `/v1/responses` stream keeps its single `response.failed` terminal event instead. The
+usage row for the attempt records the same code, so a client's report and the server's accounting
+agree. See [Stream Failures and Timeouts](docs/adr/fork/stream-failure-and-timeouts.md).
 
 ### Correlation with preflight
 

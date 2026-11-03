@@ -5,7 +5,9 @@ use crate::provider::BackendMap;
 use crate::store::Store;
 use crate::store::{UpstreamEvent, UsageRecord};
 use crate::tokens::TokenManager;
-use crate::usage::{StreamEnd, StreamOutcome, UsageTap, usage_from_dialect};
+use crate::usage::{
+    StreamEnd, StreamOutcome, UPSTREAM_STREAM_ERROR, UsageDialect, UsageTap, usage_from_dialect,
+};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -22,9 +24,34 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const LOG_BUFFER: usize = 200;
 /// How long a streamed response is held back waiting for its first output or terminal event.
 /// Upstream capacity failures before output observed in practice arrive within 60s (265 of 266).
-const PRE_OUTPUT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const PRE_OUTPUT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
 /// Upper bound on bytes buffered while holding a stream before its first output.
-const PRE_OUTPUT_HOLD_BYTES: usize = 1024 * 1024;
+pub(crate) const PRE_OUTPUT_HOLD_BYTES: usize = 1024 * 1024;
+
+/// The bounds a streamed response is subject to. None of them bounds how long a response may
+/// take: `pre_output_hold` only decides how long the first output is held back for failover and
+/// expiry just starts forwarding, and `idle_timeout` is an operator opt-in that ends a dead
+/// stream cleanly instead of waiting forever.
+#[derive(Clone, Debug)]
+pub struct StreamTuning {
+    /// How long to hold a stream before its first output while failover is still possible.
+    pub pre_output_hold: std::time::Duration,
+    /// How many bytes may be buffered while holding a stream before its first output.
+    pub pre_output_hold_bytes: usize,
+    /// How long an established stream may produce nothing at all before it is ended with a
+    /// terminal error event. `None` (the default) never ends a stream for being quiet.
+    pub idle_timeout: Option<std::time::Duration>,
+}
+
+impl Default for StreamTuning {
+    fn default() -> Self {
+        Self {
+            pre_output_hold: PRE_OUTPUT_HOLD,
+            pre_output_hold_bytes: PRE_OUTPUT_HOLD_BYTES,
+            idle_timeout: None,
+        }
+    }
+}
 
 /// Client headers that never travel upstream: credentials and transport-level headers. The
 /// proxy injects the selected account's credential itself (CONTRACTS
@@ -74,6 +101,38 @@ pub struct AppState {
     pub cline_user_agent: Option<String>,
     pub opencode_go_user_agent: Option<String>,
     pub vercel_user_agent: Option<String>,
+    /// The bounds a streamed response is subject to. Defaults are unbounded for wall-clock time.
+    pub stream_tuning: StreamTuning,
+}
+
+fn terminal_stream_error(dialect: UsageDialect, backend: &str, reason: &str) -> Vec<u8> {
+    let message = format!("upstream {backend} stream ended early: {reason}");
+    let body = match dialect {
+        UsageDialect::Chat => serde_json::json!({
+            "error": {
+                "code": UPSTREAM_STREAM_ERROR,
+                "type": "server_error",
+                "message": message,
+            }
+        }),
+        UsageDialect::Responses => serde_json::json!({
+            "type": "error",
+            "code": UPSTREAM_STREAM_ERROR,
+            "message": message,
+        }),
+        UsageDialect::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": {"type": UPSTREAM_STREAM_ERROR, "message": message},
+        }),
+    };
+    let mut out = Vec::new();
+    if dialect == UsageDialect::Responses {
+        out.extend_from_slice(b"event: error\n");
+    }
+    out.extend_from_slice(b"data: ");
+    out.extend_from_slice(&serde_json::to_vec(&body).unwrap_or_default());
+    out.extend_from_slice(b"\n\n");
+    out
 }
 
 /// @cc [owner:ghuntley,label:accounting] stream-finish-recorded
@@ -91,6 +150,10 @@ struct UsageFinish {
     /// Where an upstream event surfaced: `stream`, or `stream_failover` when the attempt was
     /// discarded and retried on another account.
     detail: &'static str,
+    /// The code to record when the upstream sent no terminal event of its own but the proxy ended
+    /// the body with one. It is the same code the client was told, so a recorded failure can be
+    /// traced to what the client saw.
+    synthesized_code: Option<&'static str>,
 }
 
 impl Drop for UsageFinish {
@@ -99,7 +162,10 @@ impl Drop for UsageFinish {
             self.record.input_tokens = Some(counts.input_tokens);
             self.record.output_tokens = Some(counts.output_tokens);
         }
-        let report = self.tap.report(self.ended.unwrap_or(StreamEnd::Dropped));
+        let mut report = self.tap.report(self.ended.unwrap_or(StreamEnd::Dropped));
+        if report.error_code.is_none() {
+            report.error_code = self.synthesized_code.map(str::to_string);
+        }
         let duration_ms = (now_ms() - self.record.ts).max(0);
         self.record.duration_ms = Some(duration_ms);
         self.record.stream_outcome = Some(report.outcome.as_str().to_string());
@@ -1238,11 +1304,22 @@ async fn attempt_account(
             let raw = match response.bytes().await {
                 Ok(raw) => raw,
                 Err(e) => {
+                    // The transport error can name the upstream host, so only the operator's log
+                    // sees it; the client gets the stable code and an actionable sentence.
+                    tracing::warn!(
+                        request_id = %request_id,
+                        backend = %selection.backend.as_str(),
+                        error = %e,
+                        "upstream.buffered_body_error"
+                    );
                     return Attempt::Respond(attach_request_id(
                         error_response(
                             StatusCode::BAD_GATEWAY,
-                            &format!("upstream body error: {e}"),
-                            "upstream_error",
+                            &format!(
+                                "upstream {} failed before the response completed; retry the request",
+                                selection.backend.as_str()
+                            ),
+                            UPSTREAM_STREAM_ERROR,
                         ),
                         request_id,
                     ));
@@ -1273,6 +1350,7 @@ async fn attempt_account(
                             // The body arrived and ended; it just was not convertible.
                             ended: Some(StreamEnd::UpstreamError),
                             detail: "buffered",
+                            synthesized_code: None,
                         };
                         finish.tap.feed(&body);
                         push_log(
@@ -1341,6 +1419,7 @@ async fn attempt_account(
                 tap: UsageTap::new(false, upstream_dialect),
                 ended: None,
                 detail: "buffered",
+                synthesized_code: None,
             };
             finish.tap.feed(&body);
             finish.ended = Some(StreamEnd::Eof);
@@ -1355,7 +1434,10 @@ async fn attempt_account(
             return Attempt::Respond(resp);
         }
 
-        let mut stream = response.bytes_stream();
+        let mut stream: futures::stream::BoxStream<'static, UpstreamChunk> = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
+            .boxed();
         let mut finish = UsageFinish {
             store: state.store.clone(),
             logs: state.logs.clone(),
@@ -1372,6 +1454,7 @@ async fn attempt_account(
             tap: UsageTap::new(streaming, upstream_dialect),
             ended: None,
             detail: "stream",
+            synthesized_code: None,
         };
         let translator = translate_stream.then(|| {
             std::sync::Arc::new(std::sync::Mutex::new(
@@ -1386,7 +1469,7 @@ async fn attempt_account(
         // untranslated one is: the first chunk may be a terminal overload the failover path owns.
         let mut held: VecDeque<axum::body::Bytes> = VecDeque::new();
         if streaming {
-            hold_until_output(&mut stream, &mut finish, &mut held).await;
+            hold_until_output(&mut stream, &mut finish, &mut held, &state.stream_tuning).await;
         }
         if let Some(code) = finish.tap.overload_before_output().map(str::to_string) {
             logging::log_overload_failover(
@@ -1441,108 +1524,19 @@ async fn attempt_account(
             };
         }
         let body_stream = Body::from_stream(futures::stream::unfold(
-            (stream, Some(guard), finish, translator, held),
-            |(mut stream, guard, mut finish, translator, mut held)| async move {
-                // Anything the hold buffered is released first, in order, and translated on the way
-                // out exactly as the live stream would have been.
-                if let Some(chunk) = held.pop_front() {
-                    let out = match &translator {
-                        Some(translator) => translator.lock().unwrap().feed(&chunk),
-                        None => chunk.to_vec(),
-                    };
-                    return Some((
-                        Ok::<_, std::io::Error>(out),
-                        (stream, guard, finish, translator, held),
-                    ));
-                }
-                if finish.ended.is_some() {
-                    // The hold already reached EOF or an upstream error; do not poll again. A
-                    // translated stream must still close with exactly one terminal event, so the
-                    // translator tail is emitted first - otherwise the client gets a 200 stream
-                    // that simply stops.
-                    if let Some(tail) = translator
-                        .as_ref()
-                        .map(|translator| translator.lock().unwrap().finish_on_eof())
-                        .filter(|tail| !tail.is_empty())
-                    {
-                        let abort = matches!(finish.ended, Some(StreamEnd::UpstreamError));
-                        return Some((
-                            Ok::<_, std::io::Error>(tail.clone()),
-                            (
-                                stream,
-                                if abort { None } else { guard },
-                                finish,
-                                translator,
-                                held,
-                            ),
-                        ));
-                    }
-                    return match finish.ended {
-                        Some(StreamEnd::UpstreamError) if guard.is_some() => Some((
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "upstream stream error",
-                            )),
-                            (stream, None, finish, translator, held),
-                        )),
-                        _ => None,
-                    };
-                }
-                match stream.next().await {
-                    Some(Ok(chunk)) => {
-                        finish.tap.feed(&chunk);
-                        let out = match &translator {
-                            Some(translator) => translator.lock().unwrap().feed(&chunk),
-                            None => chunk.to_vec(),
-                        };
-                        Some((
-                            Ok::<_, std::io::Error>(out),
-                            (stream, guard, finish, translator, held),
-                        ))
-                    }
-                    Some(Err(_)) => {
-                        finish.ended.get_or_insert(StreamEnd::UpstreamError);
-                        // A translated stream must close with exactly one terminal event. If the
-                        // translator already emitted it (e.g. after `[DONE]`), end the body cleanly
-                        // rather than aborting a completed response.
-                        match translator
-                            .as_ref()
-                            .map(|t| t.lock().unwrap().finish_on_eof())
-                        {
-                            None => Some((
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "upstream stream error",
-                                )),
-                                (stream, None, finish, translator, held),
-                            )),
-                            Some(tail) if tail.is_empty() => None,
-                            // Release the guard with the tail: the next iteration sees
-                            // `finish.ended` set and an empty translator tail, and holding the
-                            // guard there would abort the body *after* the terminal event.
-                            Some(tail) => Some((
-                                Ok::<_, std::io::Error>(tail),
-                                (stream, None, finish, translator, held),
-                            )),
-                        }
-                    }
-                    None => {
-                        finish.ended.get_or_insert(StreamEnd::Eof);
-                        let tail = translator
-                            .as_ref()
-                            .map(|translator| translator.lock().unwrap().finish_on_eof())
-                            .unwrap_or_default();
-                        if tail.is_empty() {
-                            None
-                        } else {
-                            Some((
-                                Ok::<_, std::io::Error>(tail),
-                                (stream, guard, finish, translator, held),
-                            ))
-                        }
-                    }
-                }
+            StreamBody {
+                stream,
+                guard: Some(guard),
+                finish,
+                translator,
+                held,
+                backend: selection.backend.as_str().to_string(),
+                idle_timeout: state.stream_tuning.idle_timeout,
+                dialect: upstream_dialect,
+                event_stream: translate_stream || upstream_is_sse(content_type.as_bytes()),
+                closed: false,
             },
+            poll_stream_body,
         ));
         if translate_stream {
             content_type = http::HeaderValue::from_static("text/event-stream");
@@ -1586,21 +1580,175 @@ fn unwrap_envelope(body: &[u8], envelope: Option<&str>) -> Vec<u8> {
     }
 }
 
+/// The terminal error events' fixed reason text. They name the condition, never upstream message
+/// text, so a client can act on them and the operator's logs stay free of prompt content.
+const CONNECTION_FAILED: &str = "the connection failed before the response completed";
+const IDLE_EXCEEDED: &str = "the upstream sent nothing for longer than the configured idle timeout";
+
+/// One upstream body chunk, or the transport failure that ended the transfer.
+type UpstreamChunk = Result<axum::body::Bytes, Box<dyn std::error::Error + Send + Sync + 'static>>;
+
+/// State carried across one streamed response body's polls.
+struct StreamBody {
+    stream: futures::stream::BoxStream<'static, UpstreamChunk>,
+    guard: Option<InflightGuard>,
+    finish: UsageFinish,
+    translator: Option<Arc<Mutex<crate::responses::ChatStreamTranslator>>>,
+    held: VecDeque<axum::body::Bytes>,
+    backend: String,
+    idle_timeout: Option<std::time::Duration>,
+    /// The dialect of the *upstream* body, which is the dialect a terminal error event must be
+    /// written in for a pass-through stream.
+    dialect: UsageDialect,
+    /// Whether the body on the wire is event-stream framing. A JSON document answered to a
+    /// streaming request is forwarded as JSON, so an SSE event must never be spliced into it.
+    event_stream: bool,
+    /// Set once the terminal bytes have been emitted. The next poll ends the body, so a client can
+    /// never receive the same terminal event twice.
+    closed: bool,
+}
+
+impl StreamBody {
+    /// Releases the account's in-flight slot as soon as the attempt is over, without waiting for
+    /// the body to be dropped - a client may keep reading a connection it no longer needs.
+    fn release_guard(&mut self) {
+        self.guard = None;
+    }
+
+    /// The terminal bytes for a failure observed now, or nothing when the body already ended on a
+    /// terminal event. A translated stream always gets the translator's single terminal event; a
+    /// pass-through stream gets one dialect-shaped error event of its own.
+    fn failure_tail(&mut self, reason: &str) -> Vec<u8> {
+        let tail = match &self.translator {
+            Some(translator) => translator.lock().unwrap().finish_on_error(),
+            None if self.event_stream && !self.closed && self.finish.tap.terminal().is_none() => {
+                terminal_stream_error(self.dialect, &self.backend, reason)
+            }
+            None => Vec::new(),
+        };
+        if !tail.is_empty() {
+            self.finish.synthesized_code = Some(UPSTREAM_STREAM_ERROR);
+            self.closed = true;
+        }
+        tail
+    }
+}
+
+/// @cc [owner:ghuntley,label:proxy] upstream-failure-ends-body-cleanly
+/// When the upstream fails after a 2xx response has started, the proxy MUST NOT abort the client's
+/// body: it MUST emit exactly one terminal error event in the upstream's own dialect, carrying the
+/// stable code `upstream_stream_error` and a message naming the backend, and then MUST end the body
+/// normally so a complete `Content-Length` or chunked terminator always arrives. A translated
+/// Responses stream MUST keep its single translator terminal event instead of gaining a second one.
+/// A body already ended by a terminal event the upstream sent MUST NOT gain another.
+async fn poll_stream_body(
+    mut body: StreamBody,
+) -> Option<(Result<axum::body::Bytes, std::io::Error>, StreamBody)> {
+    if body.closed {
+        return None;
+    }
+    // Anything the hold buffered is released first, in order, and translated on the way out
+    // exactly as the live stream would have been.
+    if let Some(chunk) = body.held.pop_front() {
+        let out = match &body.translator {
+            Some(translator) => translator.lock().unwrap().feed(&chunk),
+            None => chunk.to_vec(),
+        };
+        return Some((Ok(axum::body::Bytes::from(out)), body));
+    }
+    if let Some(end) = body.finish.ended {
+        // The hold already reached an end; do not poll again. The body still has to close
+        // with an event when the end was an upstream failure, or the client sees a 200 body
+        // that simply stops.
+        let tail = match end {
+            StreamEnd::UpstreamError => {
+                logging::log_upstream_body_failure(
+                    &body.finish.record.request_id,
+                    &body.backend,
+                    "connection_failed",
+                );
+                body.failure_tail(CONNECTION_FAILED)
+            }
+            _ => {
+                let tail = body
+                    .translator
+                    .as_ref()
+                    .map(|translator| translator.lock().unwrap().finish_on_eof())
+                    .unwrap_or_default();
+                body.closed = !tail.is_empty();
+                tail
+            }
+        };
+        body.release_guard();
+        return (!tail.is_empty()).then_some((Ok(axum::body::Bytes::from(tail)), body));
+    }
+    let next = match body.idle_timeout {
+        Some(idle) => match tokio::time::timeout(idle, body.stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                body.finish.ended = Some(StreamEnd::UpstreamError);
+                logging::log_upstream_body_failure(
+                    &body.finish.record.request_id,
+                    &body.backend,
+                    "idle",
+                );
+                let tail = body.failure_tail(IDLE_EXCEEDED);
+                body.release_guard();
+                return (!tail.is_empty()).then_some((Ok(axum::body::Bytes::from(tail)), body));
+            }
+        },
+        None => body.stream.next().await,
+    };
+    match next {
+        Some(Ok(chunk)) => {
+            body.finish.tap.feed(&chunk);
+            let out = match &body.translator {
+                Some(translator) => translator.lock().unwrap().feed(&chunk),
+                None => chunk.to_vec(),
+            };
+            Some((Ok(axum::body::Bytes::from(out)), body))
+        }
+        Some(Err(_)) => {
+            body.finish.ended = Some(StreamEnd::UpstreamError);
+            logging::log_upstream_body_failure(
+                &body.finish.record.request_id,
+                &body.backend,
+                "connection_failed",
+            );
+            let tail = body.failure_tail(CONNECTION_FAILED);
+            body.release_guard();
+            (!tail.is_empty()).then_some((Ok(axum::body::Bytes::from(tail)), body))
+        }
+        None => {
+            body.finish.ended = Some(StreamEnd::Eof);
+            let tail = body
+                .translator
+                .as_ref()
+                .map(|translator| translator.lock().unwrap().finish_on_eof())
+                .unwrap_or_default();
+            body.closed = !tail.is_empty();
+            (!tail.is_empty()).then_some((Ok(axum::body::Bytes::from(tail)), body))
+        }
+    }
+}
+
 /// @cc [owner:ghuntley,label:proxy] pre-output-hold-bounded
 /// `hold_until_output` MUST buffer upstream chunks (fed to the tap, in order) only until the tap
-/// sees model output or a terminal event, the stream ends or errors, `PRE_OUTPUT_HOLD` elapses,
-/// or `PRE_OUTPUT_HOLD_BYTES` are buffered, whichever comes first. It MUST NOT drop or reorder a
-/// chunk, and a stream end observed while holding MUST be recorded in `finish.ended`.
+/// sees model output or a terminal event, the stream ends or errors, the hold deadline elapses,
+/// or the hold byte bound is reached, whichever comes first. It MUST NOT drop or reorder a
+/// chunk, and a stream end observed while holding MUST be recorded in `finish.ended`. Expiry is
+/// not a failure: it only stops holding, so a legitimately long first token is never cut.
 async fn hold_until_output<S>(
     stream: &mut S,
     finish: &mut UsageFinish,
     held: &mut VecDeque<axum::body::Bytes>,
+    tuning: &StreamTuning,
 ) where
-    S: futures::Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
+    S: futures::Stream<Item = UpstreamChunk> + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + PRE_OUTPUT_HOLD;
+    let deadline = tokio::time::Instant::now() + tuning.pre_output_hold;
     let mut bytes = 0usize;
-    while !finish.tap.decided() && bytes < PRE_OUTPUT_HOLD_BYTES {
+    while !finish.tap.decided() && bytes < tuning.pre_output_hold_bytes {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(chunk))) => {
                 finish.tap.feed(&chunk);
@@ -1615,6 +1763,8 @@ async fn hold_until_output<S>(
                 finish.ended = Some(StreamEnd::Eof);
                 return;
             }
+            // The hold window elapsed. Holding any longer would delay a stream that is merely
+            // slow to its first token, so streaming simply continues.
             Err(_) => return,
         }
     }
@@ -1841,6 +1991,179 @@ mod tests {
         // A real event stream still streams in every case.
         assert!(!buffered(false, Some("data"), b"text/event-stream"));
         assert!(!buffered(true, None, b"text/event-stream"));
+    }
+
+    fn usage_finish_for_test(tap: UsageTap) -> UsageFinish {
+        UsageFinish {
+            store: Arc::new(Store::in_memory().unwrap()),
+            logs: Arc::new(Mutex::new(VecDeque::new())),
+            record: UsageRecord {
+                request_id: "req-test".into(),
+                account_id: "acct-test".into(),
+                account_label: "label-test".into(),
+                backend: "codex".into(),
+                model: "gpt-5.5".into(),
+                ..Default::default()
+            },
+            tap,
+            ended: None,
+            detail: "stream",
+            synthesized_code: None,
+        }
+    }
+
+    fn body(chunks: Vec<UpstreamChunk>, dialect: UsageDialect) -> StreamBody {
+        StreamBody {
+            stream: futures::stream::iter(chunks).boxed(),
+            guard: None,
+            finish: usage_finish_for_test(UsageTap::new(true, dialect)),
+            translator: None,
+            held: VecDeque::new(),
+            backend: "codex".into(),
+            idle_timeout: None,
+            dialect,
+            event_stream: true,
+            closed: false,
+        }
+    }
+
+    fn chunk(text: &'static str) -> UpstreamChunk {
+        Ok(axum::body::Bytes::from_static(text.as_bytes()))
+    }
+
+    fn failure() -> UpstreamChunk {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        )))
+    }
+
+    /// Drains the body the way hyper does and returns everything the client would receive.
+    async fn drain(mut body: StreamBody) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some((chunk, next)) = poll_stream_body(body).await {
+            out.extend_from_slice(&chunk.expect("the body must never abort the client's frame"));
+            body = next;
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_ends_a_chat_stream_with_one_error_event() {
+        let out = drain(body(
+            vec![
+                chunk("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+                failure(),
+            ],
+            UsageDialect::Chat,
+        ))
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("data: {\"choices\""), "{text}");
+        let last = text
+            .split("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .last()
+            .unwrap();
+        let data = last.strip_prefix("data: ").expect("a data frame");
+        let value: Value = serde_json::from_str(data).expect("one complete frame");
+        assert_eq!(value["error"]["code"], UPSTREAM_STREAM_ERROR);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("codex")
+        );
+        assert_eq!(text.matches(UPSTREAM_STREAM_ERROR).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_ends_a_responses_stream_with_one_error_event() {
+        let out = drain(body(
+            vec![
+                chunk("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"),
+                failure(),
+            ],
+            UsageDialect::Responses,
+        ))
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.ends_with("\n\n"),
+            "the final frame is terminated: {text:?}"
+        );
+        assert_eq!(text.matches(UPSTREAM_STREAM_ERROR).count(), 1, "{text}");
+        assert!(text.contains("event: error\ndata: "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_ends_an_anthropic_stream_with_one_error_event() {
+        let out = drain(body(
+            vec![
+                chunk("event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"),
+                failure(),
+            ],
+            UsageDialect::Anthropic,
+        ))
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"type\":\"error\""), "{text}");
+        assert!(text.contains(UPSTREAM_STREAM_ERROR), "{text}");
+        assert_eq!(text.matches(UPSTREAM_STREAM_ERROR).count(), 1, "{text}");
+    }
+
+    /// An upstream that already sent its terminal event and then fails must not gain a second one.
+    #[tokio::test]
+    async fn a_completed_stream_gains_no_error_event() {
+        let out = drain(body(
+            vec![
+                chunk("data: {\"type\":\"response.completed\",\"response\":{}}\n\n"),
+                failure(),
+            ],
+            UsageDialect::Responses,
+        ))
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains(UPSTREAM_STREAM_ERROR), "{text}");
+        assert_eq!(text.matches("response.completed").count(), 1, "{text}");
+    }
+
+    /// A translated stream must keep the translator's single terminal event: no second one, and
+    /// no truncated frame.
+    #[tokio::test]
+    async fn a_translated_stream_failure_emits_exactly_one_terminal_event() {
+        let mut body = body(
+            vec![
+                chunk("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
+                failure(),
+            ],
+            UsageDialect::Chat,
+        );
+        body.translator = Some(Arc::new(Mutex::new(
+            crate::responses::ChatStreamTranslator::new("m", "resp_t", 5),
+        )));
+        let text = String::from_utf8(drain(body).await).unwrap();
+        let terminal = text
+            .split("\n\n")
+            .filter(|frame| frame.lines().any(|line| line == "event: response.failed"))
+            .count();
+        assert_eq!(terminal, 1, "exactly one terminal event: {text}");
+        assert_eq!(text.matches(UPSTREAM_STREAM_ERROR).count(), 1, "{text}");
+        assert!(
+            !text.contains("event: error\ndata: {\"type\":\"error\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_upstream_failure_with_no_output_still_tells_the_client() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let text = runtime.block_on(drain(body(vec![failure()], UsageDialect::Chat)));
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains(UPSTREAM_STREAM_ERROR), "{text}");
     }
 
     #[test]

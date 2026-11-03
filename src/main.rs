@@ -189,8 +189,11 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     );
     // (alias table built after pool creation)
 
+    // Only the connect is bounded. There is deliberately no request timeout: a review may run for
+    // as long as the upstream keeps producing, and an upstream that stalls is ended by the stream
+    // idle timeout (or the client's own) with a terminal error event, not by a killed connection.
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(cfg.upstream_connect_timeout)
         .build()?;
 
     let tokens = Arc::new(tokens::TokenManager::new(store.clone(), client.clone()));
@@ -268,6 +271,11 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         cline_user_agent: cfg.cline_user_agent.clone(),
         opencode_go_user_agent: cfg.opencode_go_user_agent.clone(),
         vercel_user_agent: cfg.vercel_user_agent.clone(),
+        stream_tuning: proxy::StreamTuning {
+            pre_output_hold: cfg.pre_output_hold,
+            pre_output_hold_bytes: cfg.pre_output_hold_bytes,
+            idle_timeout: cfg.stream_idle_timeout,
+        },
     });
 
     {

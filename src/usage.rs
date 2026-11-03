@@ -54,6 +54,12 @@ pub fn usage_from_dialect(value: &Value, dialect: UsageDialect) -> Option<TokenC
     }
 }
 
+/// The stable error code the proxy reports when an upstream failure ends a 2xx body after the
+/// response has started. It is what a client sees in the terminal error event and what the usage
+/// row records, so the two can always be matched. Documented in the README and
+/// `docs/adr/fork/stream-failure-and-timeouts.md`.
+pub const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_error";
+
 /// How an upstream response body ended, as observed by the proxy while passing it through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -496,6 +502,12 @@ impl UsageTap {
             }
             _ => None,
         }
+    }
+
+    /// The outcome and code of the terminal event the upstream sent, if it sent one. A body that
+    /// already ended on its own terminal event must not be given another one.
+    pub fn terminal(&self) -> Option<&(StreamOutcome, Option<String>)> {
+        self.terminal.as_ref()
     }
 
     pub fn counts(&self) -> Option<TokenCounts> {

@@ -487,6 +487,99 @@ async fn mock_responses(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\"}}\n\n",
         ).into_response();
     }
+    // An upstream that dies mid-response after sending output: the exact shape that reached the
+    // client as `TransferEncodingError: Not enough data to satisfy transfer length header`.
+    if bearer.starts_with("tok-cut-") && wants_stream {
+        let stream = futures::stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    // Let the first chunk reach the client's socket, so the failure lands after
+                    // the 200 has been established rather than aborting the response head.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "upstream reset the connection",
+                        )),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+    // An upstream that keeps producing for well over any hold window the proxy was given, so a
+    // client can prove the proxy never cut it.
+    if bearer.starts_with("tok-long-") && wants_stream {
+        let stream = futures::stream::unfold(0u32, |step| async move {
+            if step == 12 {
+                return Some((
+                    Ok(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n",
+                    )),
+                    step + 1,
+                ));
+            }
+            if step > 12 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let chunk = format!(
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk-{step}\"}}\n\n"
+            );
+            Some((
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)),
+                step + 1,
+            ))
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+    // An upstream that sends one chunk and then goes silent well beyond an idle deadline.
+    if bearer.starts_with("tok-stall-") && wants_stream {
+        let stream = futures::stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    Some((
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\"}\n\n",
+                        )),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
     if serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| value.get("slow_abort").and_then(|flag| flag.as_bool()))
@@ -691,6 +784,25 @@ async fn spawn_app_with_user_agent(
     Arc<Mutex<VecDeque<RequestLogEntry>>>,
     Arc<Mutex<PoolCore>>,
 ) {
+    spawn_app_with_tuning(
+        store,
+        cooldown_ms,
+        user_agent,
+        underclass::proxy::StreamTuning::default(),
+    )
+    .await
+}
+
+async fn spawn_app_with_tuning(
+    store: Arc<Store>,
+    cooldown_ms: i64,
+    user_agent: Option<&str>,
+    stream_tuning: underclass::proxy::StreamTuning,
+) -> (
+    String,
+    Arc<Mutex<VecDeque<RequestLogEntry>>>,
+    Arc<Mutex<PoolCore>>,
+) {
     let client = reqwest::Client::new();
     let tokens = Arc::new(TokenManager::new(store.clone(), client.clone()));
     let mut backends: BackendMap = std::collections::HashMap::new();
@@ -742,6 +854,7 @@ async fn spawn_app_with_user_agent(
         cline_user_agent: user_agent.map(str::to_string),
         opencode_go_user_agent: user_agent.map(str::to_string),
         vercel_user_agent: user_agent.map(str::to_string),
+        stream_tuning,
     });
 
     let v1 = axum::Router::new()
@@ -1753,6 +1866,147 @@ async fn e2e_overload_after_output_passes_through() {
         "output already reached the client, so no retry"
     );
     assert_eq!(rows[0].saw_output, Some(true));
+}
+
+/// An upstream failure after output must reach the client as a complete, well-formed body whose
+/// last frame is a terminal error event. This is the regression that surfaced as
+/// `TransferEncodingError: Not enough data to satisfy transfer length header`: the proxy used to
+/// abort the body on a mid-stream transport error, so hyper never wrote the chunked terminator.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_mid_stream_upstream_failure_ends_the_body_cleanly() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("cut-a", "tok-cut-a"));
+    let (base, _logs, _pool) = spawn_app(store.clone(), 400).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({
+            "model": "gpt-5.5",
+            "input": "hi",
+            "stream": true,
+            "prompt_cache_key": "cut-session",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // `text()` itself only succeeds when the body was framed completely: a truncated chunked
+    // transfer fails here instead of returning a body.
+    let body = response
+        .text()
+        .await
+        .expect("the body must be framed completely");
+    assert!(
+        body.contains("partial"),
+        "output reached the client: {body}"
+    );
+    let frames: Vec<&str> = body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    let last = frames.last().expect("the body ends with a frame");
+    let data = last
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("the last frame carries data");
+    let value: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(value["code"], "upstream_stream_error", "{body}");
+    assert!(
+        value["message"].as_str().unwrap().contains("codex"),
+        "the message names the backend: {body}"
+    );
+
+    // The attempt is recorded once, as a failure carrying the same code the client was given.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1, "exactly one usage row per attempt");
+    // The outcome is the tap's own classification of an errored transfer; the code is the one the
+    // client was given, so a recorded failure can be traced to what the client saw.
+    assert_eq!(rows[0].stream_outcome.as_deref(), Some("upstream_error"));
+    assert_eq!(rows[0].error_code.as_deref(), Some("upstream_stream_error"));
+    assert_eq!(rows[0].saw_output, Some(true));
+}
+
+/// A backend that stays quiet past the idle deadline ends the client's body with a terminal error
+/// event instead of holding the connection open forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_idle_upstream_ends_the_body_with_an_error_event() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("stall-a", "tok-stall-a"));
+    let tuning = underclass::proxy::StreamTuning {
+        idle_timeout: Some(std::time::Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let (base, _logs, _pool) = spawn_app_with_tuning(store.clone(), 400, None, tuning).await;
+
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({
+            "model": "gpt-5.5",
+            "input": "hi",
+            "stream": true,
+            "prompt_cache_key": "stall-session",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .expect("a stalled stream ends with a framed body");
+    assert!(body.contains("partial"), "{body}");
+    assert!(body.contains("upstream_stream_error"), "{body}");
+    assert_eq!(
+        body.matches("upstream_stream_error").count(),
+        1,
+        "exactly one terminal error event: {body}"
+    );
+}
+
+/// With no idle deadline configured (the default) a quiet upstream is never cut, and a stream that
+/// keeps producing for longer than the hold window is delivered in full.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_long_stream_is_never_cut() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("long-a", "tok-long-a"));
+    // A hold shorter than the stream proves the hold is not a deadline on the response: expiry
+    // only starts streaming.
+    let tuning = underclass::proxy::StreamTuning {
+        pre_output_hold: std::time::Duration::from_millis(10),
+        ..Default::default()
+    };
+    let (base, _logs, _pool) = spawn_app_with_tuning(store.clone(), 400, None, tuning).await;
+
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", concat!("Bear", "er ", "test-key"))
+        .json(&serde_json::json!({
+            "model": "gpt-5.5",
+            "input": "hi",
+            "stream": true,
+            "prompt_cache_key": "long-session",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .expect("the long stream is framed completely");
+    for step in 0..12 {
+        assert!(
+            body.contains(&format!("chunk-{step}")),
+            "missing {step}: {body}"
+        );
+    }
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("upstream_stream_error"), "{body}");
 }
 
 /// The Anthropic surface serves only official Claude Code clients, forwards their headers and
