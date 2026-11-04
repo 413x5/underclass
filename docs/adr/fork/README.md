@@ -89,3 +89,8 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   any end without a head, exactly one `request.abandoned` line from a `Drop` guard; the mid-body idle
   bound is now on at 60s, and a new `upstream_response_header_timeout_secs` (1800s, above the
   client's own wait) bounds only the head. Total response time stays unbounded.
+- [Deployment Tooling Lives in the Repository](deploy-tooling-in-repo.md) — `scripts/deploy_macos.sh`
+  (macOS only: launchd) installs or updates an installed copy with fresh-vs-update detection, a
+  staged `mv -f` install proved by a pid change, rollback points and an example config installed
+  beside the live one; `scripts/migrate_db.sh` is the OS-neutral, extensible migration runner it
+  calls, and a missing runner is a hard error rather than a silent skip.
