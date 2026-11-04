@@ -60,6 +60,12 @@ pub fn usage_from_dialect(value: &Value, dialect: UsageDialect) -> Option<TokenC
 /// `docs/adr/fork/stream-failure-and-timeouts.md`.
 pub const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_error";
 
+/// The stable error code reported when an attempt waited for upstream response headers past the
+/// configured bound and the upstream sent nothing. It is what a client sees and what the usage row
+/// records, so a leaked request can be joined to its accounting. Documented in the README and
+/// `docs/adr/fork/response-time-bounds-and-request-observability.md`.
+pub const UPSTREAM_RESPONSE_TIMEOUT: &str = "upstream_response_timeout";
+
 /// How an upstream response body ended, as observed by the proxy while passing it through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

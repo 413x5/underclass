@@ -81,5 +81,11 @@ Keeping fork decisions in `docs/adr/fork/` with title-only filenames avoids both
   has no refresh button.
 - [Stream Failures End the Body Cleanly, and No Timeout Cuts a Long Response](stream-failure-and-timeouts.md)
   — an upstream failure after output ends the client's body with one dialect-shaped terminal event
-  carrying `upstream_stream_error` instead of aborting the frame, and nothing on the inference path
-  has a wall-clock deadline by default (the idle timeout is opt-in and ends the body the same way).
+  carrying `upstream_stream_error` instead of aborting the frame, and no total request deadline
+  exists (the idle timeout ends the body the same way; its default is superseded by
+  [Abandoned Requests Are Visible…](abandoned-request-observability.md)).
+- [Abandoned Requests Are Visible, and the Three Edges of an Attempt Are Bounded](abandoned-request-observability.md)
+  — an attempt that never gets upstream response headers now logs `request.awaiting_headers` and, on
+  any end without a head, exactly one `request.abandoned` line from a `Drop` guard; the mid-body idle
+  bound is now on at 60s, and a new `upstream_response_header_timeout_secs` (1800s, above the
+  client's own wait) bounds only the head. Total response time stays unbounded.

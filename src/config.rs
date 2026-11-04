@@ -42,9 +42,13 @@ pub struct FileConfig {
     pub codex_cooldown_ms: Option<u64>,
     pub auto_codex_resets: Option<bool>,
     pub stats_retention_days: Option<i64>,
-    /// How long a streamed response may produce nothing at all before it is ended with a terminal
-    /// error event. `0` (the default) never ends a stream for being quiet.
+    /// How long a streamed response may produce nothing at all between chunks before it is ended
+    /// with a terminal error event. `0` never ends a stream for being quiet.
     pub stream_idle_timeout_secs: Option<u64>,
+    /// How long an attempt may wait for the upstream's response headers. `0` disables the bound.
+    /// It deliberately sits above a client's own wait, so it is a leak backstop rather than a
+    /// policy.
+    pub upstream_response_header_timeout_secs: Option<u64>,
     /// How long the upstream TCP/TLS connect may take. Bounds startup of an attempt only.
     pub upstream_connect_timeout_secs: Option<u64>,
     /// How long a stream's first output is held back while failover is still possible. Expiry
@@ -62,6 +66,14 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
 pub const DEFAULT_AUTO_CODEX_RESETS: bool = true;
 /// The cooldown every backend falls back to when the upstream says nothing about a window.
 pub const DEFAULT_COOLDOWN_MS: i64 = 30 * 60 * 1000;
+/// How long a streamed response may stay silent *between chunks* before it is ended. A healthy
+/// stream emits deltas continuously, reasoning deltas included, so this much complete silence means
+/// the upstream has stopped talking. It does not bound how long a response may take.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+/// How long an attempt may wait for upstream response headers. It sits deliberately above a
+/// client's own wait (the review bundle uses 1500s), so it is a leak backstop for a request nobody
+/// is waiting for any more, never a policy on how long generation may take.
+pub const DEFAULT_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 1800;
 /// How long the upstream TCP/TLS connect may take before the attempt fails over.
 pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// How long a stream's first output is held back while failover is still possible.
@@ -103,7 +115,10 @@ impl FileConfig {
             vercel_user_agent: Some(String::new()),
             auto_codex_resets: Some(DEFAULT_AUTO_CODEX_RESETS),
             stats_retention_days: Some(crate::stats::DEFAULT_RETENTION_DAYS),
-            stream_idle_timeout_secs: Some(0),
+            stream_idle_timeout_secs: Some(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+            upstream_response_header_timeout_secs: Some(
+                DEFAULT_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+            ),
             upstream_connect_timeout_secs: Some(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS),
             pre_output_hold_secs: Some(DEFAULT_PRE_OUTPUT_HOLD_SECS),
             pre_output_hold_bytes: Some(DEFAULT_PRE_OUTPUT_HOLD_BYTES),
@@ -142,9 +157,11 @@ pub struct Config {
     pub opencode_go_user_agent: Option<String>,
     pub vercel_user_agent: Option<String>,
     pub stats_retention_days: i64,
-    /// `None` means no idle deadline at all: a long review may produce nothing between tokens for
-    /// as long as the upstream takes.
+    /// `None` means the mid-body idle bound is off: an operator can still run with no deadline on
+    /// a quiet stream at all.
     pub stream_idle_timeout: Option<std::time::Duration>,
+    /// `None` means no bound on waiting for upstream response headers.
+    pub upstream_response_header_timeout: Option<std::time::Duration>,
     /// How long the upstream TCP/TLS connect may take before the attempt fails over.
     pub upstream_connect_timeout: std::time::Duration,
     /// How long a stream's first output is held back while failover is still possible, and how
@@ -171,11 +188,10 @@ fn first_configured(candidates: impl IntoIterator<Item = Option<String>>) -> Opt
         .find(|value| !value.trim().is_empty())
 }
 
-/// Resolves the stream idle deadline from an environment value and a file value, in that order of
-/// precedence. `0` means "no idle deadline" at either level, so an operator can turn it off over
-/// the environment even when the file sets one - and the default is off, because a long review may
-/// produce nothing between tokens for as long as the upstream takes.
-fn resolve_idle_timeout(
+/// Resolves a bounded wait from an environment value and a file value, in that order of
+/// precedence. `0` means "no bound" at either level, so an operator can turn a default-on bound
+/// off over the environment even when the file sets one.
+fn resolve_seconds_bound(
     env_secs: Option<u64>,
     file_secs: Option<u64>,
 ) -> Option<std::time::Duration> {
@@ -183,6 +199,25 @@ fn resolve_idle_timeout(
         Some(secs) if secs > 0 => Some(std::time::Duration::from_secs(secs)),
         _ => None,
     }
+}
+
+/// The mid-body idle bound: how long one upstream stream may send nothing before the proxy ends
+/// it with a terminal error event. It bounds the gap *between chunks*, not the body's total time,
+/// and `0` turns it off.
+fn resolve_idle_timeout(
+    env_secs: Option<u64>,
+    file_secs: Option<u64>,
+) -> Option<std::time::Duration> {
+    resolve_seconds_bound(env_secs, file_secs)
+}
+
+/// The response-header bound: how long one attempt may wait for upstream response headers. It
+/// covers only the head, never the body, and `0` turns it off.
+fn resolve_header_timeout(
+    env_secs: Option<u64>,
+    file_secs: Option<u64>,
+) -> Option<std::time::Duration> {
+    resolve_seconds_bound(env_secs, file_secs)
 }
 
 fn home_dir() -> PathBuf {
@@ -276,6 +311,12 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok()),
             file_cfg.stream_idle_timeout_secs,
+        );
+        let upstream_response_header_timeout = resolve_header_timeout(
+            std::env::var("UNDERCLASS_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok()),
+            file_cfg.upstream_response_header_timeout_secs,
         );
         let upstream_connect_timeout = std::env::var("UNDERCLASS_UPSTREAM_CONNECT_TIMEOUT_SECS")
             .ok()
@@ -377,6 +418,7 @@ impl Config {
             vercel_user_agent,
             stats_retention_days,
             stream_idle_timeout,
+            upstream_response_header_timeout,
             upstream_connect_timeout: std::time::Duration::from_secs(upstream_connect_timeout),
             pre_output_hold: std::time::Duration::from_secs(pre_output_hold_secs),
             pre_output_hold_bytes,
@@ -418,6 +460,25 @@ mod tests {
         assert_eq!(resolve_idle_timeout(Some(120), Some(0)), secs(120));
         assert_eq!(resolve_idle_timeout(Some(120), Some(300)), secs(120));
         assert_eq!(resolve_idle_timeout(None, Some(300)), secs(300));
+        // The default is on, and a fall through to it yields a real bound.
+        assert_eq!(
+            resolve_idle_timeout(None, Some(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)),
+            secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)
+        );
+    }
+
+    /// The header bound follows the same `0`-means-off convention, so an operator can disable the
+    /// leak backstop over the environment without touching the file.
+    #[test]
+    fn the_header_bound_shares_the_zero_means_off_convention() {
+        let secs = |value: u64| Some(std::time::Duration::from_secs(value));
+        assert_eq!(resolve_header_timeout(None, None), None);
+        assert_eq!(resolve_header_timeout(Some(0), Some(1800)), None);
+        assert_eq!(resolve_header_timeout(None, Some(0)), None);
+        assert_eq!(resolve_header_timeout(Some(120), Some(0)), secs(120));
+        // 1800s sits above the review bundle's 1500s client timeout on purpose: it is a leak
+        // backstop, so it must not be lowered to race the client's own decision.
+        const { assert!(DEFAULT_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS > 1500) };
     }
 
     /// The shipped example must show the whole configuration surface and cannot drift from the
@@ -448,6 +509,7 @@ mod tests {
             "auto_codex_resets",
             "stats_retention_days",
             "stream_idle_timeout_secs",
+            "upstream_response_header_timeout_secs",
             "upstream_connect_timeout_secs",
             "pre_output_hold_secs",
             "pre_output_hold_bytes",

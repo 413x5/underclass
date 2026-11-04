@@ -181,6 +181,17 @@ current: a stale entry actively misleads.
   [`docs/adr/fork/model-metadata-sources.md`](docs/adr/fork/model-metadata-sources.md).
 - models.dev is an advisory spec source, never a set source, and a failed read leaves the catalog
   byte-identical. Its `deprecated` marks do not retire anything on their own.
+- Three bounds cover the edges of one attempt and none of them caps a healthy response: connect
+  10s, response headers 1800s (`upstream_response_header_timeout_secs`, above a client's own wait so
+  it is a leak backstop rather than a policy), and mid-body silence 60s (`stream_idle_timeout_secs`,
+  the gap before the next chunk, reset on every chunk). There is deliberately no total request
+  deadline, and the header bound is a `tokio::time::timeout` around the send rather than a `reqwest`
+  client timeout, which would bound the body. See
+  [`docs/adr/fork/abandoned-request-observability.md`](docs/adr/fork/abandoned-request-observability.md).
+- `request.awaiting_headers` and `request.abandoned` are the observability pair for an attempt that
+  never gets upstream response headers; the terminal line comes from a `Drop` guard so it fires on a
+  client abort too. It is suppressed when the head arrived, when the attempt already logged its own
+  failure, or when the header bound expired (`upstream.headers_timeout` covers that).
 ## Config files agents may edit
 
 `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `docs/adr/*`, `Cargo.toml`, `flake.nix`, `.github/*`,

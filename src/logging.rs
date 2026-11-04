@@ -56,6 +56,106 @@ pub fn log_request_completed(request_id: &str, status: u16, duration_ms: u64) {
     );
 }
 
+/// One attempt began waiting for the upstream's response headers. This is the start of the clock
+/// an attempt that never gets headers would otherwise never have: without it, a request that is
+/// selected and then produces nothing leaves one `request.selected` line and no end.
+///
+/// `attempt` is the attempt's 1-based position in this request's failover chain, and `cache_key`
+/// is the client's own session/prompt-cache key - the identity the proxy already uses to keep a
+/// session sticky, and the only thing that joins separate requests belonging to one logical call.
+#[allow(clippy::too_many_arguments)]
+pub fn log_request_awaiting_headers(
+    request_id: &str,
+    attempt: u32,
+    cache_key: &str,
+    model: &str,
+    upstream_model: &str,
+    endpoint: &str,
+    backend: &str,
+    account_id: &str,
+    label: Option<&str>,
+) {
+    tracing::info!(
+        request_id = %request_id,
+        attempt = attempt,
+        cache_key = %cache_key,
+        model = %model,
+        upstream_model = %upstream_model,
+        endpoint = %endpoint,
+        backend = %backend,
+        account = %label.unwrap_or("unknown"),
+        account_id = %truncate(account_id),
+        "request.awaiting_headers"
+    );
+}
+
+/// The one terminal line for an attempt that did not end by its upstream response. Emitted from a
+/// `Drop` guard, so it fires whether the attempt returned, errored, or was abandoned mid-flight.
+/// `stage` says where the attempt was, `reason` which of the indistinguishable cases it hit, and
+/// `elapsed_ms` how long it had been running. `reason` is a fixed label, never upstream text.
+#[allow(clippy::too_many_arguments)]
+pub fn log_request_abandoned(
+    request_id: &str,
+    attempt: u32,
+    cache_key: &str,
+    model: &str,
+    upstream_model: &str,
+    endpoint: &str,
+    backend: &str,
+    account_id: &str,
+    label: Option<&str>,
+    stage: &str,
+    reason: &str,
+    elapsed_ms: u64,
+) {
+    tracing::warn!(
+        request_id = %request_id,
+        attempt = attempt,
+        cache_key = %cache_key,
+        model = %model,
+        upstream_model = %upstream_model,
+        endpoint = %endpoint,
+        backend = %backend,
+        account = %label.unwrap_or("unknown"),
+        account_id = %truncate(account_id),
+        stage = %stage,
+        reason = %reason,
+        elapsed_ms = elapsed_ms,
+        "request.abandoned",
+    );
+}
+
+/// The configured response-header bound expired before the upstream sent its response head. This
+/// is the proxy's own decision rather than an observation about a request nobody finished, so it
+/// carries its own event name instead of `request.abandoned`.
+#[allow(clippy::too_many_arguments)]
+pub fn log_upstream_headers_timeout(
+    request_id: &str,
+    attempt: u32,
+    cache_key: &str,
+    backend: &str,
+    account_id: &str,
+    label: Option<&str>,
+    endpoint: &str,
+    stage: &str,
+    elapsed_ms: u64,
+    limit_ms: u64,
+) {
+    tracing::warn!(
+        request_id = %request_id,
+        attempt = attempt,
+        cache_key = %cache_key,
+        backend = %backend,
+        account = %label.unwrap_or("unknown"),
+        account_id = %truncate(account_id),
+        endpoint = %endpoint,
+        stage = %stage,
+        elapsed_ms = elapsed_ms,
+        limit_ms = limit_ms,
+        "upstream.headers_timeout"
+    );
+}
+
 pub fn log_account_state(account_id: &str, label: Option<&str>, event: &str, detail: &str) {
     tracing::info!(
         account = %label.unwrap_or("unknown"),

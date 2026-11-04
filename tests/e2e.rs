@@ -551,6 +551,42 @@ async fn mock_responses(
         )
             .into_response();
     }
+    // An upstream that takes a while to produce its response HEADERS. Bearer-keyed, so a test can
+    // prove the header bound covers only the head; `tok-headslow-` is used for the bounded case.
+    if let Some(delay_ms) = bearer.strip_prefix("tok-headslow-") {
+        let delay = delay_ms.parse::<u64>().unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    // An upstream whose head is prompt but whose body stalls well past any idle bound: the header
+    // bound must not touch it.
+    if bearer.starts_with("tok-bodyslow") && wants_stream {
+        let stream = futures::stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    Some((
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+                        )),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
     // An upstream that sends one chunk and then goes silent well beyond an idle deadline.
     if bearer.starts_with("tok-stall-") && wants_stream {
         let stream = futures::stream::unfold(0, |step| async move {
@@ -2007,6 +2043,121 @@ async fn e2e_long_stream_is_never_cut() {
     }
     assert!(body.contains("response.completed"), "{body}");
     assert!(!body.contains("upstream_stream_error"), "{body}");
+}
+
+/// @cc [owner:ghuntley,label:proxy] response-header-bound-ends-the-attempt
+/// An upstream that sends no response headers before the bound MUST end the attempt as failed
+/// after exactly one usage row carrying `upstream_response_timeout`, and MUST NOT leave the client
+/// waiting indefinitely. A head inside the bound and `None` are covered by their own tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_header_timeout_ends_the_attempt_and_records_once() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    // A single account whose head takes 400ms, against a 50ms bound, so the outcome is not a race
+    // with pool ordering: there is nowhere else to fail over to.
+    store.upsert_account(&codex_account("head-slow", "tok-headslow-400"));
+    let tuning = underclass::proxy::StreamTuning {
+        header_timeout: Some(std::time::Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let (base, _logs, _pool) = spawn_app_with_tuning(store.clone(), 400, None, tuning).await;
+
+    let (status, body) = post_model_stream(&base, "gpt-5.5", "head-timeout-session").await;
+    assert_ne!(status, 200, "the attempt timed out: {body}");
+    assert_eq!(
+        status, 504,
+        "a gateway timeout, not a generic pool failure: {body}"
+    );
+    assert!(
+        body.contains("upstream_response_timeout"),
+        "the client is told why: {body}"
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1, "exactly one row for one attempt: {rows:#?}");
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_response_timeout")
+    );
+}
+
+/// A response head that arrives inside the bound is served exactly as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_head_inside_the_bound_is_untouched() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("head-inside", "tok-headfast"));
+    let tuning = underclass::proxy::StreamTuning {
+        header_timeout: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    };
+    let (base, _logs, _pool) = spawn_app_with_tuning(store.clone(), 400, None, tuning).await;
+
+    let (status, body) = post_model_stream(&base, "gpt-5.5", "head-inside-session").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("response.completed"), "{body}");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].error_code, None);
+}
+
+/// `None` disables the header bound: a head that takes far longer than any small bound is
+/// delivered rather than cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_disabled_header_bound_waits_for_the_head() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("head-off", "tok-headslow-200"));
+    let tuning = underclass::proxy::StreamTuning {
+        header_timeout: None,
+        ..Default::default()
+    };
+    let (base, _logs, _pool) = spawn_app_with_tuning(store.clone(), 400, None, tuning).await;
+
+    let (status, body) = post_model_stream(&base, "gpt-5.5", "head-off-session").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("response.completed"), "{body}");
+}
+
+/// A prompt head with a slow body is not cut by the header bound: it covers only the head.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_slow_body_is_not_cut_by_the_header_bound() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("body-slow", "tok-bodyslow"));
+    let tuning = underclass::proxy::StreamTuning {
+        // Far shorter than the 250ms body gap, so any body coverage would cut it.
+        header_timeout: Some(std::time::Duration::from_millis(50)),
+        // The idle bound also has to stay off for this test to prove the header bound's scope.
+        idle_timeout: None,
+        ..Default::default()
+    };
+    let (base, _logs, _pool) = spawn_app_with_tuning(store.clone(), 400, None, tuning).await;
+
+    let (status, body) = post_model_stream(&base, "gpt-5.5", "body-slow-session").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("early"), "{body}");
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("upstream_stream_error"), "{body}");
+}
+
+/// The default tuning — what a `config.toml` copied from the example resolves — turns the mid-body
+/// idle bound on at 60s rather than leaving it off.
+#[test]
+fn the_default_stream_tuning_bounds_a_silent_body() {
+    let tuning = underclass::proxy::StreamTuning::default();
+    assert_eq!(
+        tuning.idle_timeout,
+        Some(std::time::Duration::from_secs(60))
+    );
+    assert_eq!(
+        tuning.header_timeout,
+        Some(std::time::Duration::from_secs(1800))
+    );
 }
 
 /// The Anthropic surface serves only official Claude Code clients, forwards their headers and

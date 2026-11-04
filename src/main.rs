@@ -189,9 +189,11 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     );
     // (alias table built after pool creation)
 
-    // Only the connect is bounded. There is deliberately no request timeout: a review may run for
-    // as long as the upstream keeps producing, and an upstream that stalls is ended by the stream
-    // idle timeout (or the client's own) with a terminal error event, not by a killed connection.
+    // Only the connect is bounded on the client itself. There is deliberately no per-request
+    // timeout: that would bound the body and cut a healthy long response. The wait for response
+    // headers is bounded separately, around each send, by `StreamTuning::header_timeout`, and a
+    // stalled body by `StreamTuning::idle_timeout` - both end the attempt cleanly rather than
+    // killing the connection.
     let client = reqwest::Client::builder()
         .connect_timeout(cfg.upstream_connect_timeout)
         .build()?;
@@ -275,6 +277,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             pre_output_hold: cfg.pre_output_hold,
             pre_output_hold_bytes: cfg.pre_output_hold_bytes,
             idle_timeout: cfg.stream_idle_timeout,
+            header_timeout: cfg.upstream_response_header_timeout,
         },
     });
 

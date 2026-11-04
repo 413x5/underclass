@@ -54,13 +54,19 @@ other than killing the process.
   the client was told. Failover is untouched: post-output failures are never retried
   ([pre-output-failover](../../../CONTRACTS)).
 
-### Nothing on the inference path has a wall-clock deadline
+### Nothing on the inference path has a total wall-clock deadline
+
+Three bounds cover the edges of one attempt; none of them caps a healthy response. The mid-body idle
+bound is on by default and the header bound is new — see
+[Abandoned Requests Are Visible, and the Three Edges of an Attempt Are Bounded](abandoned-request-observability.md),
+which records that change. The values below are the current ones.
 
 | Bound | Value | What it bounds | On expiry |
 |---|---|---|---|
 | upstream `connect_timeout` (`upstream_connect_timeout_secs`) | 10s | TCP/TLS connect only | attempt fails over |
+| response headers (`upstream_response_header_timeout_secs`) | 1800s | the wait for the response head, never the body | attempt records `upstream_response_timeout` and fails over |
 | pre-output hold (`pre_output_hold_secs`, `pre_output_hold_bytes`) | 60s, 1 MiB | how long the first output is held back so a capacity failure can fail over | holding stops; streaming continues |
-| stream idle timeout (`stream_idle_timeout_secs`) | `0` = off | how long an established stream may produce nothing | the body ends with the terminal error event above |
+| stream idle timeout (`stream_idle_timeout_secs`) | 60s; `0` = off | the gap before the next chunk; resets on every chunk | the body ends with the terminal error event above |
 | graceful-shutdown drain | 5s | shutdown only | remaining requests are aborted and recorded `client_closed` |
 
 - The pre-output hold (`pre_output_hold_secs` / `pre_output_hold_bytes`) never fails a request. Its
@@ -70,10 +76,14 @@ other than killing the process.
   the tree bound non-inference work: catalog reads, the models.dev corpus, Codex reset and usage
   calls, and the CLI clients.
 - Every bound above is a key in `config.example.toml` with its default, so the whole timeout
-  surface is visible in one file (`upstream_connect_timeout_secs`, `pre_output_hold_secs`,
-  `pre_output_hold_bytes`, `stream_idle_timeout_secs`). The idle timeout is off by default.
-- The idle timeout is opt-in (`stream_idle_timeout_secs` / `UNDERCLASS_STREAM_IDLE_TIMEOUT_SECS`)
-  and ends the body per the section above rather than dropping the connection.
+  surface is visible in one file (`upstream_connect_timeout_secs`,
+  `upstream_response_header_timeout_secs`, `pre_output_hold_secs`, `pre_output_hold_bytes`,
+  `stream_idle_timeout_secs`). Both bounds with a `0`-means-off convention default to on, and the
+  header bound is applied with `tokio::time::timeout` around the send rather than as a `reqwest`
+  client timeout, so it cannot bound a body.
+- The idle timeout (`stream_idle_timeout_secs` / `UNDERCLASS_STREAM_IDLE_TIMEOUT_SECS`) ends the
+  body per the section above rather than dropping the connection. Turning it on by default changed
+  only *when* that existing path runs, not what it does.
 
 ## Consequences
 
