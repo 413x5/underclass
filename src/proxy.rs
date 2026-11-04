@@ -28,10 +28,10 @@ pub(crate) const PRE_OUTPUT_HOLD: std::time::Duration = std::time::Duration::fro
 /// Upper bound on bytes buffered while holding a stream before its first output.
 pub(crate) const PRE_OUTPUT_HOLD_BYTES: usize = 1024 * 1024;
 
-/// The bounds a streamed response is subject to. None of them bounds how long a response may
-/// take: `pre_output_hold` only decides how long the first output is held back for failover and
-/// expiry just starts forwarding, and `idle_timeout` is an operator opt-in that ends a dead
-/// stream cleanly instead of waiting forever.
+/// The bounds each attempt is subject to. None of them bounds how long a *response* may take:
+/// `pre_output_hold` only decides how long the first output is held back for failover and expiry
+/// just starts forwarding, `header_timeout` covers only the wait for the response head, and
+/// `idle_timeout` covers only the gap between body chunks. A long but active response is never cut.
 #[derive(Clone, Debug)]
 pub struct StreamTuning {
     /// How long to hold a stream before its first output while failover is still possible.
@@ -39,8 +39,14 @@ pub struct StreamTuning {
     /// How many bytes may be buffered while holding a stream before its first output.
     pub pre_output_hold_bytes: usize,
     /// How long an established stream may produce nothing at all before it is ended with a
-    /// terminal error event. `None` (the default) never ends a stream for being quiet.
+    /// terminal error event. `None` never ends a stream for being quiet. The timer wraps one
+    /// `next()` call and resets on every chunk, so it bounds the silence *between chunks*, not the
+    /// body's total time.
     pub idle_timeout: Option<std::time::Duration>,
+    /// How long one attempt may wait for upstream response headers. It covers only the head:
+    /// wrapping the send this way leaves the body untouched, which a whole-request timeout would
+    /// not. `None` disables the bound.
+    pub header_timeout: Option<std::time::Duration>,
 }
 
 impl Default for StreamTuning {
@@ -48,7 +54,12 @@ impl Default for StreamTuning {
         Self {
             pre_output_hold: PRE_OUTPUT_HOLD,
             pre_output_hold_bytes: PRE_OUTPUT_HOLD_BYTES,
-            idle_timeout: None,
+            idle_timeout: Some(std::time::Duration::from_secs(
+                crate::config::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+            )),
+            header_timeout: Some(std::time::Duration::from_secs(
+                crate::config::DEFAULT_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+            )),
         }
     }
 }
@@ -396,11 +407,221 @@ fn saturated_response(until_ms: i64) -> Response {
     resp
 }
 
+/// @cc [owner:ghuntley,label:proxy] header-timeout-tells-the-client
+/// When no account produced an upstream response and at least one attempt hit the response-header
+/// bound, the request MUST answer `504` carrying the stable code `upstream_response_timeout` in the
+/// existing error envelope, not a generic `pool_exhausted` failure, so the client's error and the
+/// usage row it joins on name the same condition.
+fn header_timeout_response() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        axum::Json(serde_json::json!({
+            "error": {
+                "message": "upstream sent no response headers within the configured bound; retry the request",
+                "type": crate::usage::UPSTREAM_RESPONSE_TIMEOUT,
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn attach_request_id(mut resp: Response, request_id: &str) -> Response {
     if let Ok(v) = http::HeaderValue::from_str(request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
     resp
+}
+
+/// Where one attempt was in its life when it stopped, as far as this guard can see. Everything
+/// after the upstream's response head is covered by `UsageFinish` and the per-body logging, so the
+/// guard deliberately stops watching there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptStage {
+    /// Waiting for the account's access token (a refresh can block on the issuer). The upstream was
+    /// never contacted, so a request that ends here never reached it at all.
+    Token,
+    /// Waiting for the upstream's response headers.
+    AwaitingHeaders,
+}
+
+impl AttemptStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::AwaitingHeaders => "awaiting_headers",
+        }
+    }
+}
+
+/// How an attempt stopped being watched. Every variant except none means the guard must stay
+/// silent, because something else already recorded the end of this attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptEnd {
+    /// The upstream's response head arrived: `request.completed`, `upstream.network_error`,
+    /// `usage.recorded`, and `stream.finished` cover what happens next.
+    Covered,
+    /// The header bound expired; `upstream.headers_timeout` was logged explicitly.
+    HeaderTimeout,
+    /// The attempt failed for a reason it logged itself (`token.*`, `upstream.network_error`).
+    Failed,
+}
+
+/// What a guard reports when an attempt stops without ever getting upstream response headers. It is
+/// a plain value so the decision can be tested apart from tracing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttemptAbandon {
+    stage: &'static str,
+    reason: &'static str,
+    elapsed_ms: u64,
+}
+
+/// @cc [owner:ghuntley,label:logging] attempt-abandonment-visible
+/// An attempt that starts waiting for upstream response headers MUST log `request.awaiting_headers`
+/// first, and MUST emit exactly one `request.abandoned` line whenever it ends without that head
+/// arriving - whether the attempt returned, errored, or its future was dropped by a client abort,
+/// cancellation, or shutdown. The line MUST carry `stage`, `reason`, `attempt`, `cache_key`, and
+/// `elapsed_ms`.
+///
+/// It MUST NOT emit that line when the upstream's response head arrived (existing logging covers
+/// the attempt), when the attempt failed for a reason it already logged, or when the header bound
+/// expired (that path logs `upstream.headers_timeout` instead). It MUST never log request bodies,
+/// prompts, tokens, or credentials.
+struct AttemptWatch {
+    request_id: String,
+    attempt: u32,
+    cache_key: String,
+    model: String,
+    upstream_model: String,
+    endpoint: String,
+    backend: String,
+    account_id: String,
+    label: Option<String>,
+    started: Instant,
+    stage: AttemptStage,
+    ended: Option<AttemptEnd>,
+}
+
+impl AttemptWatch {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        req: &AttemptRequest<'_>,
+        attempt: u32,
+        upstream_model: &str,
+        selection: &Selection,
+        label: Option<&str>,
+    ) -> Self {
+        Self {
+            request_id: req.request_id.to_string(),
+            attempt,
+            cache_key: req.sticky.unwrap_or("none").to_string(),
+            model: req.model.to_string(),
+            upstream_model: upstream_model.to_string(),
+            endpoint: req.endpoint.to_string(),
+            backend: selection.backend.as_str().to_string(),
+            account_id: selection.account_id.clone(),
+            label: label.map(str::to_string),
+            started: Instant::now(),
+            stage: AttemptStage::Token,
+            ended: None,
+        }
+    }
+
+    /// The start mark, and the transition to awaiting the upstream's response head.
+    fn awaiting_headers(&mut self) {
+        self.stage = AttemptStage::AwaitingHeaders;
+        logging::log_request_awaiting_headers(
+            &self.request_id,
+            self.attempt,
+            &self.cache_key,
+            &self.model,
+            &self.upstream_model,
+            &self.endpoint,
+            &self.backend,
+            &self.account_id,
+            self.label.as_deref(),
+        );
+    }
+
+    /// Stops watching: every end this crate knows about is either covered by other logging or
+    /// logged explicitly, so this is the only way to avoid a duplicate line.
+    fn finish(&mut self, end: AttemptEnd) {
+        self.ended = Some(end);
+    }
+
+    /// The terminal line this guard would emit, or `None` when it must stay silent.
+    ///
+    /// Reaching here with no recorded end means the attempt's future stopped being polled without
+    /// this crate observing any outcome: the client went away, the request was cancelled, or the
+    /// server shut down. `stage` then separates the two cases an operator cares about - before the
+    /// send nothing upstream was contacted, and while awaiting headers the upstream had sent
+    /// nothing back - which is why the two reasons are distinguishable at all.
+    fn abandonment(&self) -> Option<AttemptAbandon> {
+        if self.ended.is_some() {
+            return None;
+        }
+        let (stage, reason) = match self.stage {
+            AttemptStage::Token => (self.stage.as_str(), "client_aborted"),
+            AttemptStage::AwaitingHeaders => (self.stage.as_str(), "upstream_silent"),
+        };
+        Some(AttemptAbandon {
+            stage,
+            reason,
+            elapsed_ms: self.started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+impl Drop for AttemptWatch {
+    fn drop(&mut self) {
+        let Some(abandon) = self.abandonment() else {
+            return;
+        };
+        logging::log_request_abandoned(
+            &self.request_id,
+            self.attempt,
+            &self.cache_key,
+            &self.model,
+            &self.upstream_model,
+            &self.endpoint,
+            &self.backend,
+            &self.account_id,
+            self.label.as_deref(),
+            abandon.stage,
+            abandon.reason,
+            abandon.elapsed_ms,
+        );
+    }
+}
+
+/// How one bounded wait ended. `TimedOut` is deliberately distinct from `Transport`, because the
+/// two are different conditions for an operator and for accounting.
+enum Bounded<T, E> {
+    Value(T),
+    Transport(E),
+    TimedOut,
+}
+
+/// @cc [owner:ghuntley,label:proxy] response-header-bound-covers-the-head-only
+/// `send_bounded` MUST apply `limit` around the future that resolves at the upstream's response
+/// head and MUST NOT bound the response body, so a slow body after prompt headers is never cut.
+/// `None` MUST await the send with no bound at all. Expiry MUST be reported as `TimedOut` rather
+/// than as a transport error, so the caller can log it as its own condition instead of a failed
+/// connection.
+async fn send_bounded<F, T, E>(send: F, limit: Option<std::time::Duration>) -> Bounded<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let Some(limit) = limit else {
+        return match send.await {
+            Ok(value) => Bounded::Value(value),
+            Err(error) => Bounded::Transport(error),
+        };
+    };
+    match tokio::time::timeout(limit, send).await {
+        Ok(Ok(value)) => Bounded::Value(value),
+        Ok(Err(error)) => Bounded::Transport(error),
+        Err(_) => Bounded::TimedOut,
+    }
 }
 
 enum Attempt {
@@ -416,6 +637,9 @@ enum Attempt {
     /// transient credential failure); skip it for the rest of the request rather than re-selecting
     /// it, which a sticky binding would otherwise guarantee.
     Excluded(String),
+    /// This attempt waited for upstream response headers past the configured bound. Distinguished
+    /// from a plain failover so a request no account can serve is told *why* it failed.
+    HeaderTimedOut,
 }
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
@@ -571,6 +795,9 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             .max(1)
     };
     let mut last_upstream: Option<Response> = None;
+    // Whether any attempt hit the response-header bound. Only used to explain a request no account
+    // could serve: the client gets `upstream_response_timeout` rather than a generic failure.
+    let mut header_timed_out = false;
     let mut refreshed: std::collections::HashSet<String> = Default::default();
     let mut reset_after_quota = false;
     let mut attempts = 0;
@@ -632,7 +859,6 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             );
             return attach_request_id(replay, &request_id);
         }
-
         if codex_resets
             && matches!(selection, Err(SelectError::Saturated { .. }))
             && !reset_after_quota
@@ -702,7 +928,17 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         }
 
         let upstream_model = selection.concrete_model.clone();
-        match attempt_account(&state, &req, &upstream_model, &selection, &mut refreshed).await {
+        match attempt_account(
+            &state,
+            &req,
+            // `attempts` was incremented at the top of this iteration, so this is 1-based.
+            attempts as u32,
+            &upstream_model,
+            &selection,
+            &mut refreshed,
+        )
+        .await
+        {
             Attempt::Respond(resp) => {
                 logging::log_request_completed(
                     &request_id,
@@ -718,6 +954,9 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             Attempt::Excluded(account_id) => {
                 deferred.lock().unwrap().insert(account_id.clone());
                 overloaded.insert(account_id);
+            }
+            Attempt::HeaderTimedOut => {
+                header_timed_out = true;
             }
             Attempt::Failover(passthrough) => {
                 last_upstream = passthrough.or(last_upstream);
@@ -745,16 +984,23 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         return attach_request_id(saturated_response(until_ms), &request_id);
     }
 
-    attach_request_id(
-        last_upstream.take().unwrap_or_else(|| {
+    let response = last_upstream.take().unwrap_or_else(|| {
+        if header_timed_out {
+            header_timeout_response()
+        } else {
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "pool exhausted: every subscription attempt failed",
                 "pool_exhausted",
             )
-        }),
+        }
+    });
+    logging::log_request_completed(
         &request_id,
-    )
+        response.status().as_u16(),
+        started.elapsed().as_millis() as u64,
+    );
+    attach_request_id(response, &request_id)
 }
 
 /// @cc [owner:ghuntley,label:proxy] affinity-restored-after-deferral
@@ -818,9 +1064,12 @@ struct AttemptRequest<'a> {
 /// was ever received). An upstream 401 or 403 MUST trigger exactly one forced token refresh and one
 /// same-account retry per request; a second 401 or 403 (or a failed refresh) MUST classify the
 /// account `AuthFailed` and fail over.
+/// `attempt` is this attempt's 1-based position in the request's failover chain, and is what the
+/// observability lines carry so N selections can be read as one logical call.
 async fn attempt_account(
     state: &Arc<AppState>,
     req: &AttemptRequest<'_>,
+    attempt: u32,
     upstream_model: &str,
     selection: &Selection,
     refreshed: &mut std::collections::HashSet<String>,
@@ -858,6 +1107,9 @@ async fn attempt_account(
         pool: state.pool.clone(),
         account_id: selection.account_id.clone(),
     };
+    // Watches this attempt until the upstream's response head arrives. Dropping it while it is
+    // still waiting is the only record a request that never gets headers would otherwise leave.
+    let mut watch = AttemptWatch::new(req, attempt, upstream_model, selection, label);
 
     let token = match state.tokens.access_token(&account).await {
         Ok(token) => token,
@@ -866,6 +1118,7 @@ async fn attempt_account(
         Err(e @ crate::tokens::TokenError::Transient(_)) => {
             tracing::warn!(request_id = %request_id, error = %e, "token.transient");
             report_outcome(state, &selection.account_id, Outcome::Transient);
+            watch.finish(AttemptEnd::Failed);
             drop(guard);
             // Exclude the account for the rest of the request. A sticky binding still points at
             // it, so without this the next iteration would re-select it and re-post the exact
@@ -881,6 +1134,7 @@ async fn attempt_account(
                 "auth_error",
                 "missing or unusable credential",
             );
+            watch.finish(AttemptEnd::Failed);
             drop(guard);
             return Attempt::Failover(None);
         }
@@ -967,26 +1221,68 @@ async fn attempt_account(
         fallback_body = fallback;
     }
 
-    let mut response = match state
-        .client
-        .post(&url)
-        .headers(headers.clone())
-        .body(outbound_bytes)
-        .send()
-        .await
+    // The start mark, and the only place a request that never gets headers begins its clock.
+    watch.awaiting_headers();
+    let mut response = match send_bounded(
+        state
+            .client
+            .post(&url)
+            .headers(headers.clone())
+            .body(outbound_bytes)
+            .send(),
+        state.stream_tuning.header_timeout,
+    )
+    .await
     {
-        Ok(resp) => resp,
-        Err(e) => {
+        Bounded::Value(resp) => resp,
+        Bounded::Transport(e) => {
             tracing::warn!(request_id = %request_id, error = %e, backend = %selection.backend.as_str(), "upstream.network_error");
             let record = usage_record(
                 request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
             );
             persist_usage(&state.store, &record);
             report_outcome(state, &selection.account_id, Outcome::Transient);
+            watch.finish(AttemptEnd::Failed);
             drop(guard);
             return Attempt::Failover(None);
         }
+        Bounded::TimedOut => {
+            // The configured bound expired: a deliberate decision by the proxy, logged under its
+            // own event so it is never confused with a client that walked away.
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let limit_ms = state
+                .stream_tuning
+                .header_timeout
+                .map(|limit| limit.as_millis() as u64)
+                .unwrap_or(0);
+            logging::log_upstream_headers_timeout(
+                request_id,
+                attempt,
+                sticky.unwrap_or("none"),
+                selection.backend.as_str(),
+                &selection.account_id,
+                label,
+                endpoint,
+                watch.stage.as_str(),
+                elapsed_ms,
+                limit_ms,
+            );
+            let mut record = usage_record(
+                request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
+            );
+            record.error_code = Some(crate::usage::UPSTREAM_RESPONSE_TIMEOUT.to_string());
+            persist_usage(&state.store, &record);
+            report_outcome(state, &selection.account_id, Outcome::Transient);
+            watch.finish(AttemptEnd::HeaderTimeout);
+            drop(guard);
+            // No upstream response was ever received, so there is nothing to pass through; the
+            // request fails over like any other attempt that produced no response.
+            return Attempt::HeaderTimedOut;
+        }
     };
+    // The upstream's response head arrived. From here `UsageFinish` and the per-attempt logging
+    // own this attempt's record, so the guard must not add an abandonment line.
+    watch.finish(AttemptEnd::Covered);
 
     if auto_usage && matches!(response.status().as_u16(), 400 | 422) {
         let status = response.status();
@@ -1011,23 +1307,59 @@ async fn attempt_account(
             tracing::warn!(request_id = %request_id, backend = %selection.backend.as_str(), "usage.stream_option_unsupported");
             let retry_bytes =
                 serde_json::to_vec(&fallback_body).unwrap_or_else(|_| body_bytes.to_vec());
-            response = match state
-                .client
-                .post(&url)
-                .headers(headers)
-                .body(retry_bytes)
-                .send()
-                .await
+            response = match send_bounded(
+                state
+                    .client
+                    .post(&url)
+                    .headers(headers)
+                    .body(retry_bytes)
+                    .send(),
+                state.stream_tuning.header_timeout,
+            )
+            .await
             {
-                Ok(resp) => resp,
-                Err(error) => {
+                Bounded::Value(resp) => resp,
+                Bounded::Transport(error) => {
                     tracing::warn!(request_id = %request_id, error = %error, "upstream.network_error");
                     let record = usage_record(
                         request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
                     );
                     persist_usage(&state.store, &record);
+                    watch.finish(AttemptEnd::Failed);
                     drop(guard);
                     return Attempt::Failover(None);
+                }
+                Bounded::TimedOut => {
+                    // The retry's own head is bounded the same way; the first response's head had
+                    // already arrived, so this is still waiting on the upstream rather than
+                    // anything the proxy decided.
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let limit_ms = state
+                        .stream_tuning
+                        .header_timeout
+                        .map(|limit| limit.as_millis() as u64)
+                        .unwrap_or(0);
+                    logging::log_upstream_headers_timeout(
+                        request_id,
+                        attempt,
+                        sticky.unwrap_or("none"),
+                        selection.backend.as_str(),
+                        &selection.account_id,
+                        label,
+                        endpoint,
+                        watch.stage.as_str(),
+                        elapsed_ms,
+                        limit_ms,
+                    );
+                    let mut record = usage_record(
+                        request_id, endpoint, model, sticky, selection, &account, 0, started_ms,
+                    );
+                    record.error_code = Some(crate::usage::UPSTREAM_RESPONSE_TIMEOUT.to_string());
+                    persist_usage(&state.store, &record);
+                    report_outcome(state, &selection.account_id, Outcome::Transient);
+                    watch.finish(AttemptEnd::HeaderTimeout);
+                    drop(guard);
+                    return Attempt::HeaderTimedOut;
                 }
             };
         } else {
@@ -2164,6 +2496,295 @@ mod tests {
         let text = runtime.block_on(drain(body(vec![failure()], UsageDialect::Chat)));
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains(UPSTREAM_STREAM_ERROR), "{text}");
+    }
+
+    /// The case this change exists for: an attempt whose future is dropped while it is still
+    /// waiting for upstream response headers. The guard fires on drop without any explicit call,
+    /// which is what makes a request nobody finished visible instead of silent.
+    #[test]
+    fn dropping_an_attempt_that_never_got_headers_reports_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::<AttemptAbandon>::new()));
+        let sink = reported.clone();
+        runtime.block_on(async move {
+            let watch = AttemptWatch {
+                request_id: "req-dropped".into(),
+                attempt: 1,
+                cache_key: "session-1".into(),
+                model: "m".into(),
+                upstream_model: "m".into(),
+                endpoint: "/v1/responses".into(),
+                backend: "codex".into(),
+                account_id: "acct-a".into(),
+                label: Some("a@example.com".into()),
+                started: Instant::now(),
+                stage: AttemptStage::AwaitingHeaders,
+                ended: None,
+            };
+            // Stand in for the client walking away: the attempt's future is never polled again.
+            let mut pending: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Box::pin(std::future::pending());
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(5), &mut pending).await;
+            let abandon = watch.abandonment().expect("a dropped attempt is reported");
+            sink.lock().unwrap().push(abandon);
+        });
+        let reported = reported.lock().unwrap();
+        assert_eq!(reported.len(), 1, "exactly one terminal report");
+        assert_eq!(reported[0].stage, "awaiting_headers");
+        assert_eq!(reported[0].reason, "upstream_silent");
+        assert!(reported[0].elapsed_ms > 0, "the elapsed time is non-zero");
+    }
+
+    /// Two dropped attempts in a row are logged separately and fall in different stages: the
+    /// first stopped before the upstream was contacted, the second while waiting for its head.
+    #[test]
+    fn two_abandoned_attempts_are_distinguishable_by_stage_and_attempt_number() {
+        let first = AttemptWatch {
+            request_id: "req-dup".into(),
+            attempt: 1,
+            cache_key: "none".into(),
+            model: "m".into(),
+            upstream_model: "m".into(),
+            endpoint: "/v1/responses".into(),
+            backend: "codex".into(),
+            account_id: "acct-a".into(),
+            label: Some("a@example.com".into()),
+            started: Instant::now(),
+            stage: AttemptStage::Token,
+            ended: None,
+        };
+        let first = first.abandonment().expect("a dropped attempt is reported");
+        assert_eq!(first.stage, "token");
+        assert_eq!(first.reason, "client_aborted");
+
+        let mut second = AttemptWatch {
+            request_id: "req-dup".into(),
+            attempt: 2,
+            cache_key: "none".into(),
+            model: "m".into(),
+            upstream_model: "m".into(),
+            endpoint: "/v1/responses".into(),
+            backend: "codex".into(),
+            account_id: "acct-b".into(),
+            label: Some("b@example.com".into()),
+            started: Instant::now(),
+            stage: AttemptStage::Token,
+            ended: None,
+        };
+        second.awaiting_headers();
+        // `awaiting_headers` only emits the start mark; the guard still reports on drop.
+        let second = second.abandonment().expect("a silent upstream is reported");
+        assert_eq!(second.stage, "awaiting_headers");
+        assert_eq!(second.reason, "upstream_silent");
+    }
+
+    /// Once the upstream has failed for a reason it logged itself, dropping the guard must stay
+    /// silent: the attempt already has a line.
+    #[test]
+    fn an_attempt_that_already_failed_is_not_reported_twice() {
+        let mut watch = AttemptWatch {
+            request_id: "req-failed".into(),
+            attempt: 1,
+            cache_key: "none".into(),
+            model: "m".into(),
+            upstream_model: "m".into(),
+            endpoint: "/v1/responses".into(),
+            backend: "codex".into(),
+            account_id: "acct-a".into(),
+            label: None,
+            started: Instant::now(),
+            stage: AttemptStage::AwaitingHeaders,
+            ended: None,
+        };
+        watch.finish(AttemptEnd::Failed);
+        assert!(watch.abandonment().is_none());
+    }
+
+    /// The start of an attempt is recorded before anything can hide it, and the elapsed time on a
+    /// reported abandonment is measured from it rather than computed at drop.
+    #[test]
+    fn an_abandonment_carries_the_elapsed_time_since_the_attempt_started() {
+        let watch = AttemptWatch {
+            request_id: "req-time".into(),
+            attempt: 1,
+            cache_key: "none".into(),
+            model: "m".into(),
+            upstream_model: "m".into(),
+            endpoint: "/v1/responses".into(),
+            backend: "codex".into(),
+            account_id: "acct-a".into(),
+            label: None,
+            started: Instant::now() - std::time::Duration::from_millis(857_000),
+            stage: AttemptStage::AwaitingHeaders,
+            ended: None,
+        };
+        let abandon = watch.abandonment().expect("reported");
+        assert!(
+            abandon.elapsed_ms >= 856_000,
+            "the 857s gap must be visible: {}",
+            abandon.elapsed_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_resolves_inside_the_bound_is_untouched() {
+        let outcome: Bounded<&'static str, &'static str> = send_bounded(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Ok("headers")
+            },
+            Some(std::time::Duration::from_millis(500)),
+        )
+        .await;
+        assert!(matches!(outcome, Bounded::Value("headers")));
+    }
+
+    #[tokio::test]
+    async fn a_configured_header_bound_expires_as_a_timeout_not_a_transport_error() {
+        let started = Instant::now();
+        let outcome: Bounded<&'static str, &'static str> = send_bounded(
+            std::future::pending(),
+            Some(std::time::Duration::from_millis(20)),
+        )
+        .await;
+        assert!(matches!(outcome, Bounded::TimedOut));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_zero_header_bound_means_no_bound_at_all() {
+        // `None` (what a resolved `0` becomes) awaits the send unbounded: a slow head is delivered
+        // rather than cut, exactly as before this bound existed.
+        let outcome: Bounded<&'static str, &'static str> = send_bounded(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                Ok("headers")
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, Bounded::Value("headers")));
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_is_still_reported_as_one() {
+        let outcome: Bounded<&'static str, &'static str> = send_bounded(
+            async { Err("reset") },
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        assert!(matches!(outcome, Bounded::Transport("reset")));
+    }
+
+    /// A body over an arbitrary chunk stream, with the mid-body idle bound under test.
+    fn body_with(
+        stream: futures::stream::BoxStream<'static, UpstreamChunk>,
+        dialect: UsageDialect,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> StreamBody {
+        let mut body = body(Vec::new(), dialect);
+        body.stream = stream;
+        body.idle_timeout = idle_timeout;
+        body
+    }
+
+    /// One delta, then complete silence: what an upstream that stopped talking mid-body looks like.
+    fn one_chunk_then_silence(
+        text: &'static str,
+    ) -> futures::stream::BoxStream<'static, UpstreamChunk> {
+        futures::stream::iter(vec![chunk(text)])
+            .chain(futures::stream::pending())
+            .boxed()
+    }
+
+    /// A stream that keeps emitting past the idle bound, so the per-chunk timer must reset.
+    fn steady_stream(
+        count: u32,
+        gap: std::time::Duration,
+    ) -> futures::stream::BoxStream<'static, UpstreamChunk> {
+        futures::stream::unfold(0u32, move |step| async move {
+            if step == count {
+                return None;
+            }
+            tokio::time::sleep(gap).await;
+            Some((
+                chunk("data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n"),
+                step + 1,
+            ))
+        })
+        .boxed()
+    }
+
+    /// Silence longer than the bound ends the body with exactly one terminal error event, and the
+    /// body still frames completely - the #30 regression must not come back through this path.
+    #[tokio::test]
+    async fn silence_past_the_idle_bound_ends_the_body_cleanly() {
+        let out = drain(body_with(
+            one_chunk_then_silence(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ),
+            UsageDialect::Responses,
+            Some(std::time::Duration::from_millis(30)),
+        ))
+        .await;
+        let text = String::from_utf8(out).expect("the body is complete utf-8");
+        assert!(text.contains("partial"), "{text}");
+        assert_eq!(
+            text.matches(UPSTREAM_STREAM_ERROR).count(),
+            1,
+            "exactly one terminal error event: {text}"
+        );
+        assert!(
+            text.ends_with("\n\n"),
+            "the last frame is terminated: {text:?}"
+        );
+    }
+
+    /// The timer wraps one `next()` call and resets on every chunk, so a stream that is long but
+    /// active is never cut.
+    #[tokio::test]
+    async fn an_active_stream_is_never_cut_by_the_idle_bound() {
+        // Twelve 10ms gaps: well over the 60ms bound in total, never near it in one gap.
+        let out = drain(body_with(
+            steady_stream(12, std::time::Duration::from_millis(10)),
+            UsageDialect::Responses,
+            Some(std::time::Duration::from_millis(60)),
+        ))
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("\"delta\":\"x\"").count(), 12, "{text}");
+        assert!(!text.contains(UPSTREAM_STREAM_ERROR), "{text}");
+    }
+
+    /// `0` disables the bound: silence longer than any small bound is delivered, and the stream
+    /// completes on its own terms.
+    #[tokio::test]
+    async fn a_disabled_idle_bound_lets_a_quiet_stream_finish() {
+        let stream = futures::stream::unfold(0u32, |step| async move {
+            match step {
+                0 => Some((
+                    chunk("data: {\"type\":\"response.output_text.delta\",\"delta\":\"slow\"}\n\n"),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    Some((
+                        chunk("data: {\"type\":\"response.completed\",\"response\":{}}\n\n"),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .boxed();
+        let out = drain(body_with(stream, UsageDialect::Responses, None)).await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("slow"), "{text}");
+        assert!(text.contains("response.completed"), "{text}");
+        assert!(!text.contains(UPSTREAM_STREAM_ERROR), "{text}");
     }
 
     #[test]

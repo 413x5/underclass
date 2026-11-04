@@ -190,16 +190,39 @@ A blank `cache key` means the client sent no `prompt_cache_key`, not that prompt
 
 ### Long requests, timeouts, and stream failures
 
-Nothing on the inference path has a wall-clock deadline. A long review runs for as long as the
-upstream keeps producing: there is no request deadline and no read deadline, and no inference
-request carries a per-request HTTP timeout. What is bounded is only startup and holding:
+There is no total request deadline. A long review runs for as long as the upstream keeps producing:
+no request deadline, no read deadline, and no inference request carries a per-request HTTP
+timeout. Three bounds cover the *edges* of one attempt, and each one is `0` to turn off:
 
-| bound | value | what it bounds | on expiry |
+| bound | default | what it bounds | on expiry |
 |---|---|---|---|
-| upstream connect (`upstream_connect_timeout_secs`) | 10s | TCP/TLS connect | the attempt fails over |
+| upstream connect (`upstream_connect_timeout_secs`) | 10s | TCP/TLS connect only | the attempt fails over |
+| response headers (`upstream_response_header_timeout_secs`) | 1800s | the wait for the upstream's response **head**, never the body | the attempt ends as `upstream_response_timeout` and fails over |
+| mid-body silence (`stream_idle_timeout_secs`) | 60s | the gap before the **next chunk**, reset on every chunk — not the body's total time | the body ends with one terminal error event |
 | pre-output hold (`pre_output_hold_secs` / `pre_output_hold_bytes`) | 60s / 1 MiB | how long output is held back so a capacity failure can still fail over | holding stops and streaming continues — never a failure |
-| stream idle timeout (`stream_idle_timeout_secs`) | `0` = off | how long an established stream may send nothing at all | the body ends with the terminal error event below |
 | shutdown drain | 5s | graceful restart only | remaining requests abort, recorded `client_closed` |
+
+The two defaults are deliberate and nest above a client's own patience rather than inside it:
+
+- **Mid-body silence, 60s.** A healthy stream emits deltas continuously — reasoning deltas
+  included — so a minute of *complete* silence mid-body means the upstream has stopped talking
+  rather than being slow. The timer wraps one `next()` call, so a long but active response is never
+  cut.
+- **Response headers, 1800s.** This sits above a client's own wait (the review bundle uses
+  `ai_timeout=1500`), so it never races the client's decision: it is a leak backstop for a request
+  nobody is waiting for any more, not a policy on how long generation may take. Lowering it toward
+  the client's timeout turns it into one. It is applied with `tokio::time::timeout` around the send,
+  never as a `reqwest` client timeout — that would bound the body too and re-create the premature
+  cut fixed in [#30](https://github.com/413x5/underclass/pull/30). If no account can produce an
+  upstream response at all, the request answers `504` carrying the same `upstream_response_timeout`
+  code its usage row does:
+
+  ```
+  {"error":{"message":"upstream sent no response headers within the configured bound; retry the request","type":"upstream_response_timeout"}}
+  ```
+
+A non-streaming completion is not covered by the mid-body bound, because it has no body to observe
+until the head arrives; the header bound is what covers that wait.
 
 If the upstream fails after the response has started, the client's body is never truncated. The
 proxy emits exactly one terminal error event in the protocol the client is speaking, using the
@@ -216,6 +239,37 @@ Anthropic surface receives `{"type":"error","error":{"type":"upstream_stream_err
 translated `/v1/responses` stream keeps its single `response.failed` terminal event instead. The
 usage row for the attempt records the same code, so a client's report and the server's accounting
 agree. See [Stream Failures and Timeouts](docs/adr/fork/stream-failure-and-timeouts.md).
+
+### Watching an attempt that never gets upstream headers
+
+An attempt logs `request.selected`, then `request.awaiting_headers` when it begins waiting for the
+upstream's response head (fields: `request_id`, `attempt`, `cache_key`, `model`, `upstream_model`,
+`endpoint`, `backend`, `account`, `account_id`). `attempt` is the attempt's 1-based position in this
+request's failover chain, and `cache_key` is the client's own session key — the identity that joins
+separate requests belonging to one logical call, since transport-level retries arrive as new
+requests.
+
+Everything after the head arrives is already covered by `request.completed`, `upstream.network_error`,
+`usage.recorded`, and `stream.finished`. The one case that used to be silent is an attempt that
+never reaches the head and is abandoned — the client goes away, the request is cancelled, or the
+server shuts down. That case now logs exactly one terminal line, emitted from a `Drop` guard so it
+fires however the attempt ends:
+
+```json
+{"level":"WARN","message":"request.abandoned","request_id":"…","attempt":1,"cache_key":"…","stage":"awaiting_headers","reason":"upstream_silent","elapsed_ms":857004,…}
+```
+
+- `stage` says where the attempt was: `token` (the upstream was never contacted) or
+  `awaiting_headers`.
+- `reason` distinguishes the causes: `upstream_silent` (still waiting for headers — the case that
+  used to vanish), `client_aborted` (the future was dropped before the upstream was contacted), or
+  `header_timeout` (the configured bound expired; that path also logs `upstream.headers_timeout`
+  with the limit).
+- The line is **not** emitted when the attempt completed normally or failed for a reason it already
+  logged, so an attempt is never reported twice.
+
+No timeout was added by this instrumentation: it observes and names what happens, it does not decide
+it. See [Watching Abandoned Requests](docs/adr/fork/abandoned-request-observability.md).
 
 ### Correlation with preflight
 

@@ -65,10 +65,15 @@ auto_codex_resets = true
 # Timeouts - what is bounded, and what deliberately is not
 # --------------------------------------------------------------------------------------------
 #
-# Nothing here bounds how long a response may take. A long review runs for as long as the upstream
-# keeps producing: there is no request deadline and no read deadline, and no inference request
-# carries a per-request HTTP timeout.
+# There is no total request deadline: a long review runs for as long as the upstream keeps
+# producing. Three bounds cover the edges of one attempt, and they nest:
 #
+#   connect 10s  <  response headers 1800s  <  no total deadline
+#                              ^
+#                              +- mid-body idle 60s starts once the body is flowing
+#
+# Each of them fails the *attempt*, never a healthy response, and each is `0` to turn off.
+
 # If the upstream fails after the response has started, underclass ends the client's body cleanly
 # with exactly one terminal error event (code `upstream_stream_error`) instead of truncating the
 # frame. A stream the upstream sends nothing on for `stream_idle_timeout_secs` is ended the same
@@ -78,6 +83,16 @@ auto_codex_resets = true
 # Bounds only the start of an attempt, never the response. Env: UNDERCLASS_UPSTREAM_CONNECT_TIMEOUT_SECS
 upstream_connect_timeout_secs = 10
 
+# Seconds an attempt may wait for the upstream's response HEADERS. The timer covers everything up
+# to the response head and never the body, so a slow body after prompt headers is left alone.
+#
+# This value is deliberately ABOVE a client's own wait - the review bundle sets ai_timeout=1500 -
+# so it never races the client's decision. It is a leak backstop for a request nobody is waiting
+# for any more, not a policy on how long generation may take. Lowering it toward the client's
+# timeout turns it into one. 0 disables it.
+# Env: UNDERCLASS_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS
+upstream_response_header_timeout_secs = 1800
+
 # Seconds a streamed response's first output is held back so a capacity failure can still fail
 # over to another account. Expiry is NOT a failure: holding stops and the response streams on, so a
 # slow first token is delivered rather than cut. Env: UNDERCLASS_PRE_OUTPUT_HOLD_SECS
@@ -86,11 +101,16 @@ pre_output_hold_secs = 60
 # Bytes that may be buffered during that hold. Env: UNDERCLASS_PRE_OUTPUT_HOLD_BYTES
 pre_output_hold_bytes = 1048576
 
-# Seconds an established stream may send nothing at all before it is ended with a terminal error
-# event. 0 (the default) never ends a stream for being quiet - set it only if you want a dead
-# upstream ended sooner than the client's own read timeout would.
+# Seconds an established stream may send NOTHING AT ALL - the gap before the next chunk - before
+# it is ended with a terminal error event. The clock resets on every chunk, so this bounds the
+# silence between deltas, not the response's total time; a long but active stream is never cut.
+#
+# 60s of complete silence mid-body means the upstream has stopped talking rather than being slow,
+# because a healthy stream emits deltas continuously (reasoning deltas included). The legitimate
+# long-silence case - a non-streaming completion waiting before its first byte - is covered by
+# `upstream_response_header_timeout_secs` instead, not by this one. 0 disables it.
 # Env: UNDERCLASS_STREAM_IDLE_TIMEOUT_SECS
-stream_idle_timeout_secs = 0
+stream_idle_timeout_secs = 60
 
 # --------------------------------------------------------------------------------------------
 # Retention

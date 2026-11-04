@@ -36,6 +36,7 @@ fn copying_the_example_config_changes_no_resolved_setting() {
             "UNDERCLASS_AUTO_CODEX_RESETS",
             "UNDERCLASS_STATS_RETENTION_DAYS",
             "UNDERCLASS_STREAM_IDLE_TIMEOUT_SECS",
+            "UNDERCLASS_UPSTREAM_RESPONSE_HEADER_TIMEOUT_SECS",
             "UNDERCLASS_UPSTREAM_CONNECT_TIMEOUT_SECS",
             "UNDERCLASS_PRE_OUTPUT_HOLD_SECS",
             "UNDERCLASS_PRE_OUTPUT_HOLD_BYTES",
@@ -59,8 +60,16 @@ fn copying_the_example_config_changes_no_resolved_setting() {
     assert_eq!(cfg.vercel_cooldown_ms, 30 * 60 * 1000);
     assert!(cfg.auto_codex_resets);
     assert_eq!(cfg.stats_retention_days, 730);
-    // Unbounded by default: no idle deadline, and a hold that only decides when streaming starts.
-    assert!(cfg.stream_idle_timeout.is_none());
+    // No total deadline, but both edges of an attempt are bounded by default: the mid-body silence
+    // between chunks, and the wait for response headers.
+    assert_eq!(
+        cfg.stream_idle_timeout,
+        Some(std::time::Duration::from_secs(60))
+    );
+    assert_eq!(
+        cfg.upstream_response_header_timeout,
+        Some(std::time::Duration::from_secs(1800))
+    );
     assert_eq!(
         cfg.upstream_connect_timeout,
         std::time::Duration::from_secs(10)
