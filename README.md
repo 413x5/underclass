@@ -300,6 +300,48 @@ ClinePass set comes from its recommended-models feed and its specs from models.d
 which is advisory only - a failed models.dev read leaves the catalog exactly as it was. See
 [Model Metadata: Sources, Precedence, and What We Refuse to Copy](docs/adr/fork/model-metadata-sources.md).
 
+## Installing on macOS
+
+The Nix path below is the supported install on Linux. On macOS, `scripts/deploy_macos.sh` installs
+underclass from source and updates it afterwards, in either case through a launch agent:
+
+```sh
+scripts/deploy_macos.sh                 # fresh install, or update the installed copy
+scripts/deploy_macos.sh --dry-run       # fetch and report what it would do
+scripts/deploy_macos.sh --list          # list rollback points
+scripts/deploy_macos.sh --rollback      # restore the newest one
+scripts/deploy_macos.sh --rollback REV  # restore the point recorded for that revision
+```
+
+It detects a fresh install rather than being told: no binary or no launch agent means build,
+install, write the agent in `~/Library/LaunchAgents`, load it and verify health; anything else is
+an update, which records a rollback point (previous binary, a consistent `pool.db` snapshot and a
+manifest under `~/.local/share/underclass/releases/`) before installing, builds before touching the
+service, and restarts with a proven pid change plus a `200` from `/v1/models`. Every run also
+installs `config.example.toml` beside your live config so you can diff the reference against your
+own `~/.config/underclass/config.toml`; that file is created only when it is missing or empty and is
+never overwritten.
+
+`scripts/migrate_db.sh` is the companion migration runner, and it is OS-neutral: it needs `sqlite3`,
+plus `lsof` for the guard that refuses to rewrite a database a daemon still holds (on a host without
+`lsof`, stop the underclass service and set `MIGRATE_ASSUME_NO_WRITER=1`). It never invokes a
+service manager, so it works the same on macOS and Linux. It applies the one-shot data rewrites a `pool.db` needs across a rename,
+registered in order and all inside one transaction, with an online-backup safety copy first. No
+migration is registered today; it exists so the next data rewrite is an entry in its registry
+rather than a new script and a new procedure:
+
+```sh
+scripts/migrate_db.sh --list            # registered migrations and which are pending
+scripts/migrate_db.sh --check           # exit 0 when nothing is pending, 1 when something is
+scripts/migrate_db.sh --dry-run         # report what would change; write nothing
+scripts/migrate_db.sh --restore         # restore the newest backup it made
+```
+
+`deploy_macos.sh` runs it automatically when `--check` reports pending work, with the daemon
+stopped. No migration is registered today. Adding one is three edits inside `scripts/migrate_db.sh`:
+an entry in `MIGRATIONS`, a `describe` case, and a `pending_<slug>` / `sql_<slug>` pair; its header
+lists them.
+
 ## Nix flake
 
 The repository is a Nix flake: it exposes the CLI as a package/app and the devenv development shell as `devShells.default`.
@@ -450,4 +492,7 @@ tests/
   properties.rs  Hegel property tests over the pure core
   e2e.rs         full-pool story against a mock upstream
   correlation.rs request-ID middleware tests
+scripts/
+  deploy_macos.sh   macOS install/update through launchd, with rollback points
+  migrate_db.sh     OS-neutral database migration runner used by deploy_macos.sh
 ```
