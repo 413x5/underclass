@@ -314,6 +314,12 @@ fn upstream_is_sse(response_content_type: &[u8]) -> bool {
     response_content_type.starts_with(b"text/event-stream")
 }
 
+/// @cc [owner:ghuntley,label:proxy] successful-stream-media-type
+/// A successful response classified as streaming by the outbound request or
+/// upstream media type MUST be published as text/event-stream, for both live
+/// forwarding and held replay. Missing or incorrect upstream JSON headers MUST
+/// NOT make clients parse SSE as JSON. Non-stream responses and HTTP errors
+/// retain their upstream media type and every response retains its body bytes.
 fn usage_is_stream(body: &Value, content_type: &[u8]) -> bool {
     body.get("stream").and_then(Value::as_bool) == Some(true)
         || content_type.starts_with(b"text/event-stream")
@@ -1632,6 +1638,15 @@ async fn attempt_account(
             streaming
         };
         let translate_stream = translate_responses && streaming;
+        // The media type published to the client is decided by whether this attempt streams, never
+        // by what the upstream labelled the body: a streaming response answered with
+        // `application/json` (or no type at all) must still reach the client as SSE, or it parses
+        // the frames as JSON. `content_type` itself stays the upstream's, because the body framing
+        // below is decided from it.
+        let mut published_content_type = content_type.clone();
+        if streaming || translate_stream {
+            published_content_type = http::HeaderValue::from_static("text/event-stream");
+        }
         if !streaming && needs_buffering {
             let raw = match response.bytes().await {
                 Ok(raw) => raw,
@@ -1849,7 +1864,7 @@ async fn attempt_account(
                 .expect("valid replay response");
             replay
                 .headers_mut()
-                .insert(http::header::CONTENT_TYPE, content_type);
+                .insert(http::header::CONTENT_TYPE, published_content_type.clone());
             return Attempt::Overloaded {
                 account_id: selection.account_id.clone(),
                 replay,
@@ -1870,9 +1885,6 @@ async fn attempt_account(
             },
             poll_stream_body,
         ));
-        if translate_stream {
-            content_type = http::HeaderValue::from_static("text/event-stream");
-        }
         push_log(
             state,
             request_id,
@@ -1889,7 +1901,7 @@ async fn attempt_account(
             .body(body_stream)
             .expect("valid stream response");
         resp.headers_mut()
-            .insert(http::header::CONTENT_TYPE, content_type);
+            .insert(http::header::CONTENT_TYPE, published_content_type);
         Attempt::Respond(resp)
     }
 }
