@@ -480,6 +480,24 @@ async fn mock_responses(
         )
             .into_response();
     }
+    if bearer.starts_with("tok-jsonbody-") {
+        // A 200 answering a `stream: true` request with a single JSON document.
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"account":"{bearer}","output_text":"plain json","usage":{{"input_tokens":11,"output_tokens":3}}}}"#),
+        )
+            .into_response();
+    }
+    if bearer.starts_with("tok-notype-") && wants_stream {
+        // Real SSE frames with no Content-Type at all.
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .body(axum::body::Body::from(
+                "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n",
+            ))
+            .unwrap();
+    }
     if bearer.starts_with("tok-mislabeled-") && wants_stream {
         // A streaming upstream that answers with the wrong media type. The frames are real SSE, so a
         // client that trusts the header as JSON cannot parse what the proxy forwards.
@@ -3545,4 +3563,51 @@ async fn e2e_stream_published_as_sse_even_when_upstream_says_json() {
         "application/json",
         "a non-stream response must keep the upstream media type"
     );
+}
+
+/// @cc [owner:ghuntley,label:proxy] stream-media-type-needs-evidence
+/// The published media type MUST follow the body: SSE frames under a JSON or absent header are
+/// published as SSE, and a JSON document answered to a `stream: true` request stays JSON.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_media_type_follows_the_body_not_the_client_intent() {
+    mock_upstream();
+    for (case, token, stream, want) in [
+        (
+            "sse-labelled-json",
+            "tok-mislabeled-key",
+            true,
+            "text/event-stream",
+        ),
+        (
+            "sse-no-content-type",
+            "tok-notype-key",
+            true,
+            "text/event-stream",
+        ),
+        (
+            "json-for-stream-request",
+            "tok-jsonbody-key",
+            true,
+            "application/json",
+        ),
+        ("plain-json", "tok-codename", false, "application/json"),
+    ] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+        store.upsert_account(&codex_account(case, token));
+        let (base, _, _) = spawn_app(store, 400).await;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/responses"))
+            .header("Authorization", "Bearer test-key")
+            .json(&serde_json::json!({"model":"gpt-5.5","input":"hi","stream":stream}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "case {case}");
+        assert_eq!(
+            response.headers()["content-type"],
+            want,
+            "case {case}: publication must follow the body"
+        );
+    }
 }

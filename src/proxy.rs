@@ -305,6 +305,38 @@ pub fn extract_sticky_key(body: &Value, session_header: Option<&str>) -> Option<
         .filter(|s| !s.is_empty())
 }
 
+/// @cc [owner:ghuntley,label:proxy] stream-media-type-needs-evidence
+/// Whether the bytes are event-stream framing, judged from the head of the pre-output hold.
+/// Returns `None` when the head carries no recognizable framing, because absence of evidence is
+/// not evidence and guessing would mislabel a body the client cannot parse. JSON's first
+/// structural byte is negative evidence and an SSE field name is positive evidence; anything
+/// else is unrecognized. The head spans chunk boundaries so a frame split across writes is still
+/// recognized, and leading whitespace is skipped because upstreams pad the first write to defeat
+/// intermediary buffering.
+fn held_head_is_sse(held: &VecDeque<axum::body::Bytes>) -> Option<bool> {
+    const HEAD_BYTES: usize = 1024;
+    const FIELDS: [&[u8]; 5] = [b"data:", b"event:", b"id:", b"retry:", b":"];
+    let mut head: Vec<u8> = Vec::new();
+    for chunk in held {
+        head.extend_from_slice(chunk);
+        if head.len() >= HEAD_BYTES {
+            head.truncate(HEAD_BYTES);
+            break;
+        }
+    }
+    let at = head
+        .iter()
+        .position(|byte| !matches!(byte, b'\n' | b'\r' | b' ' | b'\t'))?;
+    let head = &head[at..];
+    if head.starts_with(b"{") || head.starts_with(b"[") {
+        return Some(false);
+    }
+    if FIELDS.iter().any(|field| head.starts_with(field)) {
+        return Some(true);
+    }
+    None
+}
+
 /// @cc [owner:ghuntley,label:proxy] enveloped-and-translated-bodies-require-sse
 /// `upstream_is_sse` MUST report false for any non-event-stream content type so a buffered-body
 /// request whose upstream answers with a single JSON document takes the buffered path. Consuming a
@@ -1638,15 +1670,10 @@ async fn attempt_account(
             streaming
         };
         let translate_stream = translate_responses && streaming;
-        // The media type published to the client is decided by whether this attempt streams, never
-        // by what the upstream labelled the body: a streaming response answered with
-        // `application/json` (or no type at all) must still reach the client as SSE, or it parses
-        // the frames as JSON. `content_type` itself stays the upstream's, because the body framing
-        // below is decided from it.
+        // What the client is told is decided below, once the first bytes are known; the upstream's
+        // own label is only one piece of evidence. `content_type` keeps that label because the
+        // buffered path and the body framing read it.
         let mut published_content_type = content_type.clone();
-        if streaming || translate_stream {
-            published_content_type = http::HeaderValue::from_static("text/event-stream");
-        }
         if !streaming && needs_buffering {
             let raw = match response.bytes().await {
                 Ok(raw) => raw,
@@ -1818,6 +1845,17 @@ async fn attempt_account(
         if streaming {
             hold_until_output(&mut stream, &mut finish, &mut held, &state.stream_tuning).await;
         }
+        // Publication follows the body, not the client's intent: a `stream: true` request answered
+        // with a JSON document is forwarded as JSON, and SSE frames answered under a JSON (or
+        // missing) header are forwarded as SSE. A translated stream is SSE by construction. With
+        // no framing evidence at all (nothing captured yet) the client's own intent is the only
+        // remaining signal, so it decides.
+        let body_is_sse = translate_stream
+            || upstream_is_sse(content_type.as_bytes())
+            || held_head_is_sse(&held).unwrap_or(streaming);
+        if body_is_sse {
+            published_content_type = http::HeaderValue::from_static("text/event-stream");
+        }
         if let Some(code) = finish.tap.overload_before_output().map(str::to_string) {
             logging::log_overload_failover(
                 request_id,
@@ -1880,7 +1918,7 @@ async fn attempt_account(
                 backend: selection.backend.as_str().to_string(),
                 idle_timeout: state.stream_tuning.idle_timeout,
                 dialect: upstream_dialect,
-                event_stream: translate_stream || upstream_is_sse(content_type.as_bytes()),
+                event_stream: body_is_sse,
                 closed: false,
             },
             poll_stream_body,
@@ -2808,5 +2846,52 @@ mod tests {
             b"text/event-stream; charset=utf-8"
         ));
         assert!(!usage_is_stream(&json!({}), b"application/json"));
+    }
+
+    fn held(chunks: &[&'static str]) -> VecDeque<axum::body::Bytes> {
+        chunks
+            .iter()
+            .map(|chunk| axum::body::Bytes::from_static(chunk.as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn held_head_recognizes_sse_framing_and_json() {
+        assert_eq!(
+            held_head_is_sse(&held(&["event: response.created\n\n"])),
+            Some(true)
+        );
+        assert_eq!(held_head_is_sse(&held(&["data: {}\n\n"])), Some(true));
+        // Every SSE field name, including the comment field and the two that carry no event.
+        for field in ["id: 1\n", "retry: 500\n", ": keep-alive\n"] {
+            assert_eq!(held_head_is_sse(&held(&[field])), Some(true), "{field}");
+        }
+        assert_eq!(
+            held_head_is_sse(&held(&["{\"output_text\":\"hi\"}"])),
+            Some(false)
+        );
+        assert_eq!(held_head_is_sse(&held(&["[1, 2, 3]"])), Some(false));
+    }
+
+    #[test]
+    fn held_head_skips_padding_and_spans_chunk_boundaries() {
+        // The anti-buffering padding an upstream writes before its first frame.
+        assert_eq!(
+            held_head_is_sse(&held(&["  \n\n\t", "event: response.created\n\n"])),
+            Some(true)
+        );
+        // A frame whose `data:` prefix is split across two upstream writes.
+        assert_eq!(held_head_is_sse(&held(&["da", "ta: {}\n\n"])), Some(true));
+        assert_eq!(held_head_is_sse(&held(&["{", "\"a\":1}"])), Some(false));
+    }
+
+    #[test]
+    fn held_head_reports_no_evidence_rather_than_guessing() {
+        // Nothing captured, whitespace only, and an unrecognizable head all decline to answer: a
+        // wrong answer here mislabels a body the client cannot parse.
+        assert_eq!(held_head_is_sse(&VecDeque::new()), None);
+        assert_eq!(held_head_is_sse(&held(&[""])), None);
+        assert_eq!(held_head_is_sse(&held(&["   \n\t "])), None);
+        assert_eq!(held_head_is_sse(&held(&["hello"])), None);
     }
 }
